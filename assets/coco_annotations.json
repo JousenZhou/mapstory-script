@@ -3,8 +3,8 @@
         {
             "id": 1,
             "file_name": "images/0.png",
-            "width": 3840,
-            "height": 2160
+            "width": 1920,
+            "height": 1080
         }
     ],
     "annotations": [
@@ -13,19 +13,19 @@
             "image_id": 1,
             "category_id": 1,
             "bbox": [
-                127,
+                1007,
+                474,
                 66,
-                58,
-                45
+                108
             ],
-            "area": 2610,
+            "area": 7128,
             "iscrowd": 0
         }
     ],
     "categories": [
         {
             "id": 1,
-            "name": "this_is_a_place_holder",
+            "name": "\u7459\u6395\u58ca",
             "supercategory": ""
         }
     ]

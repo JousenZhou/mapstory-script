@@ -9,8 +9,8 @@ from qfluentwidgets import FluentIcon  # 导入 Fluent 图标，用于任务在 
 
 from src.tasks.MyBaseTask import MyBaseTask  # 导入项目任务基类，导入时会同时生效标注文件 UTF-8 读取补丁。
 
-MOVE_LEFT_KEY = "left"  # 左方向键：单击用于换方向，转身攻击时短敲用于转身。
-MOVE_RIGHT_KEY = "right"  # 右方向键：单击用于换方向，转身攻击时短敲用于转身。
+MOVE_LEFT_KEY = "left"  # 左方向键：单击用于换方向，定时位移时按住用于移动。
+MOVE_RIGHT_KEY = "right"  # 右方向键：单击用于换方向，定时位移时按住用于移动。
 
 
 class MapleIdleTask(MyBaseTask):  # 定义冒险岛挂机任务，继承项目基类。
@@ -30,7 +30,9 @@ class MapleIdleTask(MyBaseTask):  # 定义冒险岛挂机任务，继承项目�
             "Attack Key Left": "a",  # 左侧攻击按键：目标在角色左侧时持续按住该键攻击。
             "Attack Key Right": "b",  # 右侧攻击按键：目标在角色右侧时持续按住该键攻击。
             "Del Key Interval": 0.0,  # 每隔该秒数自动按一下 Del 键，设为 0 表示禁用。
-            "Turn Interval": 30.0,  # 每隔该秒数停止全部状态做一次转身攻击：停攻 1 秒→朝朝向反向敲击一下方向键转身→停 1 秒→按住攻击键攻击 1 秒→停 1 秒→再敲击一下方向键转回原朝向，设为 0 表示禁用。
+            "Move Interval": 30.0,  # 每隔该秒数停止全部状态做一次位移：停攻 1 秒→朝角色朝向反向移动 Move Away Seconds 秒→停 1 秒→再反方向移动 Move Back Seconds 秒，设为 0 表示禁用。
+            "Move Away Seconds": 1.0,  # 位移第一段：朝角色朝向的反向按住方向键移动的秒数。
+            "Move Back Seconds": 1.0,  # 位移第二段：停顿后再反方向（即朝向方向）按住方向键移动的秒数。
             "Character Threshold": 0.8,  # 角色匹配阈值：越高匹配越严格。
             "Monster Threshold": 0.65,  # 怪物匹配阈值：怪物漏检时可适当调低。
             "Monster Mirror Threshold": 0.65,  # 怪物镜像匹配阈值：怪物转向后精灵图镜像，镜像命中得分通常略低，可单独调低。
@@ -47,7 +49,9 @@ class MapleIdleTask(MyBaseTask):  # 定义冒险岛挂机任务，继承项目�
             "Attack Key Left": "Key held to attack targets on the left, must exist on the keyboard. 左侧攻击按键：打左边怪用，仅支持键盘存在的按键。",
             "Attack Key Right": "Key held to attack targets on the right, must exist on the keyboard. 右侧攻击按键：打右边怪用，仅支持键盘存在的按键。",
             "Del Key Interval": "Seconds between automatic Del key presses; 0 disables it. 每隔该秒数自动按一下 Del 键，0 禁用。",
-            "Turn Interval": "Seconds between turn-attack actions: stop attacking and wait 1s, tap direction key once to turn opposite to facing, wait 1s, hold attack key for 1s, wait 1s, then tap direction key once to turn back; 0 disables it. 每隔该秒数停攻等 1 秒后转身攻击一次（反向敲击转身、攻击 1 秒、再敲击转回），0 禁用。",
+            "Move Interval": "Seconds between reposition moves: stop attacking and wait 1s, move opposite to character facing for Move Away Seconds, stop 1s, then move back for Move Back Seconds; 0 disables it. 每隔该秒数停攻等 1 秒后位移一次（朝朝向反向移动、停 1 秒、再反方向移回），0 禁用。",
+            "Move Away Seconds": "Hold seconds for the first leg, moving opposite to character facing. 位移第一段：朝角色朝向反向移动的秒数。",
+            "Move Back Seconds": "Hold seconds for the second leg after a 1s pause, moving in the opposite direction of the first leg. 位移第二段：停顿 1 秒后再反方向移动的秒数。",
             "Character Threshold": "Template match threshold for the character, higher means stricter. 角色匹配阈值，越高越严格。",
             "Monster Threshold": "Template match threshold for monsters; lower it if monsters are missed. 怪物匹配阈值，漏检可调低。",
             "Monster Mirror Threshold": "Threshold for matching horizontally flipped monster templates; flipped sprites usually score a bit lower. 怪物镜像匹配阈值，镜像得分通常略低可单独调。",
@@ -83,8 +87,10 @@ class MapleIdleTask(MyBaseTask):  # 定义冒险岛挂机任务，继承项目�
         attack_y_min, attack_y_max = sorted((int(self.config.get("Attack Range Y Min")), int(self.config.get("Attack Range Y Max"))))  # 读取攻击区域上下边界（符号化像素），填反时自动交换。
         del_interval = float(self.config.get("Del Key Interval") or 0)  # 读取自动按 Del 键的间隔秒数，0 表示禁用。
         last_del_time = time.time()  # 上次按 Del 键的时间，从任务启动开始计时。
-        turn_interval = float(self.config.get("Turn Interval") or 0)  # 读取转身攻击的间隔秒数，0 表示禁用。
-        last_turn_time = time.time()  # 上次做转身攻击的时间，从任务启动开始计时。
+        move_interval = float(self.config.get("Move Interval") or 0)  # 读取定时位移的间隔秒数，0 表示禁用。
+        last_move_time = time.time()  # 上次做位移的时间，从任务启动开始计时。
+        move_away_seconds = float(self.config.get("Move Away Seconds") or 1)  # 读取位移第一段时长：朝朝向反向移动的秒数。
+        move_back_seconds = float(self.config.get("Move Back Seconds") or 1)  # 读取位移第二段时长：反方向移回的秒数。
         facing = None  # 角色当前朝向：1=右、-1=左、None=未知，只在需要换向时单击方向键。
         held_key = None  # 当前持续按住的攻击键，换侧/换向/目标消失/退出时必须松开它。
         last_diag_time = 0.0  # 上次诊断日志的时间戳，限频避免刷日志。
@@ -93,31 +99,27 @@ class MapleIdleTask(MyBaseTask):  # 定义冒险岛挂机任务，继承项目�
                 if del_interval > 0 and time.time() - last_del_time >= del_interval:  # 到达定时间隔时自动按一下 Del 键。
                     last_del_time = time.time()  # 重置计时。
                     self.send_key("delete", down_time=0.05)  # 短按一下 Del 键。
-                if turn_interval > 0 and time.time() - last_turn_time >= turn_interval:  # 到达转身间隔时停止全部状态做一次转身攻击。
-                    last_turn_time = time.time()  # 重置转身计时。
-                    if held_key is not None:  # 先松开持续按住的攻击键，转身期间不攻击。
+                if move_interval > 0 and time.time() - last_move_time >= move_interval:  # 到达位移间隔时停止全部状态做一次位移。
+                    last_move_time = time.time()  # 重置位移计时。
+                    if held_key is not None:  # 先松开持续按住的攻击键，位移期间不攻击。
                         self.send_key_up(held_key)  # 松开当前攻击键。
                         held_key = None  # 清空按住状态。
-                    self.info_set("Status", "Turning")  # 在 GUI 显示转身状态。
-                    self.sleep(1.0)  # 停止攻击后等待 1 秒再转身，等攻击后摇结束避免输入被吞。
-                    facing_assumed = False  # 本次转身的朝向是否来自假定，假定值不可信需在结束后清空。
+                    self.info_set("Status", "Moving")  # 在 GUI 显示位移状态。
+                    self.sleep(1.0)  # 停止攻击后等待 1 秒再做位移，等攻击后摇结束避免位移被吞。
+                    facing_assumed = False  # 本次位移的朝向是否来自假定，假定值不可信需在结束后清空。
                     if facing is None:  # 从未转身过导致朝向未知，先用角色模板匹配探测，失败才假定朝右。
                         facing = self.detect_facing(char_name)  # 原始模板命中=朝右、镜像命中=朝左。
                         if facing is None:  # 探测不到角色时退回假定。
                             facing = 1  # 假定角色当前朝右。
                             facing_assumed = True  # 标记朝向为假定值。
-                            self.log_info("Facing unknown before turn attack, assume facing right. 转身攻击前朝向未知，假定角色朝右。")  # 记录朝向假定供排查。
-                    turn_key = MOVE_LEFT_KEY if facing == 1 else MOVE_RIGHT_KEY  # 转身按键：当前朝向的反方向。
-                    self.log_info(f"Turn attack start: facing={facing} turn_key={turn_key}. 转身攻击开始：当前朝向与转身按键。")  # 记录转身前朝向供排查。
-                    self.send_key(turn_key, down_time=0.05)  # 短敲一下方向键只触发转身动画，不产生位移。
-                    facing = -facing  # 转身后朝向翻转。
-                    self.sleep(1.0)  # 转身后停止 1 秒再攻击，等转身动作生效。
-                    turn_attack_key = attack_key_right if facing == 1 else attack_key_left  # 按转身后朝向选对应侧攻击键。
-                    self.send_key(turn_attack_key, down_time=1.0)  # 按住攻击键攻击 1 秒，结束自动松开。
-                    self.sleep(1.0)  # 攻击结束后停止 1 秒再转回。
-                    self.send_key(turn_key, down_time=0.05)  # 短敲一下方向键转回原朝向，该键即原朝向方向。
-                    facing = -facing  # 转回后朝向恢复为转身前的原朝向。
-                    self.log_info(f"Turn attack done: facing={facing}. 转身攻击结束：朝向已转回。")  # 记录转回后朝向供排查。
+                            self.log_info("Facing unknown before reposition, assume facing right. 位移前朝向未知，假定角色朝右。")  # 记录朝向假定供排查。
+                    away_key = MOVE_LEFT_KEY if facing == 1 else MOVE_RIGHT_KEY  # 第一段按键：角色朝向的反方向。
+                    back_key = MOVE_RIGHT_KEY if facing == 1 else MOVE_LEFT_KEY  # 第二段按键：第一段的反方向，即朝向方向。
+                    self.send_key(away_key, down_time=move_away_seconds)  # 按住方向键朝朝向反向移动 y 秒，首次按下会先转身再移动。
+                    facing = -facing  # 第一段移动后角色已转身，朝向与原朝向相反。
+                    self.sleep(1.0)  # 第一段结束后停止 1 秒再反向。
+                    self.send_key(back_key, down_time=move_back_seconds)  # 按住方向键反方向移动 z 秒，按下时先转回身再移动。
+                    facing = -facing  # 第二段移动后再次转身，朝向恢复为位移前的原朝向。
                     if facing_assumed:  # 朝向为假定值时序列得到的朝向同样不可信。
                         facing = None  # 清空让下次触发重新探测，避免错误假定被长期沿用。
                 frame = self.next_frame()  # 取最新一帧画面并清除旧帧。

@@ -1,0 +1,230 @@
+{
+  "images": [
+    {
+      "id": 1,
+      "file_name": "0.png",
+      "width": 1920,
+      "height": 1080
+    },
+    {
+      "id": 5,
+      "file_name": "4.png",
+      "width": 1920,
+      "height": 1080
+    },
+    {
+      "id": 6,
+      "file_name": "5.png",
+      "width": 1920,
+      "height": 1080
+    },
+    {
+      "id": 7,
+      "file_name": "6.png",
+      "width": 1920,
+      "height": 1080
+    },
+    {
+      "id": 8,
+      "file_name": "7.png",
+      "width": 1920,
+      "height": 1080
+    },
+    {
+      "id": 9,
+      "file_name": "8.png",
+      "width": 1920,
+      "height": 1080
+    },
+    {
+      "id": 10,
+      "file_name": "1.png",
+      "width": 1920,
+      "height": 1080
+    }
+  ],
+  "annotations": [
+    {
+      "id": 1,
+      "image_id": 1,
+      "category_id": 1,
+      "bbox": [
+        1638,
+        536,
+        51,
+        53
+      ],
+      "area": 2703,
+      "iscrowd": 0
+    },
+    {
+      "id": 2,
+      "image_id": 1,
+      "category_id": 3,
+      "bbox": [
+        2,
+        2,
+        212,
+        134
+      ],
+      "area": 28408,
+      "iscrowd": 0
+    },
+    {
+      "id": 3,
+      "image_id": 1,
+      "category_id": 2,
+      "bbox": [
+        1014,
+        766,
+        70,
+        73
+      ],
+      "area": 5110,
+      "iscrowd": 0
+    },
+    {
+      "id": 4,
+      "image_id": 10,
+      "category_id": 4,
+      "bbox": [
+        979,
+        654,
+        45,
+        29
+      ],
+      "area": 1305,
+      "iscrowd": 0
+    },
+    {
+      "id": 8,
+      "image_id": 5,
+      "category_id": 8,
+      "bbox": [
+        373,
+        528,
+        130,
+        51
+      ],
+      "area": 6630,
+      "iscrowd": 0
+    },
+    {
+      "id": 9,
+      "image_id": 6,
+      "category_id": 9,
+      "bbox": [
+        1273,
+        614,
+        127,
+        55
+      ],
+      "area": 6985,
+      "iscrowd": 0
+    },
+    {
+      "id": 10,
+      "image_id": 6,
+      "category_id": 10,
+      "bbox": [
+        1648,
+        609,
+        127,
+        57
+      ],
+      "area": 7239,
+      "iscrowd": 0
+    },
+    {
+      "id": 11,
+      "image_id": 7,
+      "category_id": 11,
+      "bbox": [
+        1167,
+        654,
+        43,
+        26
+      ],
+      "area": 1118,
+      "iscrowd": 0
+    },
+    {
+      "id": 12,
+      "image_id": 8,
+      "category_id": 12,
+      "bbox": [
+        852,
+        661,
+        150,
+        29
+      ],
+      "area": 4350,
+      "iscrowd": 0
+    },
+    {
+      "id": 13,
+      "image_id": 9,
+      "category_id": 14,
+      "bbox": [
+        865,
+        662,
+        172,
+        61
+      ],
+      "area": 10492,
+      "iscrowd": 0
+    }
+  ],
+  "categories": [
+    {
+      "id": 1,
+      "name": "小青蛇",
+      "supercategory": ""
+    },
+    {
+      "id": 2,
+      "name": "绿水灵",
+      "supercategory": ""
+    },
+    {
+      "id": 3,
+      "name": "小地图",
+      "supercategory": ""
+    },
+    {
+      "id": 4,
+      "name": "角色名",
+      "supercategory": ""
+    },
+    {
+      "id": 8,
+      "name": "鳄鱼",
+      "supercategory": ""
+    },
+    {
+      "id": 9,
+      "name": "鳄鱼1",
+      "supercategory": ""
+    },
+    {
+      "id": 10,
+      "name": "鳄鱼2",
+      "supercategory": ""
+    },
+    {
+      "id": 11,
+      "name": "鳄鱼名字",
+      "supercategory": ""
+    },
+    {
+      "id": 12,
+      "name": "角色名2",
+      "supercategory": ""
+    },
+    {
+      "id": 14,
+      "name": "背景参照",
+      "supercategory": ""
+    }
+  ]
+}

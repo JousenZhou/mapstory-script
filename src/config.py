@@ -79,7 +79,7 @@ config = {
         }
     },
     'windows': {  # Windows游戏请填写此设置
-        'exe': ['Moonlight.exe'],  # 锁定采集目标为 Moonlight 串流窗口，不设置时启动会随机回写其他窗口导致启动超时
+        'exe': ['Maplestory_Classic.exe'],  # 锁定采集目标为冒险岛怀旧服客户端窗口
         # optional, if set, will search the exe only
         # 'hwnd_class': 'UnrealWindow', #增加重名检查准确度
         'interaction': ['Pynput', 'PostMessage', 'Genshin', 'PyDirect','ForegroundPostMessage'], # Genshin:某些操作可以后台, 部分游戏支持 PostMessage:可后台点击, 极少游戏支持 ForegroundPostMessage:前台使用PostMessage Pynput/PyDirect:仅支持前台使用

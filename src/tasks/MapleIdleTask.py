@@ -18,7 +18,7 @@ class MapleIdleTask(MyBaseTask):  # 定义冒险岛挂机任务，继承项目�
     def __init__(self, *args, **kwargs):  # 构造函数，先初始化父类再设置任务元数据。
         super().__init__(*args, **kwargs)  # 必须先调用父类构造。
         self.name = "Maple Idle"  # 任务显示名称。
-        self.description = "Single-spot camping: stay in place, single-tap direction key only to turn, keep attacking the nearest monster within attack range until it dies; also shows live vision."  # 任务描述：单点挂机，不持续移动，仅单击换方向，攻击范围内最近怪直到消失。
+        self.description = "Single-spot camping: stay in place, single-tap direction key only to turn, keep attacking the nearest monster within attack range until it dies; supports optional periodic reposition moves and turn-around attacks; also shows live vision."  # 任务描述：单点挂机，不持续移动，仅单击换方向，攻击范围内最近怪直到消失，支持定时位移与定时转身攻击。
         self.icon = FluentIcon.FLAG  # 任务图标。
         self.default_config.update({  # 用户可在 GUI 编辑的配置项。
             "Character Feature": "角色名",  # 角色名：模板页标注的分类名，按分类匹配角色。
@@ -30,9 +30,10 @@ class MapleIdleTask(MyBaseTask):  # 定义冒险岛挂机任务，继承项目�
             "Attack Key Left": "a",  # 左侧攻击按键：目标在角色左侧时持续按住该键攻击。
             "Attack Key Right": "b",  # 右侧攻击按键：目标在角色右侧时持续按住该键攻击。
             "Del Key Interval": 0.0,  # 每隔该秒数自动按一下 Del 键，设为 0 表示禁用。
-            "Move Interval": 30.0,  # 每隔该秒数停止全部状态做一次位移：停攻 1 秒→朝角色朝向反向移动 Move Away Seconds 秒→停 1 秒→再反方向移动 Move Back Seconds 秒，设为 0 表示禁用。
+            "Move Interval": 30.0,  # 每隔该秒数停止全部状态做一次位移：停攻 1 秒→朝角色朝向反向移动 Move Away Seconds 秒→攻击一下→等 0.5 秒→再反方向移动 Move Back Seconds 秒，设为 0 表示禁用。
             "Move Away Seconds": 1.0,  # 位移第一段：朝角色朝向的反向按住方向键移动的秒数。
-            "Move Back Seconds": 1.0,  # 位移第二段：停顿后再反方向（即朝向方向）按住方向键移动的秒数。
+            "Move Back Seconds": 1.0,  # 位移第二段：攻击后停顿 0.5 秒再反方向（即朝向方向）按住方向键移动的秒数。
+            "Turn Interval": 0.0,  # 每隔 x 秒做一次转身攻击：停止攻击等 1 秒→单击方向键转身→攻击一下→等 0.5 秒→再单击反方向键转身归位，设为 0 表示禁用。
             "Character Threshold": 0.8,  # 角色匹配阈值：越高匹配越严格。
             "Monster Threshold": 0.65,  # 怪物匹配阈值：怪物漏检时可适当调低。
             "Monster Mirror Threshold": 0.65,  # 怪物镜像匹配阈值：怪物转向后精灵图镜像，镜像命中得分通常略低，可单独调低。
@@ -49,9 +50,10 @@ class MapleIdleTask(MyBaseTask):  # 定义冒险岛挂机任务，继承项目�
             "Attack Key Left": "Key held to attack targets on the left, must exist on the keyboard. 左侧攻击按键：打左边怪用，仅支持键盘存在的按键。",
             "Attack Key Right": "Key held to attack targets on the right, must exist on the keyboard. 右侧攻击按键：打右边怪用，仅支持键盘存在的按键。",
             "Del Key Interval": "Seconds between automatic Del key presses; 0 disables it. 每隔该秒数自动按一下 Del 键，0 禁用。",
-            "Move Interval": "Seconds between reposition moves: stop attacking and wait 1s, move opposite to character facing for Move Away Seconds, stop 1s, then move back for Move Back Seconds; 0 disables it. 每隔该秒数停攻等 1 秒后位移一次（朝朝向反向移动、停 1 秒、再反方向移回），0 禁用。",
+            "Move Interval": "Seconds between reposition moves: stop attacking and wait 1s, move opposite to character facing for Move Away Seconds, attack once, wait 0.5s, then move back for Move Back Seconds; 0 disables it. 每隔该秒数停攻等 1 秒后位移一次（朝朝向反向移动、攻击一下、等 0.5 秒、再反方向移回），0 禁用。",
             "Move Away Seconds": "Hold seconds for the first leg, moving opposite to character facing. 位移第一段：朝角色朝向反向移动的秒数。",
-            "Move Back Seconds": "Hold seconds for the second leg after a 1s pause, moving in the opposite direction of the first leg. 位移第二段：停顿 1 秒后再反方向移动的秒数。",
+            "Move Back Seconds": "Hold seconds for the second leg after attacking once and waiting 0.5s, moving in the opposite direction of the first leg. 位移第二段：攻击一下停顿 0.5 秒后再反方向移动的秒数。",
+            "Turn Interval": "Every x seconds do a turn-around attack: stop attacking and wait 1s, tap direction key to turn, attack once, wait 0.5s, tap the opposite direction key to turn back; 0 disables it. 每隔 x 秒做一次转身攻击：停止攻击等 1 秒→单击方向键转身→攻击一下→等 0.5 秒→再单击反方向键转身归位，0 禁用。",
             "Character Threshold": "Template match threshold for the character, higher means stricter. 角色匹配阈值，越高越严格。",
             "Monster Threshold": "Template match threshold for monsters; lower it if monsters are missed. 怪物匹配阈值，漏检可调低。",
             "Monster Mirror Threshold": "Threshold for matching horizontally flipped monster templates; flipped sprites usually score a bit lower. 怪物镜像匹配阈值，镜像得分通常略低可单独调。",
@@ -91,6 +93,8 @@ class MapleIdleTask(MyBaseTask):  # 定义冒险岛挂机任务，继承项目�
         last_move_time = time.time()  # 上次做位移的时间，从任务启动开始计时。
         move_away_seconds = float(self.config.get("Move Away Seconds") or 1)  # 读取位移第一段时长：朝朝向反向移动的秒数。
         move_back_seconds = float(self.config.get("Move Back Seconds") or 1)  # 读取位移第二段时长：反方向移回的秒数。
+        turn_interval = float(self.config.get("Turn Interval") or 0)  # 读取转身攻击策略的间隔秒数 x，0 表示禁用。
+        last_turn_time = time.time()  # 上次做转身攻击的时间，从任务启动开始计时。
         facing = None  # 角色当前朝向：1=右、-1=左、None=未知，只在需要换向时单击方向键。
         held_key = None  # 当前持续按住的攻击键，换侧/换向/目标消失/退出时必须松开它。
         last_diag_time = 0.0  # 上次诊断日志的时间戳，限频避免刷日志。
@@ -117,10 +121,37 @@ class MapleIdleTask(MyBaseTask):  # 定义冒险岛挂机任务，继承项目�
                     back_key = MOVE_RIGHT_KEY if facing == 1 else MOVE_LEFT_KEY  # 第二段按键：第一段的反方向，即朝向方向。
                     self.send_key(away_key, down_time=move_away_seconds)  # 按住方向键朝朝向反向移动 y 秒，首次按下会先转身再移动。
                     facing = -facing  # 第一段移动后角色已转身，朝向与原朝向相反。
-                    self.sleep(1.0)  # 第一段结束后停止 1 秒再反向。
+                    once_key = attack_key_right if facing == 1 else attack_key_left  # 按第一段移动后的朝向选择对应侧攻击键。
+                    self.send_key(once_key, down_time=0.2)  # 短按一下攻击键攻击一次。
+                    self.sleep(0.5)  # 攻击后等 0.5 秒再执行第二段位移，等攻击后摇结束，避免第二段的方向键被吞。
                     self.send_key(back_key, down_time=move_back_seconds)  # 按住方向键反方向移动 z 秒，按下时先转回身再移动。
                     facing = -facing  # 第二段移动后再次转身，朝向恢复为位移前的原朝向。
                     if facing_assumed:  # 朝向为假定值时序列得到的朝向同样不可信。
+                        facing = None  # 清空让下次触发重新探测，避免错误假定被长期沿用。
+                if turn_interval > 0 and time.time() - last_turn_time >= turn_interval:  # 到达转身攻击间隔时停止攻击 1 秒，转身攻击一下再转身归位。
+                    last_turn_time = time.time()  # 重置转身计时。
+                    if held_key is not None:  # 先松开持续按住的攻击键，转身期间不攻击。
+                        self.send_key_up(held_key)  # 松开当前按住的攻击键。
+                        held_key = None  # 清空按住状态。
+                    self.info_set("Status", "Turning")  # 在 GUI 显示转身状态。
+                    self.sleep(1.0)  # 停止攻击后等待 1 秒再转身，等攻击后摇结束避免转身被吞。
+                    facing_assumed = False  # 本次转身的朝向是否来自假定，假定值不可信需在结束后清空。
+                    if facing is None:  # 从未转身过导致朝向未知，先用角色模板匹配探测，失败才假定朝右。
+                        facing = self.detect_facing(char_name)  # 原始模板命中=朝右、镜像命中=朝左。
+                        if facing is None:  # 探测不到角色时退回假定。
+                            facing = 1  # 假定角色当前朝右。
+                            facing_assumed = True  # 标记朝向为假定值。
+                    turn_key = MOVE_LEFT_KEY if facing == 1 else MOVE_RIGHT_KEY  # 转身键：当前朝向的反方向，单击只触发转身动画。
+                    self.send_key(turn_key, down_time=0.05)  # 短按一下方向键完成转身。
+                    facing = -facing  # 转身后朝向与原朝向相反。
+                    self.sleep(0.08)  # 等待转身动画生效后再攻击。
+                    once_key = attack_key_right if facing == 1 else attack_key_left  # 按转身后的朝向选择对应侧攻击键。
+                    self.send_key(once_key, down_time=0.2)  # 短按一下攻击键攻击一次。
+                    self.sleep(0.5)  # 攻击后等 0.5 秒再转身，等攻击后摇结束，避免归位的方向键被吞导致没有转回来。
+                    back_key = MOVE_RIGHT_KEY if turn_key == MOVE_LEFT_KEY else MOVE_LEFT_KEY  # 归位键：转身键的反方向，转身后朝向已翻转，再按同一方向键会变成前行而不是转身。
+                    self.send_key(back_key, down_time=0.05)  # 短按反方向键转回身归位。
+                    facing = -facing  # 第二次转身后朝向恢复为转身前的原朝向。
+                    if facing_assumed:  # 朝向为假定值时翻转得到的朝向同样不可信。
                         facing = None  # 清空让下次触发重新探测，避免错误假定被长期沿用。
                 frame = self.next_frame()  # 取最新一帧画面并清除旧帧。
                 if frame is None:  # 取不到画面时短暂等待后重试。

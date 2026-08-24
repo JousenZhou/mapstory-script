@@ -30,14 +30,15 @@ class MapleIdleTask(MyBaseTask):  # 定义冒险岛挂机任务，继承项目�
             "Attack Key Left": "a",  # 左侧攻击按键：目标在角色左侧时持续按住该键攻击。
             "Attack Key Right": "b",  # 右侧攻击按键：目标在角色右侧时持续按住该键攻击。
             "Del Key Interval": 0.0,  # 每隔该秒数自动按一下 Del 键，设为 0 表示禁用。
-            "Move Interval": 30.0,  # 每隔该秒数停止全部状态做一次位移：停攻 1 秒→朝角色朝向反向移动 Move Away Seconds 秒→攻击一下→等 0.5 秒→再反方向移动 Move Back Seconds 秒，设为 0 表示禁用。
-            "Move Away Seconds": 1.0,  # 位移第一段：朝角色朝向的反向按住方向键移动的秒数。
-            "Move Back Seconds": 1.0,  # 位移第二段：攻击后停顿 0.5 秒再反方向（即朝向方向）按住方向键移动的秒数。
+            "Move Interval": 30.0,  # 每隔该秒数停止全部状态做一次位移：停攻 1 秒→朝角色朝向反向移动 Move Away Seconds 秒→攻击一下→等 1 秒→再反方向移动 Move Back Seconds 秒，设为 0 表示禁用。
+            "Move Away Seconds": 1.0,  # 位移第一段：朝角色朝向的反向按住方向键移动的秒数，支持 3 位小数（毫秒级）。
+            "Move Back Seconds": 1.0,  # 位移第二段：攻击后停顿 1 秒再反方向（即朝向方向）按住方向键移动的秒数，支持 3 位小数（毫秒级）。
             "Turn Interval": 0.0,  # 每隔 x 秒做一次转身攻击：停止攻击等 1 秒→单击方向键转身→攻击一下→等 0.5 秒→再单击反方向键转身归位，设为 0 表示禁用。
             "Character Threshold": 0.8,  # 角色匹配阈值：越高匹配越严格。
             "Monster Threshold": 0.65,  # 怪物匹配阈值：怪物漏检时可适当调低。
             "Monster Mirror Threshold": 0.65,  # 怪物镜像匹配阈值：怪物转向后精灵图镜像，镜像命中得分通常略低，可单独调低。
             "Use Gray Scale": True,  # 是否转灰度匹配，对颜色差异更稳定。
+            "GPU Match": True,  # 是否用 NVIDIA 显卡做模板匹配，需安装 cupy，不可用时自动回退 CPU。
             "Frame Interval": 0.05,  # 每帧处理之间的最小间隔秒数，控制检测节奏。
         })
         self.config_description.update({  # 各配置项的帮助文本。
@@ -50,14 +51,15 @@ class MapleIdleTask(MyBaseTask):  # 定义冒险岛挂机任务，继承项目�
             "Attack Key Left": "Key held to attack targets on the left, must exist on the keyboard. 左侧攻击按键：打左边怪用，仅支持键盘存在的按键。",
             "Attack Key Right": "Key held to attack targets on the right, must exist on the keyboard. 右侧攻击按键：打右边怪用，仅支持键盘存在的按键。",
             "Del Key Interval": "Seconds between automatic Del key presses; 0 disables it. 每隔该秒数自动按一下 Del 键，0 禁用。",
-            "Move Interval": "Seconds between reposition moves: stop attacking and wait 1s, move opposite to character facing for Move Away Seconds, attack once, wait 0.5s, then move back for Move Back Seconds; 0 disables it. 每隔该秒数停攻等 1 秒后位移一次（朝朝向反向移动、攻击一下、等 0.5 秒、再反方向移回），0 禁用。",
-            "Move Away Seconds": "Hold seconds for the first leg, moving opposite to character facing. 位移第一段：朝角色朝向反向移动的秒数。",
-            "Move Back Seconds": "Hold seconds for the second leg after attacking once and waiting 0.5s, moving in the opposite direction of the first leg. 位移第二段：攻击一下停顿 0.5 秒后再反方向移动的秒数。",
+            "Move Interval": "Seconds between reposition moves: stop attacking and wait 1s, move opposite to character facing for Move Away Seconds, attack once, wait 1s, then move back for Move Back Seconds; 0 disables it. 每隔该秒数停攻等 1 秒后位移一次（朝朝向反向移动、攻击一下、等 1 秒、再反方向移回），0 禁用。",
+            "Move Away Seconds": "Hold seconds for the first leg, moving opposite to character facing, supports 3 decimals. 位移第一段：朝角色朝向反向移动的秒数，支持 3 位小数。",
+            "Move Back Seconds": "Hold seconds for the second leg after attacking once and waiting 1s, moving in the opposite direction of the first leg, supports 3 decimals. 位移第二段：攻击一下停顿 1 秒后再反方向移动的秒数，支持 3 位小数。",
             "Turn Interval": "Every x seconds do a turn-around attack: stop attacking and wait 1s, tap direction key to turn, attack once, wait 0.5s, tap the opposite direction key to turn back; 0 disables it. 每隔 x 秒做一次转身攻击：停止攻击等 1 秒→单击方向键转身→攻击一下→等 0.5 秒→再单击反方向键转身归位，0 禁用。",
             "Character Threshold": "Template match threshold for the character, higher means stricter. 角色匹配阈值，越高越严格。",
             "Monster Threshold": "Template match threshold for monsters; lower it if monsters are missed. 怪物匹配阈值，漏检可调低。",
             "Monster Mirror Threshold": "Threshold for matching horizontally flipped monster templates; flipped sprites usually score a bit lower. 怪物镜像匹配阈值，镜像得分通常略低可单独调。",
             "Use Gray Scale": "Match in grayscale, more robust to color differences. 是否转灰度匹配，对颜色差异更稳定。",
+            "GPU Match": "Run template matching on NVIDIA GPU via CuPy for speed; falls back to CPU automatically when unavailable. 是否用 NVIDIA 显卡加速模板匹配，需安装 cupy，不可用时自动回退 CPU。",
             "Frame Interval": "Minimum seconds between processed frames. 每帧处理之间的最小间隔秒数。",
         })
 
@@ -95,6 +97,7 @@ class MapleIdleTask(MyBaseTask):  # 定义冒险岛挂机任务，继承项目�
         move_back_seconds = float(self.config.get("Move Back Seconds") or 1)  # 读取位移第二段时长：反方向移回的秒数。
         turn_interval = float(self.config.get("Turn Interval") or 0)  # 读取转身攻击策略的间隔秒数 x，0 表示禁用。
         last_turn_time = time.time()  # 上次做转身攻击的时间，从任务启动开始计时。
+        gpu = self.build_gpu_matcher(char_name, monster_names)  # 尝试构建 GPU 匹配器并注册全部模板，失败返回 None 走 CPU。
         facing = None  # 角色当前朝向：1=右、-1=左、None=未知，只在需要换向时单击方向键。
         held_key = None  # 当前持续按住的攻击键，换侧/换向/目标消失/退出时必须松开它。
         last_diag_time = 0.0  # 上次诊断日志的时间戳，限频避免刷日志。
@@ -123,7 +126,7 @@ class MapleIdleTask(MyBaseTask):  # 定义冒险岛挂机任务，继承项目�
                     facing = -facing  # 第一段移动后角色已转身，朝向与原朝向相反。
                     once_key = attack_key_right if facing == 1 else attack_key_left  # 按第一段移动后的朝向选择对应侧攻击键。
                     self.send_key(once_key, down_time=0.2)  # 短按一下攻击键攻击一次。
-                    self.sleep(0.5)  # 攻击后等 0.5 秒再执行第二段位移，等攻击后摇结束，避免第二段的方向键被吞。
+                    self.sleep(1.0)  # 攻击后等 1 秒再执行第二段位移，等攻击后摇结束，避免第二段的方向键被吞。
                     self.send_key(back_key, down_time=move_back_seconds)  # 按住方向键反方向移动 z 秒，按下时先转回身再移动。
                     facing = -facing  # 第二段移动后再次转身，朝向恢复为位移前的原朝向。
                     if facing_assumed:  # 朝向为假定值时序列得到的朝向同样不可信。
@@ -157,10 +160,23 @@ class MapleIdleTask(MyBaseTask):  # 定义冒险岛挂机任务，继承项目�
                 if frame is None:  # 取不到画面时短暂等待后重试。
                     self.sleep(self.config.get("Frame Interval"))  # 等待一个帧间隔。
                     continue  # 进入下一帧处理。
-                character = self.find_one_feature(char_name, frame, self.config.get("Character Threshold"))  # 用角色标注模板在本帧做匹配，角色用独立阈值。
-                monsters = []  # 收集本帧全部怪物匹配框。
-                for name in monster_names:  # 逐个怪物分类匹配，支持多个怪物。
-                    monsters.extend(self.find_all_features(name, frame, self.config.get("Monster Threshold"), self.config.get("Monster Mirror Threshold")))  # 追加该分类的全部匹配框，怪物与怪物镜像各用独立阈值。
+                gm = None  # 本帧 GPU 匹配句柄，默认不可用。
+                if gpu is not None:  # GPU 匹配器可用时才尝试批量匹配。
+                    try:  # 上传/计算可能因显存等原因异常。
+                        gm = gpu.match_frame(frame)  # 上传本帧做批量匹配。
+                    except Exception as e:  # 本帧 GPU 处理异常。
+                        gpu = None  # 永久回退 CPU，避免每帧重复报错。
+                        self.log_warning(f"GPU match failed at runtime, fall back to CPU: {e}. GPU 匹配运行异常，已回退 CPU。")  # 记录回退原因。
+                if gm is not None:  # GPU 路径：一帧内批量算完角色与全部怪物（含镜像）。
+                    character = self.gpu_lookup_one(gm, char_name, self.config.get("Character Threshold"))  # 角色取最高分框，镜像命中带 flipped 标记。
+                    monsters = []  # 收集本帧全部怪物匹配框。
+                    for name in monster_names:  # 逐个怪物分类取全部达标框。
+                        monsters.extend(self.gpu_lookup_all(gm, name, self.config.get("Monster Threshold"), self.config.get("Monster Mirror Threshold")))  # 原始与镜像各自阈值，合并后去重。
+                else:  # CPU 路径：逐个模板调用 OpenCV 匹配，行为与 GPU 路径一致。
+                    character = self.find_one_feature(char_name, frame, self.config.get("Character Threshold"))  # 用角色标注模板在本帧做匹配，角色用独立阈值。
+                    monsters = []  # 收集本帧全部怪物匹配框。
+                    for name in monster_names:  # 逐个怪物分类匹配，支持多个怪物。
+                        monsters.extend(self.find_all_features(name, frame, self.config.get("Monster Threshold"), self.config.get("Monster Mirror Threshold")))  # 追加该分类的全部匹配框，怪物与怪物镜像各用独立阈值。
                 if character is not None and monsters:  # 角色存在时先剔除压在角色身上的怪物框。
                     kept = []  # 过滤后的怪物框列表。
                     for monster in monsters:  # 逐只检查是否与角色框重叠。
@@ -282,6 +298,61 @@ class MapleIdleTask(MyBaseTask):  # 定义冒险岛挂机任务，继承项目�
         if box is None:  # 两种朝向都找不到角色。
             return None  # 返回未知。
         return -1 if getattr(box, "flipped", False) else 1  # 镜像命中=朝左，原始命中=朝右。
+
+    def build_gpu_matcher(self, char_name, monster_names):  # 构建 GPU 匹配器并为角色与全部怪物注册原始/镜像模板，不可用时返回 None。
+        if not self.config.get("GPU Match"):  # 配置关闭 GPU 匹配。
+            return None  # 直接用 CPU。
+        try:  # 延迟导入，未安装 cupy 时不影响任务加载。
+            from src.gpu_match import GpuTemplateMatcher, gpu_available  # 导入项目 GPU 匹配模块。
+            if not gpu_available():  # 无可用 NVIDIA 显卡或 CuPy 未装好。
+                self.log_info("GPU match unavailable, use CPU. 显卡加速不可用，使用 CPU 匹配。")  # 提示回退原因。
+                return None  # 回退 CPU。
+            matcher = GpuTemplateMatcher(gray=bool(self.config.get("Use Gray Scale")))  # 按灰度配置创建匹配器。
+            feature_set = self.executor.feature_set  # 取执行器的特征集。
+            for name in [char_name] + monster_names:  # 逐个分类注册原始与镜像两份模板。
+                feature_set.ensure_feature(name)  # 确保标注已加载。
+                feature = feature_set.feature_dict.get(name)  # 取特征对象。
+                if feature is None or getattr(feature, "mask", None) is not None:  # 标注缺失或带掩码时 GPU 路径无法等价复现。
+                    self.log_info(f"Feature {name} not GPU-matchable, use CPU. 标注 {name} 无法 GPU 匹配，整体回退 CPU。")  # 说明回退原因。
+                    return None  # 回退 CPU 保证行为一致。
+                matcher.add_template(name, feature.mat)  # 注册原始朝向模板。
+                matcher.add_template(name + "__flip", cv2.flip(feature.mat, 1))  # 注册水平镜像模板。
+            self.log_info("GPU template match enabled. 已启用显卡模板匹配加速。")  # 提示加速已生效。
+            return matcher  # 返回可用的匹配器。
+        except Exception as e:  # 初始化任何环节异常都不影响任务运行。
+            self.log_warning(f"GPU match init failed, use CPU: {e}. GPU 匹配初始化失败，使用 CPU。")  # 记录异常原因。
+            return None  # 回退 CPU。
+
+    def gpu_lookup_one(self, gm, name, threshold, mirror_threshold=None):  # 在 GPU 帧句柄中找一个目标的最佳框，镜像未单独给阈值时沿用主阈值。
+        try:  # GPU 计算异常时返回 None，由调用方回退 CPU。
+            x, y, score = gm.best(name)  # 原始朝向模板的最高分与位置。
+            flipped = False  # 默认原始朝向命中。
+            if score < threshold:  # 原始朝向未达标时改用镜像模板。
+                x, y, score = gm.best(name + "__flip")  # 镜像模板的最高分与位置。
+                flipped = True  # 标记为镜像命中。
+                threshold = mirror_threshold or threshold  # 镜像使用独立阈值。
+            if score < threshold:  # 两种朝向都未达标。
+                return None  # 按未匹配处理。
+            td = gm.matcher.templates[name + "__flip" if flipped else name]  # 取命中模板的尺寸。
+            box = Box(int(x), int(y), td["w"], td["h"], confidence=float(score), name=name)  # 包装成 Box。
+            box.flipped = flipped  # 镜像命中标记，供画面标注区分朝向。
+            return box  # 返回匹配框。
+        except Exception as e:  # GPU 计算异常。
+            self.log_warning(f"GPU lookup failed for {name}: {e}. GPU 匹配异常。")  # 记录异常。
+            return None  # 按未匹配处理，调用方可回退 CPU。
+
+    def gpu_lookup_all(self, gm, name, threshold, mirror_threshold=None):  # 在 GPU 帧句柄中找一个目标的全部匹配框，含镜像并去重。
+        boxes = []  # 收集两种朝向的全部匹配框。
+        try:  # GPU 计算异常时返回空列表，不影响主流程。
+            for row in gm.above(name, threshold):  # 原始朝向全部达标位置。
+                boxes.append(Box(int(row[0]), int(row[1]), gm.matcher.templates[name]["w"], gm.matcher.templates[name]["h"], confidence=float(row[2]), name=name))  # 包装成 Box。
+            for row in gm.above(name + "__flip", mirror_threshold or threshold):  # 镜像朝向全部达标位置。
+                box = Box(int(row[0]), int(row[1]), gm.matcher.templates[name + "__flip"]["w"], gm.matcher.templates[name + "__flip"]["h"], confidence=float(row[2]), name=name)  # 包装成 Box。
+                box.flipped = True  # 标记镜像命中。
+                boxes.append(box)  # 加入结果。
+        except Exception as e:  # GPU 计算异常。
+            self.log_warning(f"GPU lookup-all failed for {name}: {e}. GPU 匹配异常。")  # 记录异常。
+        return self.merge_boxes(boxes)  # 两种朝向的框合并后统一去重。
 
     def find_one_feature(self, feature_name, frame, threshold, mirror_threshold=None):  # 在一帧画面中匹配一个标注模板，返回置信度最高的框或 None，镜像未单独给阈值时沿用主阈值。
         try:  # 标注不存在时框架会抛 ValueError，不能中断主流程。

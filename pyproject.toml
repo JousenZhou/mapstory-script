@@ -22,3 +22,8 @@ web = [
 docs = [
     "mkdocs==1.6.1",
 ]
+# Optional: NVIDIA GPU template-matching acceleration used by MapleIdleTask.
+# The task falls back to CPU automatically when this extra is not installed.
+gpu = [
+    "cupy-cuda12x[ctk]",
+]

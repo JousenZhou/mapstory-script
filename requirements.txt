@@ -2,6 +2,9 @@ adbutils==2.12.0
     # via ok-script
 certifi==2026.7.22
     # via requests
+# Optional GPU acceleration for template matching (pip install -e ".[gpu]").
+cupy-cuda12x==14.2.0
+    # via ok-script-app gpu extra (pyproject.toml)
 charset-normalizer==3.5.0
     # via requests
 comtypes==1.4.16

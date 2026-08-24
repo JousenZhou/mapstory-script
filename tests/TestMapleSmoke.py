@@ -50,6 +50,35 @@ class TestMapleIdleSmoke(TaskTestCase):
         self.assertIsInstance(dx, int)
         self.assertIsInstance(dy, int)
 
+    def test_gpu_match_consistent_with_cpu(self):
+        # GPU 路径与 CPU 路径对同一帧的最佳匹配位置与分数应一致，位置容差 3 像素、分数容差 0.02。
+        try:  # CuPy 未安装时跳过，不阻断无显卡环境的测试。
+            from src.gpu_match import GpuTemplateMatcher, gpu_available
+        except Exception as e:
+            self.skipTest(f"cupy not installed: {e}")
+        if not gpu_available():  # 无可用 NVIDIA 显卡。
+            self.skipTest("no available NVIDIA GPU")
+        self.set_image('ok_templates/0.png')
+        frame = self.task.frame
+        feature_set = self.task.executor.feature_set
+        names = [self.task.config['Character Feature'], "绿水灵"]  # 角色与怪物各验一个。
+        matcher = GpuTemplateMatcher(gray=bool(self.task.config.get("Use Gray Scale")))  # 按任务灰度配置建匹配器。
+        for name in names:  # 注册原始与镜像模板，与任务运行时的注册方式一致。
+            feature_set.ensure_feature(name)
+            feature = feature_set.feature_dict.get(name)
+            matcher.add_template(name, feature.mat)
+            matcher.add_template(name + "__flip", cv2.flip(feature.mat, 1))
+        gm = matcher.match_frame(frame)
+        for name in names:  # 逐个分类对比 GPU 与 CPU 的最佳匹配。
+            cpu_box = self.task.find_one_feature(name, frame, 0.6)
+            gx, gy, gscore = gm.best(name)
+            if cpu_box is None:  # CPU 找不到时 GPU 分数也必须不达标。
+                self.assertLess(gscore, 0.6)
+                continue
+            self.assertLessEqual(abs(gx - cpu_box.x), 3)
+            self.assertLessEqual(abs(gy - cpu_box.y), 3)
+            self.assertLess(abs(gscore - cpu_box.confidence), 0.02)
+
 
 if __name__ == '__main__':
     unittest.main()

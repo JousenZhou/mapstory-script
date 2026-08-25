@@ -19,6 +19,9 @@ _feature_set_module.load_json = _load_json_utf8  # 替换库内默认按系统 G
 # 需要毫秒级（3 位小数）精度的浮点配置键：框默认只有 2 位小数，无法输入 0.001 级别的位移时长。
 _THREE_DECIMAL_KEYS = frozenset({"Move Away Seconds", "Move Back Seconds"})
 
+# 需要放大上限的浮点配置键：框默认上限 99.99，Del 间隔需要输入三位数（如 100 秒）。
+_LARGE_MAX_KEYS = frozenset({"Del Key Interval", "Del Key Interval Variance"})
+
 _original_double_spinbox_init = _double_spinbox_module.LabelAndDoubleSpinBox.__init__  # 保存框架浮点控件的原构造函数。
 
 
@@ -29,6 +32,9 @@ def _patched_double_spinbox_init(self, config_desc, config, key):  # 包装浮�
         self.spin_box.setSingleStep(0.05)  # 步进缩小，方便微调小数。
         self.spin_box.setMinimum(0.0)  # 时长不允许负数。
         self.spin_box.setValue(self.config.get(self.key))  # 原构造在 2 位小数下赋的值会被截断，提精度后重新赋回完整值。
+    if key in _LARGE_MAX_KEYS:  # Del 间隔类配置需要支持三位数秒数。
+        self.spin_box.setRange(0.0, 999.0)  # 上限从默认 99.99 提升到 999，下限保持非负。
+        self.spin_box.setValue(self.config.get(self.key))  # 超出旧上限的已保存值重新赋回。
 
 
 _double_spinbox_module.LabelAndDoubleSpinBox.__init__ = _patched_double_spinbox_init  # 替换框默认 2 位小数的行为，导入时全局生效。

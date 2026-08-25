@@ -59,6 +59,18 @@
       "file_name": "9.png",
       "width": 1366,
       "height": 768
+    },
+    {
+      "id": 14,
+      "file_name": "10.png",
+      "width": 1366,
+      "height": 768
+    },
+    {
+      "id": 15,
+      "file_name": "11.png",
+      "width": 1366,
+      "height": 768
     }
   ],
   "annotations": [
@@ -130,20 +142,20 @@
     {
       "id": 6,
       "image_id": 12,
-      "category_id": 6,
+      "category_id": 18,
       "bbox": [
         670,
-        335,
-        44,
-        29
+        337,
+        33,
+        20
       ],
-      "area": 1276,
+      "area": 660,
       "iscrowd": 0
     },
     {
       "id": 7,
       "image_id": 13,
-      "category_id": 7,
+      "category_id": 16,
       "bbox": [
         5,
         71,
@@ -230,6 +242,45 @@
       ],
       "area": 10492,
       "iscrowd": 0
+    },
+    {
+      "id": 14,
+      "image_id": 14,
+      "category_id": 13,
+      "bbox": [
+        496,
+        387,
+        25,
+        18
+      ],
+      "area": 450,
+      "iscrowd": 0
+    },
+    {
+      "id": 15,
+      "image_id": 14,
+      "category_id": 15,
+      "bbox": [
+        684,
+        446,
+        19,
+        18
+      ],
+      "area": 342,
+      "iscrowd": 0
+    },
+    {
+      "id": 16,
+      "image_id": 15,
+      "category_id": 17,
+      "bbox": [
+        3,
+        70,
+        212,
+        85
+      ],
+      "area": 18020,
+      "iscrowd": 0
     }
   ],
   "categories": [
@@ -259,16 +310,6 @@
       "supercategory": ""
     },
     {
-      "id": 6,
-      "name": "帽子",
-      "supercategory": ""
-    },
-    {
-      "id": 7,
-      "name": "完整小地图",
-      "supercategory": ""
-    },
-    {
       "id": 8,
       "name": "鳄鱼",
       "supercategory": ""
@@ -294,8 +335,33 @@
       "supercategory": ""
     },
     {
+      "id": 13,
+      "name": "小青蛇1",
+      "supercategory": ""
+    },
+    {
       "id": 14,
       "name": "背景参照",
+      "supercategory": ""
+    },
+    {
+      "id": 15,
+      "name": "小青蛇2",
+      "supercategory": ""
+    },
+    {
+      "id": 16,
+      "name": "完整小地图1",
+      "supercategory": ""
+    },
+    {
+      "id": 17,
+      "name": "沼泽地1",
+      "supercategory": ""
+    },
+    {
+      "id": 18,
+      "name": "帽子",
       "supercategory": ""
     }
   ]

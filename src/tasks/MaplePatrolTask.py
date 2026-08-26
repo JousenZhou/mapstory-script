@@ -12,7 +12,6 @@ from src.tasks.MapleIdleTask import MapleIdleTask  # 导入挂机任务，复用
 MOVE_LEFT_KEY = "left"  # 左方向键：向左巡逻时持续按住。
 MOVE_RIGHT_KEY = "right"  # 右方向键：向右巡逻时持续按住。
 
-DOT_MAX_JUMP_PERCENT = 30.0  # 黄点跟踪跳变阈值（地图区域对角线的百分比）：候选块与上一帧位置距离超过该值视为瞬移或严重干扰，回退采信面积最大块。
 DOT_SAT_MIN = 80  # HSV 取黄色的饱和度下限，过滤灰白色干扰。
 DOT_VAL_MIN = 80  # HSV 取黄色的亮度下限，过滤暗色干扰。
 DOT_MISSING_HOLD_SECONDS = 2.0  # 黄点丢失期间允许继续按住方向键的最大秒数，超时松键等黄点恢复，避免盲走越界。
@@ -159,7 +158,6 @@ class MaplePatrolTask(MapleIdleTask):  # 定义冒险岛小地图巡逻打怪任
         facing = None  # 角色当前朝向：1=右、-1=左、None=未知，移动时与方向同步，攻击时用于换向判定。
         held_move_key = None  # 当前持续按住的移动方向键，换向/攻击/退出时必须松开它。
         held_attack_key = None  # 当前持续按住的攻击键，换侧/目标消失/退出时必须松开它。
-        last_dot = None  # 上一帧黄点位置（画面坐标），用于跟踪连续性。
         anchor_x = None  # 卡住判定的位置锚点，黄点移动超过阈值时重置。
         anchor_time = time.time()  # 位置锚点上次更新时间。
         dot_missing_since = None  # 黄点开始丢失的时间戳，None 表示当前能检测到。
@@ -186,14 +184,14 @@ class MaplePatrolTask(MapleIdleTask):  # 定义冒险岛小地图巡逻打怪任
                         facing = actual_facing  # 及时按图像修正，后续转身判定会自动补发转身键。
                 minimap = self.find_minimap(minimap_name, frame, minimap_threshold)  # 模板匹配定位小地图框。
                 rect = self.map_rect(minimap) if minimap is not None else None  # 计算实际地图区域（画面坐标）。
-                dot = self.detect_dot(frame, rect, last_dot, hue_min, hue_max, dot_min_pixels) if rect is not None else None  # 在地图区域内检测角色黄点。
+                dot = self.detect_dot(frame, rect, hue_min, hue_max, dot_min_pixels) if rect is not None else None  # 在地图区域内直接检测角色黄点，不做跨帧追踪。
                 if minimap is None:  # 找不到小地图时停止巡逻移动，攻击判定照常进行。
                     if held_move_key is not None:  # 有按住的移动键。
                         self.send_key_up(held_move_key)  # 松开方向键停止移动。
                         held_move_key = None  # 清空按住状态。
-                    last_dot, anchor_x, dot_missing_since = None, None, None  # 清空全部跟踪状态。
+                    anchor_x, dot_missing_since = None, None  # 清空卡住锚点与丢失计时。
                 elif dot is None:  # 小地图在但黄点检测不到：短暂保持移动，长时间丢失则松键等待。
-                    last_dot, anchor_x = None, None  # 黄点丢失时跟踪连续性中断。
+                    anchor_x = None  # 黄点丢失时卡住锚点失效。
                     if dot_missing_since is None:  # 刚开始丢失。
                         dot_missing_since = time.time()  # 开始丢失计时。
                     elif held_move_key is not None and time.time() - dot_missing_since >= DOT_MISSING_HOLD_SECONDS:  # 丢失超时仍按住方向键有盲走风险。
@@ -216,7 +214,6 @@ class MaplePatrolTask(MapleIdleTask):  # 定义冒险岛小地图巡逻打怪任
                         anchor_x, anchor_time = None, time.time()  # 脱困后重置卡住锚点。
                     if held_move_key is not None:  # 确实在移动时朝向与移动方向一致。
                         facing = direction  # 同步朝向，供攻击换向判定直接使用，减少转身探测。
-                    last_dot = dot  # 记录本帧黄点位置供下一帧跟踪。
                 gm = None  # 本帧 GPU 匹配句柄，默认不可用。
                 if gpu is not None:  # GPU 匹配器可用时才尝试批量匹配。
                     try:  # 上传/计算可能因显存等原因异常。
@@ -340,7 +337,7 @@ class MaplePatrolTask(MapleIdleTask):  # 定义冒险岛小地图巡逻打怪任
             raise ValueError("Map Rect value out of range")  # 越界。
         return tuple(values)  # 返回 (x, y, w, h) 百分比。
 
-    def detect_dot(self, frame, rect, last_dot, hue_min, hue_max, min_pixels):  # 在地图区域内检测角色黄点，返回画面坐标 (x, y, 面积) 或 None。
+    def detect_dot(self, frame, rect, hue_min, hue_max, min_pixels):  # 在地图区域内检测角色黄点，返回画面坐标 (x, y, 面积) 或 None。
         x, y, w, h = rect  # 地图区域。
         roi = frame[y:y + h, x:x + w]  # 裁剪地图区域画面。
         if roi.size == 0:  # 区域无效。
@@ -364,12 +361,7 @@ class MaplePatrolTask(MapleIdleTask):  # 定义冒险岛小地图巡逻打怪任
             candidates.append((cx, cy, area))  # 加入候选。
         if not candidates:  # 地图区域内没有黄点。
             return None  # 返回未检测到。
-        if last_dot is not None:  # 有上一帧位置时优先采信离上一帧最近的候选块，保证跟踪连续性。
-            max_jump = ((w ** 2 + h ** 2) ** 0.5) * DOT_MAX_JUMP_PERCENT / 100  # 跳变阈值：地图区域对角线的 30%。
-            nearest = min(candidates, key=lambda c: (c[0] - last_dot[0]) ** 2 + (c[1] - last_dot[1]) ** 2)  # 离上一帧最近的候选块。
-            if (nearest[0] - last_dot[0]) ** 2 + (nearest[1] - last_dot[1]) ** 2 <= max_jump ** 2:  # 距离在阈值内视为正常移动。
-                return nearest  # 采信最近块。
-        return max(candidates, key=lambda c: c[2])  # 首帧或发生瞬移/严重干扰时，采信面积最大块。
+        return max(candidates, key=lambda c: c[2])  # 小地图内只有角色一个黄点，直接采信面积最大块；偶发噪点面积小自然被排除，无需跨帧追踪。
 
     def update_stuck_anchor(self, x, anchor_x, anchor_time, width):  # 更新卡住判定锚点：位置变化超过阈值视为移动了，重置锚点与时间。
         move_px = max(2, width * STUCK_MIN_MOVE_PERCENT / 100)  # 变化阈值：2 像素与区域宽度 0.8% 取较大者。

@@ -41,16 +41,14 @@ class TestMaplePatrolSmoke(TaskTestCase):
             MaplePatrolTask.parse_map_rect("abc")
 
     def test_detect_dot(self):
-        # 合成画面：两个黄点，无上一帧时取最大块，有上一帧时优先最近块。
+        # 合成画面：两个黄色块，直接采信面积最大块，不做跨帧追踪。
         frame = np.full((200, 500, 3), 20, dtype=np.uint8)
         cv2.circle(frame, (150, 80), 4, (0, 255, 255), -1)
         cv2.circle(frame, (420, 60), 6, (0, 255, 255), -1)
         rect = (50, 20, 400, 160)
-        largest = self.task.detect_dot(frame, rect, None, 18, 38, 4)
+        largest = self.task.detect_dot(frame, rect, 18, 38, 4)
         self.assertEqual((420, 60), (largest[0], largest[1]))
-        nearest = self.task.detect_dot(frame, rect, (148, 79), 18, 38, 4)
-        self.assertEqual((150, 80), (nearest[0], nearest[1]))
-        self.assertIsNone(self.task.detect_dot(frame, rect, None, 90, 120, 4))  # 色相窗口不含黄色时无结果。
+        self.assertIsNone(self.task.detect_dot(frame, rect, 90, 120, 4))  # 色相窗口不含黄色时无结果。
 
     def test_detect_template_facing(self):
         # 用左右朝向模板判定朝向：双命中取置信度高者，都未命中返回 None。

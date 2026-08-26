@@ -135,8 +135,9 @@ class MaplePatrolTask(MapleIdleTask):  # 定义冒险岛小地图巡逻打怪任
             self.log_warning(f"Right facing template not annotated, facing calibration disabled: {facing_right_name}. 右朝向模板未标注，朝向校准已禁用：{facing_right_name}。")  # 提示并禁用校准，不阻断任务。
             facing_right_name = ''  # 清空后不再参与校准。
         facing_check = bool(facing_left_name and facing_right_name)  # 左右两个朝向模板都就绪才启用图像朝向校准。
-        attack_key_left = self.config.get("Attack Key Left")  # 读取左侧攻击按键，目标在左时按住它。
-        attack_key_right = self.config.get("Attack Key Right")  # 读取右侧攻击按键，目标在右时按住它。
+        attack_key = self.config.get("Attack Key")  # 读取常规攻击按键，横向距离超过近战距离时按住它。
+        melee_key = self.config.get("Melee Attack Key")  # 读取近战攻击按键，横向距离在近战距离内时按住它。
+        melee_distance = float(self.config.get("Melee Distance") or 0)  # 读取近战距离（像素），横向距离绝对值不超过该值用近战键。
         attack_x_min, attack_x_max = sorted((int(self.config.get("Attack Range X Min")), int(self.config.get("Attack Range X Max"))))  # 读取攻击区域左右边界（符号化像素），填反时自动交换。
         attack_y_min, attack_y_max = sorted((int(self.config.get("Attack Range Y Min")), int(self.config.get("Attack Range Y Max"))))  # 读取攻击区域上下边界（符号化像素），填反时自动交换。
         del_interval = float(self.config.get("Del Key Interval") or 0)  # 读取自动按 Del 键的基础间隔秒数，0 表示禁用。
@@ -157,7 +158,7 @@ class MaplePatrolTask(MapleIdleTask):  # 定义冒险岛小地图巡逻打怪任
         direction = 1  # 巡逻方向：1=向右、-1=向左，默认先向右走。
         facing = None  # 角色当前朝向：1=右、-1=左、None=未知，移动时与方向同步，攻击时用于换向判定。
         held_move_key = None  # 当前持续按住的移动方向键，换向/攻击/退出时必须松开它。
-        held_attack_key = None  # 当前持续按住的攻击键，换侧/目标消失/退出时必须松开它。
+        held_attack_key = None  # 当前持续按住的攻击键（近战或常规），切换/目标消失/退出时必须松开它。
         anchor_x = None  # 卡住判定的位置锚点，黄点移动超过阈值时重置。
         anchor_time = time.time()  # 位置锚点上次更新时间。
         dot_missing_since = None  # 黄点开始丢失的时间戳，None 表示当前能检测到。
@@ -267,8 +268,8 @@ class MaplePatrolTask(MapleIdleTask):  # 定义冒险岛小地图巡逻打怪任
                         held_move_key = None  # 清空按住状态。
                     dx, dy = self.center_offset(character, target)  # 计算目标怪物相对角色的方向。
                     want_direction = 1 if dx > 0 else -1  # 1=怪在右侧，-1=怪在左侧。
-                    want_key = attack_key_right if want_direction == 1 else attack_key_left  # 目标在右用右键，在左用左键。
-                    if held_attack_key is not None and held_attack_key != want_key:  # 换目标侧时先松开旧键，避免两键同时按住。
+                    want_key = melee_key if abs(dx) <= melee_distance else attack_key  # 横向距离在近战距离内用近战键，否则用常规攻击键，怪物走近走远时自动切换。
+                    if held_attack_key is not None and held_attack_key != want_key:  # 换攻击键（近战/常规切换）时先松开旧键，避免两键同时按住。
                         self.send_key_up(held_attack_key)  # 松开当前按住的攻击键。
                         held_attack_key = None  # 清空按住状态。
                     if facing != want_direction:  # 朝向与怪物方向不一致时执行转身序列，绝不持续按住方向键造成移动。
@@ -280,7 +281,7 @@ class MaplePatrolTask(MapleIdleTask):  # 定义冒险岛小地图巡逻打怪任
                         facing = want_direction  # 记录当前朝向，同一方向不再重复按键，避免持续位移。
                         self.sleep(0.08)  # 等待转身动作生效后再攻击。
                     if held_attack_key is None:  # 当前没有按住攻击键时才按下，已按住则保持不重复发送。
-                        self.send_key_down(want_key)  # 持续按住对应侧攻击键不放。
+                        self.send_key_down(want_key)  # 持续按住近战或常规攻击键不放。
                         held_attack_key = want_key  # 记录当前按住的键。
                     self.info_set("Status", "Attacking")  # 在 GUI 显示攻击状态。
                     self.sleep(0.1)  # 按住期间每 0.1 秒重新识别一次校准目标。
@@ -388,6 +389,10 @@ class MaplePatrolTask(MapleIdleTask):  # 定义冒险岛小地图巡逻打怪任
             y_min, y_max = sorted((int(self.config.get("Attack Range Y Min")), int(self.config.get("Attack Range Y Max"))))  # 上下边界，填反自动交换，与判定公式一致。
             cv2.rectangle(canvas, (int(cx + x_min), int(cy + y_min)), (int(cx + x_max), int(cy + y_max)), (255, 0, 255), 2)  # 紫色矩形框标出攻击范围，怪物中心点落入框内才会被攻击。
             self.draw_text(canvas, "ATK RANGE", (int(cx + x_min), max(int(cy + y_min) - 6, 14)), (255, 0, 255))  # 范围框左上角标注文本。
+            melee_distance = int(float(self.config.get("Melee Distance") or 0))  # 近战距离，与 run() 中近战/常规攻击键切换公式一致。
+            if melee_distance > 0:  # 配置了近战距离时用蓝线框出近战范围。
+                cv2.rectangle(canvas, (int(cx - melee_distance), int(cy + y_min)), (int(cx + melee_distance), int(cy + y_max)), (255, 0, 0), 2)  # 蓝色矩形框标出近战范围，怪物中心点落入框内用近战键。
+                self.draw_text(canvas, f"MELEE {melee_distance}", (int(cx - melee_distance), min(int(cy + y_max) + 16, canvas.shape[0] - 6)), (255, 0, 0))  # 近战框下方标注近战距离，避免与上方的 ATK RANGE 标注重叠。
         for monster in monsters:  # 绘制每只怪物的标注。
             self.draw_target(canvas, monster, (0, 0, 255), "MOB" + ("-flip" if getattr(monster, "flipped", False) else ""), cross=False)  # 红色框不带十字延长线，避免多只怪物时红线交叉刷屏，镜像命中时标注 -flip。
         if target is not None:  # 存在当前攻击目标时额外高亮。

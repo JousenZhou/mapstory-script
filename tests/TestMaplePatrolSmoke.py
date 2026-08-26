@@ -22,12 +22,12 @@ class TestMaplePatrolSmoke(TaskTestCase):
         for removed in ("Move Interval", "Move Away Seconds", "Move Back Seconds", "Turn Interval"):
             self.assertNotIn(removed, self.task.default_config)
             self.assertNotIn(removed, self.task.config_description)
-        for kept in ("Attack Key Left", "Attack Key Right", "Monster Features", "GPU Match", "Patrol Left Percent", "Patrol Right Percent", "Minimap Feature", "Character Facing Left Feature", "Character Facing Right Feature"):
+        for kept in ("Attack Key", "Melee Attack Key", "Melee Distance", "Monster Features", "GPU Match", "Patrol Left Percent", "Patrol Right Percent", "Minimap Feature", "Character Facing Left Feature", "Character Facing Right Feature"):
             self.assertIn(kept, self.task.default_config)
 
     def test_validate_config(self):
-        self.assertIsNone(self.task.validate_config("Attack Key Left", "a"))  # 合法按键复用父类校验。
-        self.assertIsNotNone(self.task.validate_config("Attack Key Right", "not_a_key"))  # 非法按键报错。
+        self.assertIsNone(self.task.validate_config("Attack Key", "a"))  # 合法按键复用父类校验。
+        self.assertIsNotNone(self.task.validate_config("Melee Attack Key", "not_a_key"))  # 非法按键报错。
         self.assertIsNone(self.task.validate_config("Patrol Left Percent", 10.0))  # 合法占比。
         self.assertIsNotNone(self.task.validate_config("Patrol Left Percent", 120))  # 越界占比报错。
         self.assertIsNotNone(self.task.validate_config("Dot Hue Min", 200))  # 色相越界报错。

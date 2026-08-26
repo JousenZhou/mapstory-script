@@ -19,9 +19,12 @@ class TestMapleIdleSmoke(TaskTestCase):
         self.assertEqual(["小青蛇", "绿水灵"], names)
 
     def test_validate_attack_key(self):
-        for key in ("Attack Key Left", "Attack Key Right"):  # 两侧攻击按键都要走按键合法性校验。
+        for key in ("Attack Key", "Melee Attack Key"):  # 常规与近战攻击按键都要走按键合法性校验。
             self.assertIsNone(self.task.validate_config(key, "a"))
             self.assertIsNotNone(self.task.validate_config(key, "not_a_key"))
+        self.assertIsNone(self.task.validate_config("Melee Distance", 40))  # 近战距离合法非负数字。
+        self.assertIsNotNone(self.task.validate_config("Melee Distance", "abc"))  # 非数字报错。
+        self.assertIsNotNone(self.task.validate_config("Melee Distance", -1))  # 负数报错。
 
     def test_find_monster_flipped(self):
         # 整帧水平镜像后怪物朝向反转，镜像匹配应能命中并标记 flipped。

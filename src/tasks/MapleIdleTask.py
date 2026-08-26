@@ -27,8 +27,9 @@ class MapleIdleTask(MyBaseTask):  # 定义冒险岛挂机任务，继承项目�
             "Attack Range X Max": 150,  # 攻击区域右边界：怪物横向偏移小于等于该值才可攻击，正值=角色右侧。
             "Attack Range Y Min": -60,  # 攻击区域上边界：怪物纵向偏移大于等于该值才可攻击，负值=角色上方。
             "Attack Range Y Max": 60,  # 攻击区域下边界：怪物纵向偏移小于等于该值才可攻击，正值=角色下方。
-            "Attack Key Left": "a",  # 左侧攻击按键：目标在角色左侧时持续按住该键攻击。
-            "Attack Key Right": "b",  # 右侧攻击按键：目标在角色右侧时持续按住该键攻击。
+            "Attack Key": "a",  # 常规攻击按键：不分左右，横向距离超过近战距离时持续按住该键攻击。
+            "Melee Attack Key": "b",  # 近战攻击按键：横向距离在近战距离内时持续按住该键攻击。
+            "Melee Distance": 40,  # 近战距离：怪物横向距离 0 到该值用近战攻击键，该值到攻击区域 X 边界用常规攻击键。
             "Del Key Interval": 0.0,  # 每隔该秒数自动按一下 Del 键，设为 0 表示禁用。
             "Move Interval": 30.0,  # 每隔该秒数停止全部状态做一次位移：停攻 1 秒→朝角色朝向反向移动 Move Away Seconds 秒→攻击一下→等 1 秒→再反方向移动 Move Back Seconds 秒，设为 0 表示禁用。
             "Move Away Seconds": 1.0,  # 位移第一段：朝角色朝向的反向按住方向键移动的秒数，支持 3 位小数（毫秒级）。
@@ -48,8 +49,9 @@ class MapleIdleTask(MyBaseTask):  # 定义冒险岛挂机任务，继承项目�
             "Attack Range X Max": "Right boundary of attack zone in signed pixels relative to character, positive=right side. 攻击区域右边界（像素，正值=右侧）。",
             "Attack Range Y Min": "Top boundary of attack zone in signed pixels relative to character, negative=above. 攻击区域上边界（像素，负值=上方）。",
             "Attack Range Y Max": "Bottom boundary of attack zone in signed pixels relative to character, positive=below. 攻击区域下边界（像素，正值=下方）。",
-            "Attack Key Left": "Key held to attack targets on the left, must exist on the keyboard. 左侧攻击按键：打左边怪用，仅支持键盘存在的按键。",
-            "Attack Key Right": "Key held to attack targets on the right, must exist on the keyboard. 右侧攻击按键：打右边怪用，仅支持键盘存在的按键。",
+            "Attack Key": "Normal attack key held regardless of side, used beyond Melee Distance; must exist on the keyboard. 常规攻击按键：不分左右，超出近战距离时用，仅支持键盘存在的按键。",
+            "Melee Attack Key": "Melee attack key held when the horizontal distance is within Melee Distance; must exist on the keyboard. 近战攻击按键：横向距离在近战距离内时用，仅支持键盘存在的按键。",
+            "Melee Distance": "Horizontal distance in pixels; 0 to this value uses the melee attack key, this value to the Attack Range X bounds uses the normal attack key. 近战距离（像素）：0 到该值用近战攻击键，该值到攻击区域 X 边界用常规攻击键。",
             "Del Key Interval": "Seconds between automatic Del key presses; 0 disables it. 每隔该秒数自动按一下 Del 键，0 禁用。",
             "Move Interval": "Seconds between reposition moves: stop attacking and wait 1s, move opposite to character facing for Move Away Seconds, attack once, wait 1s, then move back for Move Back Seconds; 0 disables it. 每隔该秒数停攻等 1 秒后位移一次（朝朝向反向移动、攻击一下、等 1 秒、再反方向移回），0 禁用。",
             "Move Away Seconds": "Hold seconds for the first leg, moving opposite to character facing, supports 3 decimals. 位移第一段：朝角色朝向反向移动的秒数，支持 3 位小数。",
@@ -64,11 +66,18 @@ class MapleIdleTask(MyBaseTask):  # 定义冒险岛挂机任务，继承项目�
         })
 
     def validate_config(self, key, value):  # 配置保存前校验，返回错误提示或 None。
-        if key in ("Attack Key Left", "Attack Key Right"):  # 两侧攻击按键都必须是键盘上存在的按键。
+        if key in ("Attack Key", "Melee Attack Key"):  # 常规与近战攻击按键都必须是键盘上存在的按键。
             try:  # 用框架自带的按键校验逻辑。
                 self.validate_key(value)  # 非法按键会抛出异常。
             except Exception:  # 按键非法时阻止保存并提示。
                 return "Attack key must exist on the keyboard. 攻击按键必须是键盘上存在的按键。"
+        if key == "Melee Distance":  # 近战距离必须是非负数字。
+            try:  # 尝试按浮点数解析。
+                distance = float(value)  # 解析用户输入。
+            except (TypeError, ValueError):  # 非数字输入。
+                return "Melee distance must be a number. 近战距离必须是数字。"  # 阻止保存并提示。
+            if distance < 0:  # 距离不能为负。
+                return "Melee distance must be >= 0. 近战距离必须大于等于 0。"  # 阻止保存并提示。
         return None  # 其他配置项不做额外校验。
 
     def run(self):  # 任务运行入口。
@@ -85,8 +94,9 @@ class MapleIdleTask(MyBaseTask):  # 定义冒险岛挂机任务，继承项目�
         if missing:  # 必要标注缺失时无法运行。
             self.log_warning(f"Template not ready, please annotate in the Template tab: {', '.join(missing)}. 模板未就绪，请先在模板页标注：{'、'.join(missing)}。")  # 提示用户去模板页标注。
             return  # 标注不可用时直接结束任务。
-        attack_key_left = self.config.get("Attack Key Left")  # 读取左侧攻击按键，目标在左时按住它。
-        attack_key_right = self.config.get("Attack Key Right")  # 读取右侧攻击按键，目标在右时按住它。
+        attack_key = self.config.get("Attack Key")  # 读取常规攻击按键，横向距离超过近战距离时按住它。
+        melee_key = self.config.get("Melee Attack Key")  # 读取近战攻击按键，横向距离在近战距离内时按住它。
+        melee_distance = float(self.config.get("Melee Distance") or 0)  # 读取近战距离（像素），横向距离绝对值不超过该值用近战键。
         attack_x_min, attack_x_max = sorted((int(self.config.get("Attack Range X Min")), int(self.config.get("Attack Range X Max"))))  # 读取攻击区域左右边界（符号化像素），填反时自动交换。
         attack_y_min, attack_y_max = sorted((int(self.config.get("Attack Range Y Min")), int(self.config.get("Attack Range Y Max"))))  # 读取攻击区域上下边界（符号化像素），填反时自动交换。
         del_interval = float(self.config.get("Del Key Interval") or 0)  # 读取自动按 Del 键的间隔秒数，0 表示禁用。
@@ -99,7 +109,7 @@ class MapleIdleTask(MyBaseTask):  # 定义冒险岛挂机任务，继承项目�
         last_turn_time = time.time()  # 上次做转身攻击的时间，从任务启动开始计时。
         gpu = self.build_gpu_matcher(char_name, monster_names)  # 尝试构建 GPU 匹配器并注册全部模板，失败返回 None 走 CPU。
         facing = None  # 角色当前朝向：1=右、-1=左、None=未知，只在需要换向时单击方向键。
-        held_key = None  # 当前持续按住的攻击键，换侧/换向/目标消失/退出时必须松开它。
+        held_key = None  # 当前持续按住的攻击键（近战或常规），切换/换向/目标消失/退出时必须松开它。
         last_diag_time = 0.0  # 上次诊断日志的时间戳，限频避免刷日志。
         try:  # 包裹主循环，退出时兜底松开持续按住的攻击键。
             while True:  # 实时识图循环，直到用户手动停止任务。
@@ -124,8 +134,7 @@ class MapleIdleTask(MyBaseTask):  # 定义冒险岛挂机任务，继承项目�
                     back_key = MOVE_RIGHT_KEY if facing == 1 else MOVE_LEFT_KEY  # 第二段按键：第一段的反方向，即朝向方向。
                     self.send_key(away_key, down_time=move_away_seconds)  # 按住方向键朝朝向反向移动 y 秒，首次按下会先转身再移动。
                     facing = -facing  # 第一段移动后角色已转身，朝向与原朝向相反。
-                    once_key = attack_key_right if facing == 1 else attack_key_left  # 按第一段移动后的朝向选择对应侧攻击键。
-                    self.send_key(once_key, down_time=0.2)  # 短按一下攻击键攻击一次。
+                    self.send_key(attack_key, down_time=0.2)  # 短按一下常规攻击键攻击一次，位移后距离未知不用近战键。
                     self.sleep(1.0)  # 攻击后等 1 秒再执行第二段位移，等攻击后摇结束，避免第二段的方向键被吞。
                     self.send_key(back_key, down_time=move_back_seconds)  # 按住方向键反方向移动 z 秒，按下时先转回身再移动。
                     facing = -facing  # 第二段移动后再次转身，朝向恢复为位移前的原朝向。
@@ -148,8 +157,7 @@ class MapleIdleTask(MyBaseTask):  # 定义冒险岛挂机任务，继承项目�
                     self.send_key(turn_key, down_time=0.05)  # 短按一下方向键完成转身。
                     facing = -facing  # 转身后朝向与原朝向相反。
                     self.sleep(0.08)  # 等待转身动画生效后再攻击。
-                    once_key = attack_key_right if facing == 1 else attack_key_left  # 按转身后的朝向选择对应侧攻击键。
-                    self.send_key(once_key, down_time=0.2)  # 短按一下攻击键攻击一次。
+                    self.send_key(attack_key, down_time=0.2)  # 短按一下常规攻击键攻击一次，转身后距离未知不用近战键。
                     self.sleep(0.5)  # 攻击后等 0.5 秒再转身，等攻击后摇结束，避免归位的方向键被吞导致没有转回来。
                     back_key = MOVE_RIGHT_KEY if turn_key == MOVE_LEFT_KEY else MOVE_LEFT_KEY  # 归位键：转身键的反方向，转身后朝向已翻转，再按同一方向键会变成前行而不是转身。
                     self.send_key(back_key, down_time=0.05)  # 短按反方向键转回身归位。
@@ -212,8 +220,8 @@ class MapleIdleTask(MyBaseTask):  # 定义冒险岛挂机任务，继承项目�
                 if target is not None:  # 攻击范围内有怪物时原地攻击。
                     dx, dy = self.center_offset(character, target)  # 计算目标怪物相对角色的方向。
                     direction = 1 if dx > 0 else -1  # 1=怪在右侧，-1=怪在左侧。
-                    want_key = attack_key_right if direction == 1 else attack_key_left  # 目标在右用右键，在左用左键。
-                    if held_key is not None and held_key != want_key:  # 换目标侧时先松开旧键，避免两键同时按住。
+                    want_key = melee_key if abs(dx) <= melee_distance else attack_key  # 横向距离在近战距离内用近战键，否则用常规攻击键，怪物走近走远时自动切换。
+                    if held_key is not None and held_key != want_key:  # 换攻击键（近战/常规切换）时先松开旧键，避免两键同时按住。
                         self.send_key_up(held_key)  # 松开当前按住的攻击键。
                         held_key = None  # 清空按住状态。
                     if facing != direction:  # 朝向与怪物方向不一致时才单击方向键换向，绝不持续按住造成移动。
@@ -221,7 +229,7 @@ class MapleIdleTask(MyBaseTask):  # 定义冒险岛挂机任务，继承项目�
                         facing = direction  # 记录当前朝向，同一方向不再重复按键，避免持续位移。
                         self.sleep(0.08)  # 等待转身动作生效后再攻击。
                     if held_key is None:  # 当前没有按住攻击键时才按下，已按住则保持不重复发送。
-                        self.send_key_down(want_key)  # 持续按住对应侧攻击键不放。
+                        self.send_key_down(want_key)  # 持续按住近战或常规攻击键不放。
                         held_key = want_key  # 记录当前按住的键。
                     self.info_set("Status", "Attacking")  # 在 GUI 显示攻击状态。
                     self.sleep(0.1)  # 按住期间每 0.1 秒重新识别一次校准目标。
@@ -248,6 +256,10 @@ class MapleIdleTask(MyBaseTask):  # 定义冒险岛挂机任务，继承项目�
             y_min, y_max = sorted((int(self.config.get("Attack Range Y Min")), int(self.config.get("Attack Range Y Max"))))  # 上下边界，填反自动交换，与判定公式一致。
             cv2.rectangle(canvas, (int(cx + x_min), int(cy + y_min)), (int(cx + x_max), int(cy + y_max)), (255, 0, 255), 2)  # 紫色矩形框标出攻击范围，怪物中心点落入框内才会被攻击。
             self.draw_text(canvas, "ATK RANGE", (int(cx + x_min), max(int(cy + y_min) - 6, 14)), (255, 0, 255))  # 范围框左上角标注文本。
+            melee_distance = int(float(self.config.get("Melee Distance") or 0))  # 近战距离，与 run() 中近战/常规攻击键切换公式一致。
+            if melee_distance > 0:  # 配置了近战距离时用蓝线框出近战范围。
+                cv2.rectangle(canvas, (int(cx - melee_distance), int(cy + y_min)), (int(cx + melee_distance), int(cy + y_max)), (255, 0, 0), 2)  # 蓝色矩形框标出近战范围，怪物中心点落入框内用近战键。
+                self.draw_text(canvas, f"MELEE {melee_distance}", (int(cx - melee_distance), min(int(cy + y_max) + 16, canvas.shape[0] - 6)), (255, 0, 0))  # 近战框下方标注近战距离，避免与上方的 ATK RANGE 标注重叠。
         for monster in monsters:  # 绘制每只怪物的标注。
             self.draw_target(canvas, monster, (0, 0, 255), "MOB" + ("-flip" if getattr(monster, "flipped", False) else ""))  # 红色框+十字延长线，镜像命中时标注 -flip，方便确认镜像匹配生效。
         if target is not None:  # 存在当前攻击目标时额外高亮。

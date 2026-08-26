@@ -1,0 +1,84 @@
+name: Build Exe
+
+on:
+  push:
+    # 与 build.yml 相同, 按 tag 触发; 产物作为绿色版附加到同一 Release
+    tags:
+      - 'v*'
+
+jobs:
+  build-exe:
+
+    runs-on: windows-latest
+
+    env:
+      PYTHONIOENCODING: 'UTF-8'
+
+    strategy:
+      matrix:
+        python-version: [ 3.12 ]
+
+    steps:
+      - name: Configure git
+        run: |
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+        shell: pwsh
+
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          # cupy 为可选 GPU 加速依赖, 体积大且打包时已 exclude, 这里不安装
+          (Get-Content requirements.txt | Where-Object { $_ -notmatch 'cupy' }) | Set-Content requirements-ci.txt
+          pip install --no-deps -r requirements-ci.txt
+          pip install pyinstaller
+        shell: pwsh
+
+      - name: Run tests
+        run: |
+          Get-ChildItem -Path ".\tests\*.py" | ForEach-Object {
+              Write-Host "Running tests in $($_.FullName)"
+              python -m unittest $_.FullName
+          }
+        shell: pwsh
+
+      - name: Build with PyInstaller
+        run: |
+          python -m PyInstaller build_exe.spec --clean --noconfirm
+          # 项目资源目录按 exe 同级相对路径读取, 复制到 exe 同级
+          foreach ($res in @("i18n", "ok_templates", "icons", "assets")) {
+              Copy-Item -Path $res -Destination "dist\goodgoodstudydaydayup" -Recurse -Force
+          }
+          New-Item -ItemType Directory -Force -Path "dist\goodgoodstudydaydayup\configs" | Out-Null
+          # 版本号写入 exe 同级 VERSION.txt, main.py 启动时读取
+          Set-Content -Path "dist\goodgoodstudydaydayup\VERSION.txt" -Value "${{ github.ref_name }}" -Encoding ascii -NoNewline
+        shell: pwsh
+
+      - name: Zip artifact
+        run: |
+          Compress-Archive -Path "dist\goodgoodstudydaydayup\*" -DestinationPath "dist\goodgoodstudydaydayup-win-x64.zip" -CompressionLevel Optimal
+        shell: pwsh
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          draft: false
+          body: |
+            ### 版本 ${{ github.ref_name }}
+            ### 下载包说明
+              * [ok-script-app-win32-China-setup.exe](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/ok-script-app-win32-China-setup.exe) 完整安装包, 更新使用阿里云+腾讯CNB.
+              * [ok-script-app-win32-Global-setup.exe](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/ok-script-app-win32-Global-setup.exe) full package with dependencies, using GitHub and PyPi as update source
+              * [ok-script-app-win32-Web-setup.exe](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/ok-script-app-win32-Web-setup.exe) web UI package with dependencies
+              * [goodgoodstudydaydayup-win-x64.zip](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/goodgoodstudydaydayup-win-x64.zip) 绿色免安装版 (PyInstaller 独立 exe, 解压后以管理员身份运行)
+            ### 如果无法下载或下载慢, 请检查网络或使用代理下载
+          files: dist/goodgoodstudydaydayup-win-x64.zip

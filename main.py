@@ -1,5 +1,26 @@
+import os
+import sys
+
 import ok
-from src.config import config
+
+if getattr(sys, 'frozen', False):  # PyInstaller 打包后, 将工作目录切到 exe 所在目录, 保证 configs/ok_templates 等相对路径一致。
+    os.chdir(os.path.dirname(os.path.abspath(sys.executable)))
+
+from src import config as config_module
+
+# 版本号优先级: exe 同级 VERSION.txt (打包时写入) > APP_VERSION 环境变量 > 源码默认值。
+_version_file = os.path.join(os.getcwd(), 'VERSION.txt')
+_app_version = ""
+if os.path.exists(_version_file):
+    with open(_version_file, encoding='utf-8') as f:
+        _app_version = f.read().strip()
+if not _app_version:
+    _app_version = os.environ.get("APP_VERSION", "")
+if _app_version:
+    config_module.version = _app_version
+    config_module.config['version'] = _app_version
+
+config = config_module.config
 
 if __name__ == '__main__':
     config = config

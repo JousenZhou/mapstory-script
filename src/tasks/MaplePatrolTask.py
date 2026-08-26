@@ -19,6 +19,7 @@ DOT_MISSING_HOLD_SECONDS = 2.0  # 黄点丢失期间允许继续按住方向键�
 STUCK_MOVE_SECONDS = 0.5  # 卡住恢复时反向移动按住的秒数。
 STUCK_MIN_MOVE_PERCENT = 0.8  # 位置变化达到该百分比（地图区域宽度）才算“移动了”，否则累计卡住时长。
 ATTACK_TO_MOVE_WAIT = 0.5  # 攻击结束后恢复巡逻按方向键前的等待秒数，过早按键会被攻击后摇动画吞掉（沿用挂机任务验证过的时序）。
+FACING_CHECK_INTERVAL = 0.2  # 用朝向模板校准角色实际朝向的间隔秒数，兼顾及时修正与 CPU 开销。
 
 
 class MaplePatrolTask(MapleIdleTask):  # 定义冒险岛小地图巡逻打怪任务，继承挂机任务复用检测与攻击能力。
@@ -33,6 +34,8 @@ class MaplePatrolTask(MapleIdleTask):  # 定义冒险岛小地图巡逻打怪任
             self.config_description.pop(key, None)  # 移除帮助文本。
         self.default_config.update({  # 巡逻专属配置项，父类没有需自行补充。
             "Del Key Interval Variance": 20.0,  # Del 间隔随机浮动量：每次按完后下一次间隔在基础值 ±该值内随机，设为 0 表示固定间隔。
+            "Character Facing Left Feature": "",  # 角色左朝向模板：模板页标注的分类名，用于图像识别校准朝向，留空禁用朝向校准。
+            "Character Facing Right Feature": "",  # 角色右朝向模板：模板页标注的分类名，用于图像识别校准朝向，两个朝向模板都配置才启用校准。
             "Minimap Feature": "完整小地图",  # 小地图：模板页标注的分类名，按分类匹配小地图位置。
             "Minimap Threshold": 0.8,  # 小地图匹配阈值：越高匹配越严格。
             "Map Rect": "",  # 小地图框内的实际地图区域（相对小地图框的百分比，格式 x,y,w,h 如 5,20,90,75），留空表示整个小地图框。
@@ -46,6 +49,8 @@ class MaplePatrolTask(MapleIdleTask):  # 定义冒险岛小地图巡逻打怪任
         })
         self.config_description.update({  # 巡逻专属配置项的帮助文本。
             "Del Key Interval Variance": "Random ±variance applied to Del Key Interval after each press, e.g. 100 with 20 gives 80-120; 0 means fixed. Del 间隔随机浮动量：每次按完后下一次间隔在基础值 ±该值内随机，0 表示固定间隔。",
+            "Character Facing Left Feature": "Category name annotated for the left-facing character template; empty disables facing calibration. 角色左朝向模板：模板页标注的分类名，留空禁用朝向校准。",
+            "Character Facing Right Feature": "Category name annotated for the right-facing character template; both facing templates are required to enable calibration. 角色右朝向模板：模板页标注的分类名，两个朝向模板都配置才启用校准。",
             "Minimap Feature": "Category name annotated for the minimap in the Template tab. 小地图：在模板页标注的分类名。",
             "Minimap Threshold": "Template match threshold for the minimap, higher means stricter. 小地图匹配阈值，越高越严格。",
             "Map Rect": "Actual map area inside the minimap box as percents of the minimap box, format x,y,w,h e.g. 5,20,90,75; empty means the whole minimap box. 小地图框内的实际地图区域（相对小地图框的百分比，格式 x,y,w,h），留空表示整个小地图框。",
@@ -90,10 +95,29 @@ class MaplePatrolTask(MapleIdleTask):  # 定义冒险岛小地图巡逻打怪任
             return base  # 直接返回基础值。
         return max(0.1, base + random.uniform(-variance, variance))  # 基础值 ±浮动量内随机，下限 0.1 秒防止浮动过大导致连续快速按键。
 
+    def find_one_raw(self, feature_name, frame, threshold):  # 仅用原始朝向匹配单个模板（不做镜像回退），返回置信度最高的框或 None。
+        try:  # 标注不存在时框架会抛 ValueError，不能中断主流程。
+            return self.find_one(feature_name, frame=frame, threshold=threshold, use_gray_scale=self.config.get("Use Gray Scale"), horizontal_variance=1, vertical_variance=1)  # variance=1 表示全屏搜索，朝向模板不能用镜像否则左右会互串。
+        except ValueError:  # 该分类名未在模板页标注。
+            return None  # 按未匹配处理。
+
+    def detect_template_facing(self, frame, left_name, right_name, threshold):  # 用左右朝向模板判定角色实际朝向：-1=朝左、1=朝右，都未命中返回 None。
+        left_box = self.find_one_raw(left_name, frame, threshold)  # 匹配左朝向模板。
+        right_box = self.find_one_raw(right_name, frame, threshold)  # 匹配右朝向模板。
+        if left_box is None and right_box is None:  # 两个模板都未命中。
+            return None  # 朝向未知，保持系统当前记录。
+        if left_box is None:  # 只有右朝向命中。
+            return 1  # 角色朝右。
+        if right_box is None:  # 只有左朝向命中。
+            return -1  # 角色朝左。
+        return -1 if getattr(left_box, "confidence", 0) >= getattr(right_box, "confidence", 0) else 1  # 两个都命中时采信置信度更高的一侧。
+
     def run(self):  # 任务运行入口：小地图巡逻移动 + 攻击范围内停下打怪的双层循环。
         char_name = self.config.get("Character Feature")  # 读取角色标注分类名。
         monster_names = self.parse_monster_names(self.config.get("Monster Features"))  # 解析逗号分隔的怪物分类名列表。
         minimap_name = str(self.config.get("Minimap Feature") or '').strip()  # 读取小地图标注分类名。
+        facing_left_name = str(self.config.get("Character Facing Left Feature") or '').strip()  # 读取角色左朝向模板标注分类名，留空禁用朝向校准。
+        facing_right_name = str(self.config.get("Character Facing Right Feature") or '').strip()  # 读取角色右朝向模板标注分类名。
         frame = self.wait_frame()  # 先取到一帧画面，让 FeatureSet 确定画面尺寸。
         if frame is None:  # 取不到画面时无法运行。
             self.log_warning("No frame captured, cannot run. 取不到画面，任务退出。")  # 提示取不到画面。
@@ -105,6 +129,13 @@ class MaplePatrolTask(MapleIdleTask):  # 定义冒险岛小地图巡逻打怪任
         if missing:  # 必要标注缺失时无法运行。
             self.log_warning(f"Template not ready, please annotate in the Template tab: {', '.join(missing)}. 模板未就绪，请先在模板页标注：{'、'.join(missing)}。")  # 提示用户去模板页标注。
             return  # 标注不可用时直接结束任务。
+        if facing_left_name and not self.feature_ready(facing_left_name):  # 左朝向模板已配置但未在模板页标注。
+            self.log_warning(f"Left facing template not annotated, facing calibration disabled: {facing_left_name}. 左朝向模板未标注，朝向校准已禁用：{facing_left_name}。")  # 提示并禁用校准，不阻断任务。
+            facing_left_name = ''  # 清空后不再参与校准。
+        if facing_right_name and not self.feature_ready(facing_right_name):  # 右朝向模板已配置但未在模板页标注。
+            self.log_warning(f"Right facing template not annotated, facing calibration disabled: {facing_right_name}. 右朝向模板未标注，朝向校准已禁用：{facing_right_name}。")  # 提示并禁用校准，不阻断任务。
+            facing_right_name = ''  # 清空后不再参与校准。
+        facing_check = bool(facing_left_name and facing_right_name)  # 左右两个朝向模板都就绪才启用图像朝向校准。
         attack_key_left = self.config.get("Attack Key Left")  # 读取左侧攻击按键，目标在左时按住它。
         attack_key_right = self.config.get("Attack Key Right")  # 读取右侧攻击按键，目标在右时按住它。
         attack_x_min, attack_x_max = sorted((int(self.config.get("Attack Range X Min")), int(self.config.get("Attack Range X Max"))))  # 读取攻击区域左右边界（符号化像素），填反时自动交换。
@@ -134,6 +165,7 @@ class MaplePatrolTask(MapleIdleTask):  # 定义冒险岛小地图巡逻打怪任
         dot_missing_since = None  # 黄点开始丢失的时间戳，None 表示当前能检测到。
         patrol_resume_at = 0.0  # 允许重新按住移动键的时间点，攻击刚结束后短暂等待避免方向键被后摇吞掉。
         last_diag_time = 0.0  # 上次诊断日志的时间戳，限频避免刷日志。
+        last_facing_check = 0.0  # 上次朝向校准的时间戳，0 表示启动后立即校准一次。
         try:  # 包裹主循环，退出时兜底松开移动键与攻击键。
             while True:  # 实时识图循环，直到用户手动停止任务。
                 if del_interval > 0 and time.time() - last_del_time >= next_del_interval:  # 到达本次随机间隔时自动按一下 Del 键。
@@ -144,6 +176,14 @@ class MaplePatrolTask(MapleIdleTask):  # 定义冒险岛小地图巡逻打怪任
                 if frame is None:  # 取不到画面时短暂等待后重试。
                     self.sleep(frame_interval)  # 等待一个帧间隔。
                     continue  # 进入下一帧处理。
+                if facing_check and time.time() - last_facing_check >= FACING_CHECK_INTERVAL:  # 配置了朝向模板时定期用图像校准实际朝向。
+                    last_facing_check = time.time()  # 记录本次校准时间。
+                    actual_facing = self.detect_template_facing(frame, facing_left_name, facing_right_name, self.config.get("Character Threshold"))  # 左右朝向模板取置信度高者。
+                    if actual_facing is not None and facing is None:  # 朝向未知（如任务刚启动）时用图像结果初始化。
+                        facing = actual_facing  # 直接采信图像朝向。
+                    elif actual_facing is not None and actual_facing != facing:  # 图像识别的朝向与系统记录不一致。
+                        self.log_info(f"Facing corrected by template: {facing} -> {actual_facing}. 朝向已由图像校准修正：{facing} -> {actual_facing}。")  # 记录修正供排查。
+                        facing = actual_facing  # 及时按图像修正，后续转身判定会自动补发转身键。
                 minimap = self.find_minimap(minimap_name, frame, minimap_threshold)  # 模板匹配定位小地图框。
                 rect = self.map_rect(minimap) if minimap is not None else None  # 计算实际地图区域（画面坐标）。
                 dot = self.detect_dot(frame, rect, last_dot, hue_min, hue_max, dot_min_pixels) if rect is not None else None  # 在地图区域内检测角色黄点。

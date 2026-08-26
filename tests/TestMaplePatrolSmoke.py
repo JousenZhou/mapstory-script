@@ -1,5 +1,7 @@
 # MaplePatrolTask 回归测试：验证配置裁剪、校验、黄点检测与画面标注逻辑。
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import cv2
@@ -20,7 +22,7 @@ class TestMaplePatrolSmoke(TaskTestCase):
         for removed in ("Move Interval", "Move Away Seconds", "Move Back Seconds", "Turn Interval"):
             self.assertNotIn(removed, self.task.default_config)
             self.assertNotIn(removed, self.task.config_description)
-        for kept in ("Attack Key Left", "Attack Key Right", "Monster Features", "GPU Match", "Patrol Left Percent", "Patrol Right Percent", "Minimap Feature"):
+        for kept in ("Attack Key Left", "Attack Key Right", "Monster Features", "GPU Match", "Patrol Left Percent", "Patrol Right Percent", "Minimap Feature", "Character Facing Left Feature", "Character Facing Right Feature"):
             self.assertIn(kept, self.task.default_config)
 
     def test_validate_config(self):
@@ -49,6 +51,20 @@ class TestMaplePatrolSmoke(TaskTestCase):
         nearest = self.task.detect_dot(frame, rect, (148, 79), 18, 38, 4)
         self.assertEqual((150, 80), (nearest[0], nearest[1]))
         self.assertIsNone(self.task.detect_dot(frame, rect, None, 90, 120, 4))  # 色相窗口不含黄色时无结果。
+
+    def test_detect_template_facing(self):
+        # 用左右朝向模板判定朝向：双命中取置信度高者，都未命中返回 None。
+        frame = np.full((100, 100, 3), 20, dtype=np.uint8)
+        with patch.object(self.task, "find_one_raw", return_value=None):
+            self.assertIsNone(self.task.detect_template_facing(frame, "左", "右", 0.8))  # 都未命中时朝向未知。
+        with patch.object(self.task, "find_one_raw", side_effect=[SimpleNamespace(confidence=0.9), None]):
+            self.assertEqual(-1, self.task.detect_template_facing(frame, "左", "右", 0.8))  # 仅左朝向命中。
+        with patch.object(self.task, "find_one_raw", side_effect=[None, SimpleNamespace(confidence=0.9)]):
+            self.assertEqual(1, self.task.detect_template_facing(frame, "左", "右", 0.8))  # 仅右朝向命中。
+        with patch.object(self.task, "find_one_raw", side_effect=[SimpleNamespace(confidence=0.7), SimpleNamespace(confidence=0.95)]):
+            self.assertEqual(1, self.task.detect_template_facing(frame, "左", "右", 0.8))  # 双命中时采信置信度更高的一侧。
+        with patch.object(self.task, "find_one_raw", side_effect=[SimpleNamespace(confidence=0.95), SimpleNamespace(confidence=0.7)]):
+            self.assertEqual(-1, self.task.detect_template_facing(frame, "左", "右", 0.8))  # 反向双命中取左侧。
 
     def test_update_stuck_anchor(self):
         anchor_x, anchor_time = self.task.update_stuck_anchor(100, None, 0.0, 400)  # 首次建立锚点。

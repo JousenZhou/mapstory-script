@@ -71,6 +71,24 @@
       "file_name": "11.png",
       "width": 1366,
       "height": 768
+    },
+    {
+      "id": 16,
+      "file_name": "12.png",
+      "width": 1366,
+      "height": 768
+    },
+    {
+      "id": 17,
+      "file_name": "13.png",
+      "width": 1366,
+      "height": 768
+    },
+    {
+      "id": 18,
+      "file_name": "14.png",
+      "width": 1366,
+      "height": 768
     }
   ],
   "annotations": [
@@ -145,11 +163,11 @@
       "category_id": 18,
       "bbox": [
         670,
-        337,
-        33,
-        20
+        339,
+        45,
+        18
       ],
-      "area": 660,
+      "area": 810,
       "iscrowd": 0
     },
     {
@@ -281,6 +299,45 @@
       ],
       "area": 18020,
       "iscrowd": 0
+    },
+    {
+      "id": 17,
+      "image_id": 16,
+      "category_id": 6,
+      "bbox": [
+        325,
+        590,
+        42,
+        17
+      ],
+      "area": 714,
+      "iscrowd": 0
+    },
+    {
+      "id": 18,
+      "image_id": 17,
+      "category_id": 7,
+      "bbox": [
+        495,
+        590,
+        40,
+        16
+      ],
+      "area": 640,
+      "iscrowd": 0
+    },
+    {
+      "id": 19,
+      "image_id": 18,
+      "category_id": 19,
+      "bbox": [
+        2,
+        70,
+        225,
+        73
+      ],
+      "area": 16425,
+      "iscrowd": 0
     }
   ],
   "categories": [
@@ -307,6 +364,16 @@
     {
       "id": 5,
       "name": "鳄鱼3",
+      "supercategory": ""
+    },
+    {
+      "id": 6,
+      "name": "帽子左",
+      "supercategory": ""
+    },
+    {
+      "id": 7,
+      "name": "帽子右",
       "supercategory": ""
     },
     {
@@ -362,6 +429,11 @@
     {
       "id": 18,
       "name": "帽子",
+      "supercategory": ""
+    },
+    {
+      "id": 19,
+      "name": "沼泽地3",
       "supercategory": ""
     }
   ]

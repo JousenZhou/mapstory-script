@@ -35,6 +35,29 @@ ok-script==2.0.0b7
     # via ok-script-app (pyproject.toml)
 onnxocr-ppocrv5==0.0.20
     # via ok-script
+# Optional ONNX Runtime CUDA inference stack for LieDetectorTab (pip install -e ".[inference]").
+onnxruntime-gpu==1.23.2
+    # via ok-script-app inference extra (pyproject.toml)
+nvidia-cudnn-cu12==9.25.1.1
+    # via ok-script-app inference extra (pyproject.toml)
+nvidia-cublas-cu12==12.9.2.10
+    # via
+    #   cupy-cuda12x[ctk]
+    #   ok-script-app inference extra (pyproject.toml)
+nvidia-cufft-cu12==11.4.1.4
+    # via
+    #   cupy-cuda12x[ctk]
+    #   ok-script-app inference extra (pyproject.toml)
+nvidia-cuda-runtime-cu12==12.9.79
+    # via
+    #   cupy-cuda12x[ctk]
+    #   ok-script-app inference extra (pyproject.toml)
+nvidia-nvjitlink-cu12==12.9.86
+    # via
+    #   cupy-cuda12x[ctk]
+    #   ok-script-app inference extra (pyproject.toml)
+scipy==1.18.1
+    # via ok-script-app inference extra (pyproject.toml)
 opencc==1.2.0
     # via ok-script
 opencv-python==5.0.0.93

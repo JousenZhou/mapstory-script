@@ -1,13 +1,25 @@
+import math  # 导入标准库 math，用于解测谎鼠标追踪的步长计算。
+import os  # 导入标准库 os，用于测谎报警音频的路径解析与存在性检查。
 import random  # 导入标准库 random，用于 Del 间隔的随机浮动。
 import time  # 导入标准库 time，用于边界折返节奏、卡住计时与攻击节奏。
+import traceback  # 导入标准库 traceback，用于解测谎异常时记录完整堆栈定位问题。
+from collections import deque  # 导入双端队列，用于解测谎时保留每条轨迹的最近中心尾迹。
 
 import cv2  # 导入 OpenCV，用于小地图模板匹配、黄点取色与画面标注绘制。
 import numpy as np  # 导入 NumPy，用于 HSV 取色掩码运算。
 
 from ok import og  # 导入全局对象，用于把带标注画面推送给 UI 实时展示。
+from ok.task.exceptions import TaskDisabledException  # 导入任务被禁用异常，用户停任务时的正常退出信号不能误判为解测谎故障。
 from qfluentwidgets import FluentIcon  # 导入 Fluent 图标，用于任务在 GUI 中显示图标。
 
 from src.tasks.MapleIdleTask import MapleIdleTask  # 导入挂机任务，复用其模板检测、GPU 匹配与攻击相关的全部辅助方法。
+
+try:  # 解测谎推理依赖可选：模块缺失时巡逻照常，仅禁用自动解测谎。
+    from src.liedetector.detector import TransparentShapeDetector  # 导入透明图形检测器（ONNX 会话懒加载，优先 CUDA）。
+    from src.liedetector.solver import TransparentShapeSolver  # 导入透明图形求解器（跟踪+背景方向评分+光标预测）。
+    LIE_SOLVER_AVAILABLE = True  # 推理流水线可用。
+except ImportError:  # liedetector 模块缺失或依赖损坏。
+    LIE_SOLVER_AVAILABLE = False  # 禁用自动解测谎，运行时日志提示。
 
 MOVE_LEFT_KEY = "left"  # 左方向键：向左巡逻时持续按住。
 MOVE_RIGHT_KEY = "right"  # 右方向键：向右巡逻时持续按住。
@@ -20,18 +32,27 @@ STUCK_MIN_MOVE_PERCENT = 0.8  # 位置变化达到该百分比（地图区域宽
 ATTACK_TO_MOVE_WAIT = 0.5  # 攻击结束后恢复巡逻按方向键前的等待秒数，过早按键会被攻击后摇动画吞掉（沿用挂机任务验证过的时序）。
 FACING_CHECK_INTERVAL = 0.2  # 用朝向模板校准角色实际朝向的间隔秒数，兼顾及时修正与 CPU 开销。
 
+LIE_REGION_SHIFT_PIXELS = 4  # 【测谎坐标框】移动超过该像素数视为新一局（或窗口位移），重置求解器与轨迹。
+LIE_TRAIL_LENGTH = 30  # 解测谎可视化每条轨迹保留最近 30 个中心尾迹，与测谎检验页签一致。
+LIE_MOVE_MAX_STEP = 50  # 解测谎时每帧鼠标最多移动的像素数，分步追赶避免光标瞬移过大。
+LIE_MAX_TICKS = 750  # 解测谎无结果兜底退出的帧数（约 25 秒 @30FPS），防止触发标注误匹配造成死循环。
+LIE_FRAME_WAIT = 0.05  # 解测谎中取不到画面时的重试等待秒数。
+CAPTURE_FPS = 30  # 截图采集固定帧率：任务取帧与实时画面推送都按该节拍。
+CAPTURE_MIN_INTERVAL = 1.0 / CAPTURE_FPS  # 固定帧间隔秒数（约 0.0333），配置帧间隔更大时尊重配置。
+
 
 class MaplePatrolTask(MapleIdleTask):  # 定义冒险岛小地图巡逻打怪任务，继承挂机任务复用检测与攻击能力。
 
     def __init__(self, *args, **kwargs):  # 构造函数，先复用父类全部配置再按巡逻场景裁剪。
         super().__init__(*args, **kwargs)  # 父类构造已填好角色/怪物/攻击等全部配置项与帮助文本。
         self.name = "Maple Patrol"  # 任务显示名称。
-        self.description = "Minimap patrol with combat: locate the minimap by template and track the character with the yellow dot color, hold the direction key to walk back and forth between the left/right percent boundaries; when a monster enters the attack range, stop and attack the nearest one until it disappears; red vertical lines mark the boundaries in the live vision."  # 任务描述：小地图巡逻+打怪，黄点跟踪往返边界，攻击范围内有怪就停下打最近一只，边界用红色竖线标出。
+        self.description = "Minimap patrol with combat: locate the minimap by template and track the character with the yellow dot color, hold the direction key to walk back and forth between the left/right percent boundaries; when a monster enters the attack range, stop and attack the nearest one until it disappears; red vertical lines mark the boundaries in the live vision; when the lie detector trigger template appears, pause patrol and auto solve the lie detector mini-game by following the target shape with the mouse; patrol itself can be disabled to keep a watch-only mode.  # 任务描述：小地图巡逻+打怪，黄点跟踪往返边界，攻击范围内有怪就停下打最近一只，边界用红色竖线标出；识别到测谎触发标注时暂停巡逻并自动解测谎（鼠标追踪目标图形），可用开关关闭巡逻打怪只保留监视与解测谎。"
         self.icon = FluentIcon.PLAY  # 任务图标。
         for key in ("Move Interval", "Move Away Seconds", "Move Back Seconds", "Turn Interval"):  # 定时位移与转身策略由小地图巡逻取代，裁剪掉对应配置。
             self.default_config.pop(key, None)  # 移除默认值。
             self.config_description.pop(key, None)  # 移除帮助文本。
         self.default_config.update({  # 巡逻专属配置项，父类没有需自行补充。
+            "Patrol Enabled": True,  # 巡逻打怪总开关：关闭后不移动不攻击不按 Del，只推送画面并值守测谎触发。
             "Del Key Interval Variance": 20.0,  # Del 间隔随机浮动量：每次按完后下一次间隔在基础值 ±该值内随机，设为 0 表示固定间隔。
             "Character Facing Left Feature": "",  # 角色左朝向模板：模板页标注的分类名，用于图像识别校准朝向，留空禁用朝向校准。
             "Character Facing Right Feature": "",  # 角色右朝向模板：模板页标注的分类名，用于图像识别校准朝向，两个朝向模板都配置才启用校准。
@@ -45,8 +66,14 @@ class MaplePatrolTask(MapleIdleTask):  # 定义冒险岛小地图巡逻打怪任
             "Dot Min Pixels": 4,  # 黄点最小像素面积：小于该面积的连通块丢弃。
             "Stuck Seconds": 8.0,  # 卡住判定时长：按住方向键但黄点位置持续无明显变化达该秒数时反向脱困，0 禁用。
             "Resume Wait Seconds": 1.0,  # 卡住脱困后恢复巡逻前的等待秒数。
+            "Lie Detector Auto Solve": True,  # 自动解测谎总开关：识别到【测谎触发】标注时暂停其他功能优先解测谎，默认开启。
+            "Lie Detector Trigger Feature": "测谎触发",  # 测谎触发标注：模板页标注的分类名，匹配到即触发解测谎。
+            "Lie Detector Region Feature": "测谎坐标框",  # 测谎坐标框标注：模板页标注的分类名，透明图形只在该框区域内检测与追踪。
+            "Lie Detector Threshold": 0.7,  # 【测谎触发】的模板匹配阈值，越高越严格；【测谎坐标框】直接采集标注坐标，不参与匹配。
+            "Lie Alarm Sound": "",  # 测谎报警音频文件路径（支持 wav/mp3 等，相对路径相对项目根目录）；留空或文件不存在则不报警。
         })
         self.config_description.update({  # 巡逻专属配置项的帮助文本。
+            "Patrol Enabled": "Master switch of patrol movement and attacking; when off the task only watches the live vision and handles the lie detector trigger. 巡逻打怪总开关：关闭后不巡逻移动、不打怪、不按 Del，仅推送实时画面并在触发测谎时处理解测谎。",
             "Del Key Interval Variance": "Random ±variance applied to Del Key Interval after each press, e.g. 100 with 20 gives 80-120; 0 means fixed. Del 间隔随机浮动量：每次按完后下一次间隔在基础值 ±该值内随机，0 表示固定间隔。",
             "Character Facing Left Feature": "Category name annotated for the left-facing character template; empty disables facing calibration. 角色左朝向模板：模板页标注的分类名，留空禁用朝向校准。",
             "Character Facing Right Feature": "Category name annotated for the right-facing character template; both facing templates are required to enable calibration. 角色右朝向模板：模板页标注的分类名，两个朝向模板都配置才启用校准。",
@@ -60,6 +87,11 @@ class MaplePatrolTask(MapleIdleTask):  # 定义冒险岛小地图巡逻打怪任
             "Dot Min Pixels": "Minimum pixel area of the yellow dot; smaller blobs are ignored. 黄点最小像素面积，更小的连通块丢弃。",
             "Stuck Seconds": "Seconds of no visible dot movement while holding a direction key before a reverse escape; 0 disables it. 按住方向键但黄点持续不动达该秒数时反向脱困，0 禁用。",
             "Resume Wait Seconds": "Seconds to wait after a stuck escape before resuming patrol. 卡住脱困后恢复巡逻前的等待秒数。",
+            "Lie Detector Auto Solve": "When the trigger annotation appears, pause patrol/attack and auto solve the lie detector mini-game with the mouse; resume patrol after the annotation disappears. 自动解测谎总开关：识别到【测谎触发】标注时暂停巡逻/攻击进入解测谎（鼠标自动追踪目标图形），标注消失代表测谎结束并恢复巡逻。",
+            "Lie Detector Trigger Feature": "Category name annotated in the Template tab; matching it means the lie detector starts. 测谎触发标注：模板页标注的分类名，匹配到即代表触发测谎。",
+            "Lie Detector Region Feature": "Category name annotated in the Template tab for the puzzle rectangle; its annotated coordinates are read directly as the solve input area without template matching. 测谎坐标框标注：模板页标注的分类名，直接采集该标注的坐标框信息作为解测谎的输入界面，不做模板匹配。",
+            "Lie Detector Threshold": "Template match threshold for the trigger annotation, higher means stricter; the region box uses its annotated coordinates directly. 【测谎触发】标注的匹配阈值，越高越严格；【测谎坐标框】直接采集标注坐标，不参与匹配。",
+            "Lie Alarm Sound": "Audio file played once when the lie detector triggers (wav/mp3, relative paths resolve against the project root); empty or missing file disables the alarm. 触发测谎时播放一次的报警音频文件路径（支持 wav/mp3，相对路径相对项目根目录），留空或文件不存在则不报警。",
         })
 
     def validate_config(self, key, value):  # 配置保存前校验，返回错误提示或 None。
@@ -85,6 +117,13 @@ class MaplePatrolTask(MapleIdleTask):  # 定义冒险岛小地图巡逻打怪任
                 self.parse_map_rect(str(value))  # 解析失败会抛 ValueError。
             except ValueError:  # 格式不合法。
                 return "Map Rect must be 4 comma-separated percents like x,y,w,h. 地图区域必须是 x,y,w,h 四个逗号分隔的百分比。"  # 阻止保存并提示。
+        if key == "Lie Detector Threshold":  # 测谎匹配阈值必须是 (0, 1] 的数字。
+            try:  # 尝试按浮点数解析。
+                threshold = float(value)  # 解析用户输入。
+            except (TypeError, ValueError):  # 非数字输入。
+                return "Lie detector threshold must be a number. 测谎阈值必须是数字。"  # 阻止保存并提示。
+            if not 0 < threshold <= 1:  # 阈值范围限制。
+                return "Lie detector threshold must be within 0-1. 测谎阈值必须在 0-1 之间。"  # 阻止保存并提示。
         return None  # 其他配置项不做额外校验。
 
     def next_del_interval(self, base, variance):  # 生成下一次按 Del 键前的等待秒数。
@@ -118,16 +157,20 @@ class MaplePatrolTask(MapleIdleTask):  # 定义冒险岛小地图巡逻打怪任
         facing_left_name = str(self.config.get("Character Facing Left Feature") or '').strip()  # 读取角色左朝向模板标注分类名，留空禁用朝向校准。
         facing_right_name = str(self.config.get("Character Facing Right Feature") or '').strip()  # 读取角色右朝向模板标注分类名。
         frame = self.wait_frame()  # 先取到一帧画面，让 FeatureSet 确定画面尺寸。
+        patrol_enabled = bool(self.config.get("Patrol Enabled"))  # 读取巡逻打怪总开关，默认开启；关闭后只监视画面并值守测谎。
         if frame is None:  # 取不到画面时无法运行。
             self.log_warning("No frame captured, cannot run. 取不到画面，任务退出。")  # 提示取不到画面。
             return  # 直接结束任务。
-        if not monster_names:  # 未配置任何怪物分类时无法运行。
+        if not patrol_enabled:  # 监视模式不巡逻不打怪，画面与小地图相关状态不再参与判定。
+            self.log_info("Patrol disabled, watch-only mode: vision only, lie detector watch kept. 巡逻打怪已关闭，仅监视画面并值守测谎。")  # 记录当前运行模式供排查。
+        if patrol_enabled and not monster_names:  # 巡逻模式下未配置任何怪物分类时无法运行。
             self.log_warning("No monster feature configured. 未配置怪物分类名，任务退出。")  # 提示配置缺失。
             return  # 直接结束任务。
-        missing = [name for name in [minimap_name, char_name] + monster_names if not self.feature_ready(name)]  # 检查小地图、角色与全部怪物标注是否存在。
-        if missing:  # 必要标注缺失时无法运行。
-            self.log_warning(f"Template not ready, please annotate in the Template tab: {', '.join(missing)}. 模板未就绪，请先在模板页标注：{'、'.join(missing)}。")  # 提示用户去模板页标注。
-            return  # 标注不可用时直接结束任务。
+        if patrol_enabled:  # 巡逻模式下小地图、角色与全部怪物标注都必须就绪。
+            missing = [name for name in [minimap_name, char_name] + monster_names if not self.feature_ready(name)]  # 检查小地图、角色与全部怪物标注是否存在。
+            if missing:  # 必要标注缺失时无法运行。
+                self.log_warning(f"Template not ready, please annotate in the Template tab: {', '.join(missing)}. 模板未就绪，请先在模板页标注：{'、'.join(missing)}。")  # 提示用户去模板页标注。
+                return  # 标注不可用时直接结束任务。
         if facing_left_name and not self.feature_ready(facing_left_name):  # 左朝向模板已配置但未在模板页标注。
             self.log_warning(f"Left facing template not annotated, facing calibration disabled: {facing_left_name}. 左朝向模板未标注，朝向校准已禁用：{facing_left_name}。")  # 提示并禁用校准，不阻断任务。
             facing_left_name = ''  # 清空后不再参与校准。
@@ -146,15 +189,28 @@ class MaplePatrolTask(MapleIdleTask):  # 定义冒险岛小地图巡逻打怪任
         next_del_interval = self.next_del_interval(del_interval, del_variance)  # 首段间隔也带随机浮动，方法复用父类。
         minimap_threshold = float(self.config.get("Minimap Threshold"))  # 读取小地图匹配阈值。
         left_pct, right_pct = sorted((float(self.config.get("Patrol Left Percent")), float(self.config.get("Patrol Right Percent"))))  # 读取巡逻左右边界（百分比），填反时自动交换。
-        if left_pct >= right_pct:  # 左右边界相同没有可巡逻区间。
+        if patrol_enabled and left_pct >= right_pct:  # 巡逻模式下左右边界相同没有可巡逻区间。
             self.log_warning("Left and right patrol percents are the same, nothing to patrol. 左右巡逻占比相同，无可巡逻区间，任务退出。")  # 提示配置问题。
             return  # 直接结束任务。
         hue_min, hue_max = sorted((int(self.config.get("Dot Hue Min")), int(self.config.get("Dot Hue Max"))))  # 读取黄点色相范围，填反时自动交换。
         dot_min_pixels = max(1, int(self.config.get("Dot Min Pixels")))  # 读取黄点最小面积，至少 1 像素。
         stuck_seconds = float(self.config.get("Stuck Seconds") or 0)  # 读取卡住判定时长，0 表示禁用。
         resume_wait = float(self.config.get("Resume Wait Seconds") or 0)  # 读取脱困后的等待秒数。
-        frame_interval = float(self.config.get("Frame Interval") or 0.05)  # 读取帧间隔。
-        gpu = self.build_gpu_matcher(char_name, monster_names)  # 尝试构建 GPU 匹配器并注册全部模板，失败返回 None 走 CPU。
+        lie_enabled = bool(self.config.get("Lie Detector Auto Solve"))  # 读取自动解测谎总开关，默认开启。
+        lie_trigger_name = str(self.config.get("Lie Detector Trigger Feature") or '').strip()  # 读取【测谎触发】标注分类名。
+        lie_region_name = str(self.config.get("Lie Detector Region Feature") or '').strip()  # 读取【测谎坐标框】标注分类名。
+        lie_threshold = float(self.config.get("Lie Detector Threshold") or 0.7)  # 读取测谎标注的匹配阈值。
+        alarm_sound = str(self.config.get("Lie Alarm Sound") or '').strip()  # 读取报警音频路径，留空表示不报警。
+        if lie_enabled and not LIE_SOLVER_AVAILABLE:  # 开关打开但推理模块不可用。
+            self.log_warning("Lie detector module unavailable, auto solve disabled. 测谎推理模块不可用，自动解测谎已禁用。")  # 提示并降级。
+            lie_enabled = False  # 禁用后不影响巡逻。
+        for lie_name in (lie_trigger_name, lie_region_name):  # 两个测谎标注都必须在模板页标注过才能启用。
+            if lie_enabled and (not lie_name or not self.feature_ready(lie_name)):  # 标注名为空或未标注。
+                self.log_warning(f"Lie detector annotation missing, auto solve disabled: {lie_name}. 测谎标注缺失，自动解测谎已禁用：{lie_name}。")  # 提示并降级，不阻断巡逻。
+                lie_enabled = False  # 禁用。
+        frame_interval = float(self.config.get("Frame Interval") or 0)  # 读取配置帧间隔，0 表示不额外限速。
+        loop_interval = max(frame_interval, CAPTURE_MIN_INTERVAL)  # 截图采集固定 30FPS，配置更慢则尊重配置。
+        gpu = self.build_gpu_matcher(char_name, monster_names) if patrol_enabled else None  # 巡逻模式才构建 GPU 匹配器，监视模式不需要角色/怪物匹配。
         direction = 1  # 巡逻方向：1=向右、-1=向左，默认先向右走。
         facing = None  # 角色当前朝向：1=右、-1=左、None=未知，移动时与方向同步，攻击时用于换向判定。
         held_move_key = None  # 当前持续按住的移动方向键，换向/攻击/退出时必须松开它。
@@ -165,16 +221,49 @@ class MaplePatrolTask(MapleIdleTask):  # 定义冒险岛小地图巡逻打怪任
         patrol_resume_at = 0.0  # 允许重新按住移动键的时间点，攻击刚结束后短暂等待避免方向键被后摇吞掉。
         last_diag_time = 0.0  # 上次诊断日志的时间戳，限频避免刷日志。
         last_facing_check = 0.0  # 上次朝向校准的时间戳，0 表示启动后立即校准一次。
+        loop_start = time.time()  # 本轮循环起点，用于把截图采集节拍钉在固定 30FPS。
         try:  # 包裹主循环，退出时兜底松开移动键与攻击键。
             while True:  # 实时识图循环，直到用户手动停止任务。
-                if del_interval > 0 and time.time() - last_del_time >= next_del_interval:  # 到达本次随机间隔时自动按一下 Del 键。
+                wait = loop_interval - (time.time() - loop_start)  # 计算本轮剩余等待，把取帧节拍钉在固定 30FPS。
+                if wait > 0:  # 未到下一帧时点时先等待，sleep 同时承担用户停止检查。
+                    self.sleep(wait)  # 补齐帧间隔。
+                loop_start = time.time()  # 记录本轮起点供下轮计算。
+                if patrol_enabled and del_interval > 0 and time.time() - last_del_time >= next_del_interval:  # 巡逻模式下到达本次随机间隔时自动按一下 Del 键。
                     last_del_time = time.time()  # 重置计时。
                     self.send_key("delete", down_time=0.05)  # 短按一下 Del 键。
                     next_del_interval = self.next_del_interval(del_interval, del_variance)  # 重新随机下一段间隔，避免固定节奏。
                 frame = self.next_frame()  # 取最新一帧画面并清除旧帧。
-                if frame is None:  # 取不到画面时短暂等待后重试。
-                    self.sleep(frame_interval)  # 等待一个帧间隔。
+                if frame is None:  # 取不到画面时等待下一帧时点再重试。
+                    self.sleep(loop_interval)  # 按固定 30FPS 节拍等待。
+                    loop_start = time.time()  # 重置本轮起点，避免下轮再补等待。
                     continue  # 进入下一帧处理。
+                if lie_enabled:  # 自动解测谎已启用：每帧优先检查触发标注，命中则暂停其他全部功能。
+                    trigger_box = self.find_lie_box(lie_trigger_name, frame, lie_threshold)  # 全屏匹配【测谎触发】标注。
+                    if trigger_box is not None:  # 识别到触发标注，代表测谎已触发。
+                        if held_move_key is not None:  # 先松开当前按住的移动方向键。
+                            self.send_key_up(held_move_key)  # 松开方向键。
+                            held_move_key = None  # 清空按住状态。
+                        if held_attack_key is not None:  # 再松开当前按住的攻击键。
+                            self.send_key_up(held_attack_key)  # 松开攻击键。
+                            held_attack_key = None  # 清空按住状态。
+                        self.play_lie_alarm(alarm_sound)  # 播放报警音频（未配置或文件不存在时自动跳过）。
+                        lie_region_box = self.get_lie_region_box(lie_region_name)  # 直接采集【测谎坐标框】标注的坐标供画面框选，不做模板匹配。
+                        og.my_app.update_vision(self.draw_lie_annotations(frame, trigger_box, lie_region_box))  # 触发瞬间立即把两个标注框选推送到实时画面。
+                        try:  # 进入解测谎子循环，直到【测谎触发】标注消失才返回。
+                            self.solve_lie_detector(frame, lie_trigger_name, lie_region_name, lie_threshold)  # 优先处理解测谎。
+                        except TaskDisabledException:  # 用户手动停任务/任务被禁用是正常退出信号。
+                            raise  # 透传给框架结束任务，绝不能当成解测谎故障禁用自动解测谎。
+                        except Exception as e:  # 推理流水线异常不拖垮巡逻。
+                            self.log_warning(f"Lie solve error, auto solve disabled: {e}\n{traceback.format_exc()} 解测谎异常，已禁用自动解测谎（含完整堆栈）。")  # 记录异常原因与完整堆栈供定位。
+                            lie_enabled = False  # 本次运行不再尝试解测谎。
+                        anchor_x, dot_missing_since = None, None  # 清空卡住锚点与黄点丢失计时，恢复后重新评估。
+                        self.sleep(0.5)  # 等弹窗关闭后画面稳定再继续巡逻。
+                        continue  # 重新取帧恢复巡逻打怪。
+                if not patrol_enabled:  # 监视模式：不巡逻不打怪，只推送带测谎标注框选的画面。
+                    watch_region = self.get_lie_region_box(lie_region_name) if lie_region_name else None  # 坐标框标注配置了才采集坐标，供画面框选。
+                    og.my_app.update_vision(self.draw_lie_annotations(frame, None, watch_region))  # 推送画面：触发标注已在上方框选过，这里补坐标框常态框选。
+                    self.info_set("Status", "Watch only")  # 在 GUI 显示监视状态。
+                    continue  # 跳过后续全部巡逻与攻击逻辑，循环顶部按 30FPS 节拍等待。
                 if facing_check and time.time() - last_facing_check >= FACING_CHECK_INTERVAL:  # 配置了朝向模板时定期用图像校准实际朝向。
                     last_facing_check = time.time()  # 记录本次校准时间。
                     actual_facing = self.detect_template_facing(frame, facing_left_name, facing_right_name, self.config.get("Character Threshold"))  # 左右朝向模板取置信度高者。
@@ -292,7 +381,7 @@ class MaplePatrolTask(MapleIdleTask):  # 定义冒险岛小地图巡逻打怪任
                     patrol_resume_at = time.time() + ATTACK_TO_MOVE_WAIT  # 攻击后摇会吞方向键输入，短暂等待后再恢复移动。
                 if time.time() < patrol_resume_at:  # 攻击刚结束的等待期内只识图不移动。
                     self.info_set("Status", "Resuming patrol")  # 在 GUI 显示恢复巡逻等待状态。
-                    self.sleep(frame_interval)  # 等待一个帧间隔。
+                    self.sleep(loop_interval)  # 按固定 30FPS 节拍等待。
                     continue  # 等待期结束后自动恢复巡逻。
                 if minimap is not None:  # 小地图可用时按巡逻方向持续移动。
                     want_key = MOVE_RIGHT_KEY if direction == 1 else MOVE_LEFT_KEY  # 当前巡逻方向需要的方向键。
@@ -304,7 +393,7 @@ class MaplePatrolTask(MapleIdleTask):  # 定义冒险岛小地图巡逻打怪任
                     self.info_set("Status", "Patrolling right" if direction == 1 else "Patrolling left")  # 在 GUI 显示当前巡逻方向。
                 else:  # 小地图不可用时保持静止等待。
                     self.info_set("Status", "Minimap not found")  # 在 GUI 显示未找到小地图。
-                self.sleep(frame_interval)  # 等待一个帧间隔后处理下一帧。
+                self.sleep(loop_interval)  # 按固定 30FPS 节拍等待后处理下一帧。
         finally:  # 用户停止任务或异常退出时兜底松键，防止按键卡住。
             if held_attack_key is not None:  # 有按住未松的攻击键。
                 self.send_key_up(held_attack_key)  # 松开它。
@@ -420,4 +509,169 @@ class MaplePatrolTask(MapleIdleTask):  # 定义冒险岛小地图巡逻打怪任
             cv2.circle(canvas, (dot[0], dot[1]), 6, (0, 255, 255), 2)  # 黄色圆圈标出角色位置。
             percent = (dot[0] - rect[0]) / rect[2] * 100  # 当前位置百分比。
             self.draw_text(canvas, f"DOT {percent:.1f}%", (dot[0] + 8, dot[1] - 8), (0, 255, 255))  # 黄点旁显示位置百分比。
+        return canvas  # 返回绘制完成的画面。
+
+    def find_lie_box(self, feature_name, frame, threshold):  # 全屏匹配单个测谎标注，返回置信度最高的框或 None。
+        try:  # 标注不存在时框架会抛 ValueError，不能中断主流程。
+            return self.find_one(feature_name, frame=frame, threshold=threshold, use_gray_scale=self.config.get("Use Gray Scale"), horizontal_variance=1, vertical_variance=1)  # variance=1 表示全屏搜索，测谎弹窗位置不固定。
+        except ValueError:  # 该分类名未在模板页标注。
+            return None  # 按未匹配处理。
+
+    def get_lie_region_box(self, region_name):  # 直接采集【测谎坐标框】标注记录的坐标框信息作为解测谎输入界面，不做模板匹配；未标注返回 None。
+        try:  # 框架按标注名读取记录坐标，自动按当前画面分辨率缩放。
+            box = self.get_box_by_name(region_name)  # 找不到标注时框架抛 ValueError。
+        except ValueError:  # 该分类名未在模板页标注。
+            return None  # 按坐标框缺失处理。
+        if box is None:  # 当前无画面帧时框架取不到标注坐标。
+            return None  # 按坐标框缺失处理，等下一帧重试。
+        return box  # 返回标注记录的坐标框。
+
+    def get_lie_detector(self):  # 懒加载透明图形检测器并跨次运行复用（ONNX 会话首次推理时才创建）。
+        if getattr(self, "_lie_detector", None) is None:  # 尚无缓存的检测器。
+            self._lie_detector = TransparentShapeDetector()  # 优先 CUDA EP，失败自动回退 CPU（检测器内部处理）。
+        return self._lie_detector  # 返回复用实例。
+
+    def play_lie_alarm(self, sound_path):  # 播放测谎报警音频：异步播放不阻塞解测谎，失败只记日志不影响任务，返回是否已播放。
+        if not sound_path:  # 未配置音频（没上传）：不报警。
+            return False  # 静默跳过。
+        path = sound_path if os.path.isabs(sound_path) else os.path.join(os.getcwd(), sound_path)  # 相对路径按项目根目录解析。
+        if not os.path.exists(path):  # 文件不存在（没上传或路径写错）：不报警并提示。
+            self.log_warning(f"Lie alarm sound not found, skip: {sound_path}. 测谎报警音频不存在，跳过报警：{sound_path}。")  # 提醒检查路径。
+            return False  # 未播放。
+        try:  # 播放失败也不能拖垮解测谎。
+            if path.lower().endswith('.wav'):  # WAV 用系统声音接口直接异步播放。
+                import winsound  # Windows 系统声音模块。
+                winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC)  # 异步播放，不阻塞任务线程。
+            else:  # mp3/wma 等格式走 Windows MCI 解码播放。
+                import ctypes  # 调用系统 winmm.dll。
+                winmm = ctypes.windll.winmm  # Windows 多媒体 API。
+                alias = "lie_alarm"  # 固定设备别名，重复触发时先关旧实例再重开。
+                winmm.mciSendStringW(f"close {alias}", None, 0, 0)  # 关闭上一次播放残留，避免占用。
+                if winmm.mciSendStringW(f'open "{path}" alias {alias}', None, 0, 0) != 0:  # 自动识别格式打开失败。
+                    if winmm.mciSendStringW(f'open "{path}" type mpegvideo alias {alias}', None, 0, 0) != 0:  # 再按 mpeg 音频显式打开。
+                        self.log_warning(f"Lie alarm sound open failed: {sound_path}. 测谎报警音频无法打开（格式可能不支持）：{sound_path}。")  # 两种打开方式都失败。
+                        return False  # 未播放。
+                winmm.mciSendStringW(f"play {alias}", None, 0, 0)  # 异步播放，不等待播完。
+            self.log_info(f"Lie alarm playing: {sound_path}. 测谎报警音频已播放：{sound_path}。")  # 记录报警供排查。
+            return True  # 已播放。
+        except Exception as e:  # 播放异常不中断解测谎。
+            self.log_warning(f"Lie alarm play failed: {e}. 测谎报警播放失败：{e}。")  # 记录异常原因。
+            return False  # 未播放。
+
+    def solve_lie_detector(self, first_frame, trigger_name, region_name, threshold):  # 解测谎子循环：暂停其他功能，直到【测谎触发】标注从画面消失。
+        self.log_info("Lie detector triggered, patrol paused, auto solving. 识别到【测谎触发】，暂停巡逻进入解测谎状态。")  # 记录进入解测谎供排查。
+        self.info_set("Status", "Solving lie detector")  # 在 GUI 显示解测谎状态。
+        self.ensure_in_front()  # 游戏窗口置顶：鼠标追踪依赖前台窗口接收鼠标事件。
+        detector = self.get_lie_detector()  # 透明图形 YOLO 检测器，懒加载模型。
+        solver = TransparentShapeSolver(fps=30)  # ByteTrack 跟踪+背景方向评分+光标预测求解器，参数与测谎检验页签一致。
+        trails = {}  # 轨迹 ID -> 最近中心点尾迹，用于画面绘制。
+        region = None  # 当前有效的【测谎坐标框】区域 (x, y, w, h)，未匹配到前保持 None。
+        mouse_pos = None  # 上一帧鼠标目标点（画面坐标），用于分步平滑追赶。
+        frame = first_frame  # 从触发帧开始求解。
+        tick = 0  # 已处理帧数，用于兜底超时与诊断限频。
+        last_diag_time = 0.0  # 上次诊断日志时间。
+        while True:  # 循环直到触发标注消失或兜底超时。
+            tick += 1  # 帧计数累加。
+            if tick > LIE_MAX_TICKS:  # 长时间未结束，可能触发标注误匹配，退回巡逻。
+                self.log_warning(f"Lie solve exceeded {LIE_MAX_TICKS} frames, resume patrol. 解测谎超过 {LIE_MAX_TICKS} 帧未结束，退回巡逻。")  # 记录兜底退出。
+                break  # 退出子循环。
+            trigger_box = self.find_lie_box(trigger_name, frame, threshold)  # 本帧匹配【测谎触发】标注，同时供画面红色框选。
+            if trigger_box is None:  # 【测谎触发】标注不在页面，代表测谎已结束。
+                self.log_info("Lie detector finished, resume patrol. 【测谎触发】标注消失，测谎已结束，解除测谎状态恢复挂机。")  # 记录退出原因。
+                break  # 退出子循环恢复巡逻。
+            region_box = self.get_lie_region_box(region_name)  # 直接采集【测谎坐标框】标注记录的坐标框信息，不做模板匹配。
+            new_region = (region_box.x, region_box.y, region_box.width, region_box.height) if region_box is not None else None  # 转为四元组，未采集到时为 None。
+            if new_region is None:  # 本帧未采集到坐标框：沿用旧区域，从未有过则跳过求解。
+                if region is None:  # 从未采集到坐标框。
+                    self.sleep(LIE_FRAME_WAIT)  # 短等后重试（与固定 30FPS 节拍同数量级）。
+                    new_frame = self.next_frame()  # 取新帧。
+                    if new_frame is not None:  # 取到新帧才替换；numpy 数组不能用 or 判真值，必须显式判 None。
+                        frame = new_frame  # 更新当前帧，取不到沿用旧帧。
+                    continue  # 进入下一轮检查。
+            elif region is None or abs(new_region[0] - region[0]) > LIE_REGION_SHIFT_PIXELS or abs(new_region[1] - region[1]) > LIE_REGION_SHIFT_PIXELS:  # 区域首次出现或位置明显变化。
+                region = new_region  # 更新区域。
+                solver = TransparentShapeSolver(fps=30)  # 重置跟踪器与求解器，避免新一局的轨迹污染。
+                trails = {}  # 清空尾迹。
+                mouse_pos = None  # 鼠标目标点重新校准。
+            else:  # 区域位置稳定。
+                region = new_region  # 刷新区域（尺寸可能微调）。
+            crop = frame[region[1]:region[1] + region[3], region[0]:region[0] + region[2]]  # 裁剪谎言检测区域供 YOLO 检测。
+            detections = detector.detect(crop)  # 检测区域内全部透明图形（区域局部坐标）。
+            cursor, target = solver.solve(region, detections)  # 跟踪+背景方向评分选目标+预测光标位置（画面坐标）。
+            if cursor is not None:  # 求解器给出光标目标点时才移动鼠标。
+                mouse_pos = self.move_mouse_toward(mouse_pos, cursor)  # 分步向预测点移动鼠标，模拟人眼平滑追踪。
+            if time.time() - last_diag_time >= 1.0:  # 每秒限频输出一次诊断日志。
+                last_diag_time = time.time()  # 记录本次诊断时间。
+                target_desc = f"#{target.track_id}" if target is not None else "-"  # 当前锁定目标描述。
+                self.log_info(f"Lie solve diag: detections={len(detections)} tracks={len(solver.tracker.tracked)} target={target_desc} cursor={cursor} 解测谎诊断：检测数/轨迹数/目标/光标位置。")  # 供排查检测为空等问题。
+            og.my_app.update_vision(self.draw_lie_overlay(frame, region, detections, solver.tracker.tracked, trails, target, cursor, solver.bg_direction, trigger_box))  # 把目标框选、轨迹追踪与触发标注框选推送给 UI。
+            self.sleep(CAPTURE_MIN_INTERVAL)  # 按固定 30FPS 节拍取帧，同时作为用户停止检查点（手动停止时在此抛出退出）。
+            next_frame = self.next_frame()  # 取最新一帧画面。
+            if next_frame is not None:  # 取到新帧才替换，取不到沿用上一帧继续求解。
+                frame = next_frame  # 更新当前帧。
+
+    def move_mouse_toward(self, current, target):  # 每帧向预测光标位置分步移动鼠标，返回移动后的位置。
+        if current is None:  # 首帧无参照点，直接跳到预测点（游戏内光标也会瞬间到位）。
+            position = target  # 目标位置即预测光标点。
+        else:  # 已有参照点，按最大步长追赶。
+            dx = target[0] - current[0]  # 到预测点的横向位移。
+            dy = target[1] - current[1]  # 到预测点的纵向位移。
+            distance = math.hypot(dx, dy)  # 直线距离。
+            if distance <= LIE_MOVE_MAX_STEP:  # 距离在一个步长内，一步到位。
+                position = target  # 直接到达预测点。
+            else:  # 距离超过单步上限，按最大步长截断方向向量。
+                position = (current[0] + dx / distance * LIE_MOVE_MAX_STEP, current[1] + dy / distance * LIE_MOVE_MAX_STEP)  # 沿目标方向移动一步。
+        self.move(int(position[0]), int(position[1]))  # 画面坐标转为鼠标移动事件发给游戏窗口。
+        return position  # 返回当前位置，供下一帧作参照。
+
+    def draw_lie_annotations(self, frame, trigger_box, region_box):  # 在画面上框选测谎标注：【测谎触发】红色、【测谎坐标框】青色，未命中的不画。
+        canvas = frame.copy()  # 复制画面避免污染原始帧。
+        if trigger_box is not None:  # 【测谎触发】标注命中时用红色框选。
+            cv2.rectangle(canvas, (trigger_box.x, trigger_box.y), (trigger_box.x + trigger_box.width, trigger_box.y + trigger_box.height), (0, 0, 255), 2)  # 红色框标出触发标注位置。
+            self.draw_text(canvas, "LIE TRIGGER", (trigger_box.x, max(trigger_box.y - 6, 14)), (0, 0, 255))  # 触发标注标签。
+        if region_box is not None:  # 【测谎坐标框】标注命中时用青色框选。
+            cv2.rectangle(canvas, (region_box.x, region_box.y), (region_box.x + region_box.width, region_box.y + region_box.height), (255, 255, 0), 2)  # 青色框标出谎言检测区域。
+            self.draw_text(canvas, "LIE REGION", (region_box.x, max(region_box.y - 6, 14)), (255, 255, 0))  # 坐标框标签。
+        return canvas  # 返回绘制完成的画面。
+
+    def draw_lie_overlay(self, frame, region, detections, tracks, trails, target, cursor, bg_direction, trigger_box=None):  # 绘制解测谎叠加画面：触发标注框、区域框、目标框选、轨迹尾迹、背景方向箭头与预测光标十字，风格与测谎检验页签一致。
+        canvas = frame.copy()  # 复制画面避免污染原始帧。
+        rx, ry, rw, rh = region  # 谎言检测区域。
+        if trigger_box is not None:  # 【测谎触发】标注在页面上时用红色框选，方便确认触发匹配位置。
+            cv2.rectangle(canvas, (trigger_box.x, trigger_box.y), (trigger_box.x + trigger_box.width, trigger_box.y + trigger_box.height), (0, 0, 255), 2)  # 红色框标出触发标注。
+            self.draw_text(canvas, "LIE TRIGGER", (trigger_box.x, max(trigger_box.y - 6, 14)), (0, 0, 255))  # 触发标注标签。
+        cv2.rectangle(canvas, (rx, ry), (rx + rw, ry + rh), (255, 255, 0), 1)  # 青色框标出测谎坐标框边界。
+        self.draw_text(canvas, "LIE REGION", (rx, max(ry - 6, 14)), (255, 255, 0))  # 区域标签。
+        for (x, y, w, h), score in detections:  # 全部检测框（区域局部坐标转画面坐标）。
+            p1 = (rx + int(x), ry + int(y))  # 检测框左上角。
+            p2 = (rx + int(x + w), ry + int(y + h))  # 检测框右下角。
+            cv2.rectangle(canvas, p1, p2, (0, 220, 0), 1)  # 绿色检测框。
+            cv2.putText(canvas, f"{score:.2f}", (p1[0], max(p1[1] - 3, 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 220, 0), 1)  # 置信度标签。
+        alive_ids = set()  # 本帧存活轨迹 ID 集合。
+        for track in tracks:  # 每条轨迹：尾迹折线 + 卡尔曼速度箭头。
+            tid = track.track_id  # 轨迹 ID。
+            alive_ids.add(tid)  # 记录存活。
+            center = (rx + int(track.rect[0] + track.rect[2] // 2), ry + int(track.rect[1] + track.rect[3] // 2))  # 轨迹中心（局部转画面坐标，取整避免浮点传入 cv2）。
+            trail = trails.setdefault(tid, deque(maxlen=LIE_TRAIL_LENGTH))  # 取或建该轨迹的尾迹队列。
+            trail.append(center)  # 追加本帧中心。
+            if len(trail) >= 2:  # 至少两个点才能画折线。
+                points = np.array(trail, dtype=np.int32).reshape(-1, 1, 2)  # 转为折线点集。
+                cv2.polylines(canvas, [points], False, (0, 200, 255), 1)  # 橙色尾迹折线。
+            vx, vy = track.kalman_velocity  # 卡尔曼速度。
+            cv2.arrowedLine(canvas, center, (center[0] + int(vx * 8), center[1] + int(vy * 8)), (0, 128, 255), 1, tipLength=0.3)  # 速度方向箭头。
+        for tid in [t for t in trails if t not in alive_ids]:  # 清理已消亡轨迹的尾迹。
+            del trails[tid]  # 删除死轨迹。
+        if bg_direction[0] != 0.0 or bg_direction[1] != 0.0:  # 背景运动方向已估计时画大箭头。
+            origin = (rx + 30, ry + 30)  # 箭头起点：区域左上角内侧。
+            cv2.arrowedLine(canvas, origin, (origin[0] + int(bg_direction[0] * 60), origin[1] + int(bg_direction[1] * 60)), (255, 80, 255), 2, tipLength=0.25)  # 背景方向箭头。
+        if target is not None:  # 当前锁定目标高亮框选。
+            x, y, w, h = target.rect  # 目标轨迹框（局部坐标）。
+            cv2.rectangle(canvas, (rx + int(x), ry + int(y)), (rx + int(x + w), ry + int(y + h)), (0, 0, 255), 2)  # 红色高亮框（取整避免浮点传入）。
+            self.draw_text(canvas, f"TARGET #{target.track_id}", (rx + int(x), max(ry + int(y) - 6, 14)), (0, 0, 255))  # 目标标签。
+        if cursor is not None:  # 预测光标位置画十字标记。
+            cx, cy = int(cursor[0]), int(cursor[1])  # 光标画面坐标。
+            cv2.line(canvas, (cx - 12, cy), (cx + 12, cy), (0, 0, 255), 2)  # 横向十字。
+            cv2.line(canvas, (cx, cy - 12), (cx, cy + 12), (0, 0, 255), 2)  # 纵向十字。
+            cv2.circle(canvas, (cx, cy), 4, (0, 0, 255), 1)  # 中心小圆。
+        self.draw_text(canvas, "LIE DETECTOR: SOLVING", (8, 22), (0, 255, 255))  # 左上角状态横幅。
         return canvas  # 返回绘制完成的画面。

@@ -79,7 +79,9 @@ config = {
         }
     },
     'windows': {  # Windows游戏请填写此设置
-        'exe': ['Maplestory_Classic.exe'],  # 锁定采集目标为冒险岛怀旧服客户端窗口
+        # 不锁定 exe：枚举全部可见窗口，交由「选择窗口」的可搜索下拉框选择（见 src/ui/patch_window_selector.py）。
+        # 如需重新锁定为只搜索冒险岛客户端，取消下面这行注释即可。
+        # 'exe': ['Maplestory_Classic.exe'],
         # optional, if set, will search the exe only
         # 'hwnd_class': 'UnrealWindow', #增加重名检查准确度
         'interaction': ['Pynput', 'PostMessage', 'Genshin', 'PyDirect','ForegroundPostMessage'], # Genshin:某些操作可以后台, 部分游戏支持 PostMessage:可后台点击, 极少游戏支持 ForegroundPostMessage:前台使用PostMessage Pynput/PyDirect:仅支持前台使用

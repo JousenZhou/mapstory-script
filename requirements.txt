@@ -58,6 +58,11 @@ nvidia-nvjitlink-cu12==12.9.86
     #   ok-script-app inference extra (pyproject.toml)
 scipy==1.18.1
     # via ok-script-app inference extra (pyproject.toml)
+# Optional ultralytics YOLO CUDA inference for Globals.detect (pip install -e ".[yolo]").
+# torch/torchvision must be CUDA builds; for Blackwell (RTX 50xx, sm_120) use the cu128
+# index, so they are installed separately and NOT pinned here (keeps CI/exe build lean):
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+#   pip install ultralytics
 opencc==1.2.0
     # via ok-script
 opencv-python==5.0.0.93

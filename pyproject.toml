@@ -40,3 +40,14 @@ inference = [
     "nvidia-cuda-runtime-cu12",
     "nvidia-nvjitlink-cu12",
 ]
+# Optional: ultralytics YOLO detection accelerated on NVIDIA GPU, used by
+# Globals.detect (src/globals.py). torch must be a CUDA build matching the GPU
+# generation; for Blackwell (RTX 50xx, sm_120) install from the cu128 index:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+#   pip install ultralytics
+# Globals.detect falls back to CPU / disables itself when this extra is missing.
+yolo = [
+    "torch",
+    "torchvision",
+    "ultralytics>=8.4",
+]

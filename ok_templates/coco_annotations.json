@@ -95,6 +95,18 @@
       "file_name": "15.png",
       "width": 1366,
       "height": 768
+    },
+    {
+      "id": 20,
+      "file_name": "16.png",
+      "width": 1340,
+      "height": 754
+    },
+    {
+      "id": 21,
+      "file_name": "17.png",
+      "width": 1340,
+      "height": 754
     }
   ],
   "annotations": [
@@ -344,6 +356,71 @@
       ],
       "area": 16425,
       "iscrowd": 0
+    },
+    {
+      "id": 20,
+      "image_id": 19,
+      "category_id": 23,
+      "bbox": [
+        575,
+        632,
+        215,
+        33
+      ],
+      "area": 7095,
+      "iscrowd": 0
+    },
+    {
+      "id": 21,
+      "image_id": 19,
+      "category_id": 21,
+      "bbox": [
+        300,
+        109,
+        769,
+        508
+      ],
+      "area": 390652,
+      "iscrowd": 0
+    },
+    {
+      "id": 22,
+      "image_id": 20,
+      "category_id": 22,
+      "bbox": [
+        34,
+        96,
+        191,
+        78
+      ],
+      "area": 14898,
+      "iscrowd": 0
+    },
+    {
+      "id": 23,
+      "image_id": 21,
+      "category_id": 24,
+      "bbox": [
+        567,
+        626,
+        204,
+        27
+      ],
+      "area": 5508,
+      "iscrowd": 0
+    },
+    {
+      "id": 24,
+      "image_id": 21,
+      "category_id": 20,
+      "bbox": [
+        311,
+        135,
+        715,
+        477
+      ],
+      "area": 341055,
+      "iscrowd": 0
     }
   ],
   "categories": [
@@ -440,6 +517,31 @@
     {
       "id": 19,
       "name": "沼泽地3",
+      "supercategory": ""
+    },
+    {
+      "id": 20,
+      "name": "测谎坐标框2",
+      "supercategory": ""
+    },
+    {
+      "id": 21,
+      "name": "测谎坐标框",
+      "supercategory": ""
+    },
+    {
+      "id": 22,
+      "name": "测试",
+      "supercategory": ""
+    },
+    {
+      "id": 23,
+      "name": "测谎触发",
+      "supercategory": ""
+    },
+    {
+      "id": 24,
+      "name": "测谎触发2",
       "supercategory": ""
     }
   ]

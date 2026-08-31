@@ -7,6 +7,9 @@ from qfluentwidgets import FluentIcon  # 导入 Fluent 图标，用于页签图�
 from ok import og  # 导入全局对象，用于读取任务线程推送的画面与截图设备。
 from ok.gui.widget.CustomTab import CustomTab  # 导入自定义页签基类。
 
+CAPTURE_FPS = 30  # 截图采集固定帧率：实时画面刷新与无任务时的截图取帧都按该节拍。
+CAPTURE_INTERVAL_MS = round(1000 / CAPTURE_FPS)  # 帧间隔毫秒数（33ms），QTimer 最小粒度即 1ms 足够。
+
 
 class VisionLabel(QLabel):  # 定义自适应缩放的画面标签。
 
@@ -48,7 +51,7 @@ class VisionTab(CustomTab):  # 定义实时识图画面页签，展示任务推�
         self.add_card("Realtime Vision 实时识图画面", self.image_label, stretch=1)  # 把画面标签放进卡片并占满剩余空间。
         self.timer = QTimer(self)  # 创建刷新定时器。
         self.timer.timeout.connect(self.refresh)  # 定时刷新画面。
-        self.timer.start(100)  # 每 100 毫秒刷新一次，兼顾流畅度与性能。
+        self.timer.start(CAPTURE_INTERVAL_MS)  # 按固定 30FPS 节拍刷新，截图采集速率由此钉死。
 
     @property
     def name(self):  # 页签显示名称。

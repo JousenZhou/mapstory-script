@@ -15,6 +15,7 @@ class Globals(QObject):
         super().__init__()
         self.yolo_model = None  # 存放懒加载的 YOLO 模型实例。
         self.yolo_load_failed = False  # 记录模型是否加载失败，避免重复加载报错。
+        self.yolo_device = None  # YOLO 推理设备：优先 CUDA 显卡，缺失时回退 CPU。
         self._vision_lock = threading.Lock()  # 保护实时画面在任务线程与 UI 线程间的读写。
         self._vision_frame = None  # 最新一帧带标注的游戏画面（BGR 矩阵）。
         self._vision_time = 0.0  # 最新一帧的写入时间戳，用于判断画面是否过期。
@@ -39,18 +40,29 @@ class Globals(QObject):
             try:  # 尝试导入 ultralytics 并加载模型。
                 from ultralytics import YOLO  # 导入 YOLO 类。
                 self.yolo_model = YOLO(model_path)  # 加载用户训练的模型权重。
-                logger.info(f'yolo model loaded: {model_path}')
+                self.yolo_device = self._pick_yolo_device()  # 选择推理设备：优先 CUDA 显卡。
+                logger.info(f'yolo model loaded: {model_path} device: {self.yolo_device}')
             except Exception as e:  # 未安装 ultralytics 或权重损坏时记录并标记失败。
                 logger.error(f'failed to load yolo model: {e}')
                 self.yolo_load_failed = True
         return self.yolo_model  # 返回模型实例或 None。
+
+    @staticmethod
+    def _pick_yolo_device():  # 选择 YOLO 推理设备：有可用 CUDA 显卡返回 0，否则回退 'cpu'。
+        try:
+            import torch  # 导入 torch 探测 CUDA。
+            if torch.cuda.is_available():  # 显卡驱动与 CUDA 运行时可用。
+                return 0  # 使用第一块显卡做推理。
+        except Exception as e:  # torch 未安装或探测异常。
+            logger.warning(f'torch CUDA probe failed, fallback to cpu: {e}')
+        return 'cpu'  # 回退 CPU 推理。
 
     def detect(self, frame, model_path='assets/yolo.pt'):  # 对一帧画面运行 YOLO，返回统一的检测结果。
         model = self.get_yolo(model_path)  # 获取已加载的模型。
         if model is None or frame is None:  # 模型或画面不可用时返回空结果。
             return []
         try:  # 运行推理，verbose=False 避免刷屏日志。
-            results = model.predict(frame, verbose=False)  # 对当前帧做一次推理。
+            results = model.predict(frame, verbose=False, device=self.yolo_device)  # 在选定设备（优先 CUDA）上推理。
         except Exception as e:  # 推理异常时记录并返回空结果，不让任务崩溃。
             logger.error(f'yolo predict failed: {e}')
             return []

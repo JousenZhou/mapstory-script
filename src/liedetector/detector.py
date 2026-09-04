@@ -3,6 +3,7 @@
 #   detect_lie_detector_shape / detect_lie_detector_shape_preparing
 # 推理引擎与参考项目一致：ONNX Runtime，优先 CUDA EP，模型为同一份
 # transparent_shape_nms.onnx（YOLOv12n 内嵌 NMS，输出 [1,300,6]）。
+# 第二期：MaplePatrolTask 迁移到 shape_session 后本文件的 ONNX/ByteTrack 部分将被移除。
 import math
 import os
 from pathlib import Path

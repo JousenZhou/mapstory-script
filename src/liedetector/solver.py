@@ -1,6 +1,7 @@
 # 透明图形求解器移植，逐段对照参考项目 solvers/shape.rs 的 TransparentShapeSolver：
 # 初始锁定区域中心最近轨迹 -> 背景方向估计 -> 夹角评分+高斯距离惩罚 ->
 # 连续 2 帧最高分才切换目标 -> 光标取卡尔曼中心+1 步速度，丢失时 1.5 倍速度外推。
+# 第二期：MaplePatrolTask 迁移到 shape_session 后本文件的 ONNX/ByteTrack 部分将被移除。
 import math
 
 from src.liedetector.tracker import ByteTracker  # 导入移植的 ByteTrack 跟踪器。

@@ -49,13 +49,13 @@ class ShapeTrackParams:
     """
 
     process_scale: float = 0.5  # 处理尺度上限：先把裁剪区域缩小再算，坐标输出时换算回全尺度。
-    max_process_side: float = 400.0  # 处理分辨率上限（最长边像素）：大区域自动降低实际 scale，保证单帧耗时可控。
+    max_process_side: float = 320.0  # 处理分辨率上限（最长边像素）：大区域自动降低实际 scale；320 档实测三个参考视频跟踪结果与 400 档完全一致。
     dis_preset: int = cv2.DISOPTICAL_FLOW_PRESET_FAST  # DIS 光流精度档位（实时档用 FAST，实测 9.1ms→≈5ms，证据图质量下降可忽略）。
     temporal_lags: tuple[int, ...] = (1, 2)  # 时序残差使用的时间基线（实时档只留 2 个，光流次数 3→2）。
     play_height_ratio: float = 1.0  # 有效高度比例。偏离脚本的 0.89：页签处理的是裁出的图形区域，内部没有 UI 需要排除。
     particle_count: int = 280  # 粒子数量（实时档）。
     global_proposals: int = 400  # 重定位第一级粗扫候选数（两级粗到细，替代旧版 2400 一次性打分）。
-    control_count: int = 260  # 对照组数量：只需中位数/ MAD 两个统计量，260 足够稳定。
+    control_count: int = 130  # 对照组数量：只需中位数/ MAD 两个鲁棒统计量，130 足够稳定（实测跟踪结果与 260 一致，耗时减半）。
     coarse_top: int = 30  # 粗扫后进入精扫的 top-K 邻域数。
     refine_per_top: int = 8  # 每个粗扫邻域生成的精扫拖尾候选数。
     relocation_cooldown_frames: int = 15  # 两次全局重定位之间的最小间隔帧数（限频，约 0.5 秒@30fps）。

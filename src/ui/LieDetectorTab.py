@@ -1,6 +1,6 @@
-# 测谎检验页签：用户上传谎言检测器录像，以最快速度逐帧处理（不限速），
+# 测谎检验页签：用户上传谎言检测器录像，按视频原帧率实时播放（处理跟不上时丢帧保实时，贴近真实采集场景），
 # 用 DIS 稠密光流对齐历史帧 + 粒子滤波跟踪透明轮廓（无神经网络），
-# 画面叠加轮廓、状态与实测 FPS，视频模式不发送鼠标，仅验证算法效果。
+# 画面叠加轮廓、状态与实测/源帧率，视频模式不发送鼠标，仅验证算法效果。
 import os
 from pathlib import Path
 import queue
@@ -17,8 +17,8 @@ from qfluentwidgets import BodyLabel, FluentIcon, PushButton, TextEdit  # 导入
 from ok.gui.widget.CustomTab import CustomTab  # 导入自定义页签基类。
 from src.ui.VisionTab import VisionLabel  # 复用实时识图页签的自适应画面标签。
 
-TICK_FPS = 30  # 固定节拍帧率，与参考项目 FPS=30 一致。
-TIMEOUT_TICKS = 545  # 超时兜底 545 tick（约 18 秒），与参考项目 solve_shape.rs 一致。
+TICK_FPS_FALLBACK = 30  # 源帧率缺失时的回退帧率，与参考项目 FPS=30 一致。
+TIMEOUT_TICKS = 545  # 超时预算 545 tick@30fps（约 18 秒），与参考项目 solve_shape.rs 一致；实际按源帧率折算成视频时长。
 LOCATE_MAX_SIDE = 400  # 全屏弹窗定位的分辨率上限（最长边像素）：超过则先缩帧再匹配，坐标换算回原图。
 
 try:  # 探测 OpenCV 是否包含 DIS 稠密光流，缺失时页签降级为不可运行。
@@ -45,8 +45,8 @@ class _EmitLogger:  # 把检测器内部日志转发成 Qt 信号的适配器。
         self._emit(str(message))
 
 
-def draw_shape_overlay(frame, region, result, tick, status, fps_text="", mode_tag=""):
-    """在全帧上叠加：区域框、轮廓、中心点、状态文本（含模式/置信度/对称周期/信噪比）与右上角实测 FPS。"""
+def draw_shape_overlay(frame, region, result, tick, status, timeout_ticks, fps_text="", mode_tag=""):
+    """在全帧上叠加：区域框、轮廓、中心点、状态文本（含模式/置信度/对称周期/信噪比）与右上角帧率。"""
 
     rx, ry, rw, rh = region  # 解包区域坐标。
     cv2.rectangle(frame, (rx, ry), (rx + rw, ry + rh), (255, 255, 0), 1)  # 青色区域框。
@@ -79,7 +79,7 @@ def draw_shape_overlay(frame, region, result, tick, status, fps_text="", mode_ta
     else:  # 未学习/等待。
         text = "SHAPE: learning"
     cv2.putText(frame, text, (8, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.60, color, 2, cv2.LINE_AA)  # 状态文本。
-    cv2.putText(frame, f"tick {tick}/{TIMEOUT_TICKS} [{mode_tag}] {status}", (8, 22),  # 左上角状态条（含模式标签）。
+    cv2.putText(frame, f"tick {tick}/{timeout_ticks} [{mode_tag}] {status}", (8, 22),  # 左上角状态条（含模式标签）。
                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
     if fps_text:  # 右上角实测处理帧率。
         fw = frame.shape[1]  # 帧宽。
@@ -122,7 +122,13 @@ class LieDetectorWorker(QThread):  # 工作线程：在线分析 + 实时预览�
             return
         frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))  # 视频宽。
         frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))  # 视频高。
-        self.log_message.emit(f"video {frame_w}x{frame_h} opened 视频已打开")
+        src_fps = float(cap.get(cv2.CAP_PROP_FPS))  # 源帧率：决定播放节拍与算法时间阈值。
+        if not (5.0 <= src_fps <= 240.0):  # 部分容器返回 0/1000 等异常值：回退 30。
+            src_fps = float(TICK_FPS_FALLBACK)
+        frame_interval = 1.0 / src_fps  # 原帧率播放的单帧间隔（秒）。
+        timeout_ticks = max(1, int(round(TIMEOUT_TICKS / TICK_FPS_FALLBACK * src_fps)))  # 超时预算按源帧率折算，固定约 18 秒视频时长。
+        self.log_message.emit(
+            f"video {frame_w}x{frame_h} opened 视频已打开 src_fps={src_fps:.1f} 源帧率 timeout={timeout_ticks} ticks")
         region_finder = LieDetectorRegion()  # 多尺度模板定位器。
         try:  # 前置流程（模板缩小/探测/定位器构造）异常时也要正常收尾，避免线程静默死亡卡死 UI。
             locate_scale = min(1.0, LOCATE_MAX_SIDE / max(frame_w, frame_h, 1))  # 定位缩帧系数：按最长边封顶。
@@ -175,7 +181,7 @@ class LieDetectorWorker(QThread):  # 工作线程：在线分析 + 实时预览�
         algo_emitted = False  # 是否已发出算法就绪信号。
         result_ok = False  # 最终判定。
         last_target_tick = 0  # 最近一次有效跟踪的 tick。
-        result_msg = f"timeout after {TIMEOUT_TICKS} ticks 超过 {TIMEOUT_TICKS} tick 未通过"  # 默认超时。
+        result_msg = f"timeout after {timeout_ticks} ticks 超过 {timeout_ticks} tick 未通过"  # 默认超时。
         last_region = None  # 上一帧的区域坐标。
         tick = 0  # 节拍计数。
         user_stopped = False  # 用户是否手动停止。
@@ -186,13 +192,18 @@ class LieDetectorWorker(QThread):  # 工作线程：在线分析 + 实时预览�
         locate_ms = 0.0  # 最近一帧弹窗定位耗时（毫秒）。
         track_ms = 0.0  # 最近一帧粒子跟踪耗时（毫秒）。
         mode_tag = "CROP" if crop_mode else "FULL"  # 画面左上角显示的模式标签。
+        drop_count = 0  # 处理超时累计丢弃的帧数（模拟真实采集掉帧）。
+        frame_idx = 0  # 下一个待读帧序号，丢帧快进时推进。
+        play_start = 0.0  # 原帧率播放的绝对时间起点，主循环首帧时锁定。
+        next_deadline = 0.0  # 当前帧的原帧率播放节拍点（绝对时间）。
 
         self.log_message.emit(  # 打印实际生效的参数，便于与外部脚本回归对照。
             f"algorithm params: scale={params.process_scale} lags={params.temporal_lags} "
             f"particles={params.particle_count} proposals={params.global_proposals}")
 
-        try:  # ---- 在线分析 + 实时预览（全速不限速） ----
-            while not self._stopped.is_set() and tick < TIMEOUT_TICKS:
+        try:  # ---- 在线分析 + 实时预览（按源帧率播放，处理超时丢帧保实时） ----
+            while not self._stopped.is_set() and tick < timeout_ticks:
+                next_deadline = play_start + frame_idx * frame_interval  # 本帧的原帧率播放节拍点。
                 t_decode = time.perf_counter()  # 解码计时起点。
                 ok, frame = cap.read()  # 读下一帧。
                 decode_ms = (time.perf_counter() - t_decode) * 1000  # 解码耗时。
@@ -206,13 +217,27 @@ class LieDetectorWorker(QThread):  # 工作线程：在线分析 + 实时预览�
                         result_msg = "video ended before result 视频播完仍未出结果"
                     break
                 tick += 1
+                frame_idx += 1
+                if play_start == 0.0:  # 首帧：锁定播放节拍起点。
+                    play_start = time.perf_counter()
+                    next_deadline = play_start
+                if time.perf_counter() > next_deadline:  # 节拍已过：处理跟不上，丢弃落后帧快进追平实时。
+                    behind = int((time.perf_counter() - next_deadline) / frame_interval)  # 落后帧数。
+                    if behind > 0:
+                        drop_count += behind  # 累计丢帧。
+                        frame_idx += behind  # 推进读帧游标。
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)  # 直接 seek，跳过落后帧。
+                        if drop_count % 30 < behind:  # 每丢约 1 秒报告一次，避免刷屏。
+                            self.log_message.emit(
+                                f"tick {tick}: dropped {drop_count} frames 处理超时累计丢帧 {drop_count}，保持实时播放")
                 fps_frames += 1  # FPS 统计窗口 +1。
                 fps_elapsed = time.perf_counter() - fps_window_start  # 窗口已经过时长。
                 if fps_elapsed >= 0.5:  # 每 0.5 秒更新一次实测帧率。
                     fps_value = fps_frames / fps_elapsed  # 实测处理帧率。
                     fps_frames = 0  # 重置窗口。
                     fps_window_start = time.perf_counter()  # 重置窗口起点。
-                fps_text = f"FPS {fps_value:.1f}" if fps_value > 0 else ""  # 右上角叠加文本。
+                fps_text = (f"{fps_value:.0f}/{src_fps:.0f} FPS" +  # 右上角：实测处理帧率/源帧率，丢帧时附计数。
+                            (f" drop={drop_count}" if drop_count else "")) if fps_value > 0 else ""
                 if crop_mode:  # 裁剪模式：整帧即区域。
                     preparing = False
                     region = (0, 0, frame.shape[1], frame.shape[0])
@@ -240,7 +265,7 @@ class LieDetectorWorker(QThread):  # 工作线程：在线分析 + 实时预览�
                         self._push_frame(frame)
                         break
                     status = "preparing..." if preparing else "waiting for dialog..."
-                    cv2.putText(frame, f"tick {tick}/{TIMEOUT_TICKS} [{mode_tag}] {status}", (8, 22),
+                    cv2.putText(frame, f"tick {tick}/{timeout_ticks} [{mode_tag}] {status}", (8, 22),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
                     if fps_text:  # 等待阶段也显示实测帧率。
                         fw = frame.shape[1]  # 帧宽。
@@ -272,7 +297,7 @@ class LieDetectorWorker(QThread):  # 工作线程：在线分析 + 实时预览�
                     last_region = region
                     crop = frame[ry:ry + rh, rx:rx + rw]  # 裁出图形区域。
                     t_track = time.perf_counter()  # 跟踪计时起点。
-                    result = session.update(crop, TICK_FPS)  # 喂入跟踪会话。
+                    result = session.update(crop, src_fps)  # 喂入跟踪会话（时间阈值按源帧率换算）。
                     track_ms = (time.perf_counter() - t_track) * 1000  # 粒子跟踪耗时。
                     if not algo_emitted:  # 首次发出算法就绪信号。
                         algo_emitted = True
@@ -285,9 +310,12 @@ class LieDetectorWorker(QThread):  # 工作线程：在线分析 + 实时预览�
                             f"tick {tick}: source={result.source} conf={result.confidence:.2f} "
                             f"snr={result.border_snr:.2f} radius={result.search_radius:.1f} "
                             f"flow={result.flow_residual} whites={result.white_candidates} "
-                            f"fps={fps_value:.1f} | decode={decode_ms:.0f}ms locate={locate_ms:.0f}ms track={track_ms:.0f}ms")
-                    draw_shape_overlay(frame, region, result, tick, "", fps_text, mode_tag)  # 叠加绘制。
+                            f"src={src_fps:.1f}fps | decode={decode_ms:.0f}ms locate={locate_ms:.0f}ms track={track_ms:.0f}ms")
+                    draw_shape_overlay(frame, region, result, tick, "", timeout_ticks, fps_text, mode_tag)  # 叠加绘制。
                     self._push_frame(frame)
+                now = time.perf_counter()  # 本帧处理完毕。
+                if now < next_deadline:  # 处理快于节拍：休眠到点，保证视频按原帧率播放。
+                    time.sleep(next_deadline - now)
         except Exception as exc:  # 流水线异常不拖垮 UI，记录后按失败收尾。
             self.log_message.emit(f"pipeline error 流水线异常: {exc}")
             result_msg = f"pipeline error: {exc}"

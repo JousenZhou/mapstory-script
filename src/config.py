@@ -126,7 +126,7 @@ config = {
     'version': version, #版本
     'my_app': ['src.globals', 'Globals'], #可选. 全局单例对象, 可以存放加载的模型, 使用og.my_app调用
     'custom_tabs': [  # 自定义 GUI 页签
-        ["src.ui.VisionTab", "VisionTab"],  # 实时识图画面页签, 展示任务推送的带标注游戏画面
+        ["src.ui.DashboardTab", "DashboardTab"],  # 看板页签：实时识图画面 + 测谎/角色/怪物共享配置（任务从这里采集参数）
         ["src.ui.LieDetectorTab", "LieDetectorTab"],  # 测谎检验页签, 上传谎言检测器录像验证求解流水线
     ],
     'onetime_tasks': [  # 用户点击触发的任务

@@ -18,13 +18,20 @@ class TestMapleIdleSmoke(TaskTestCase):
         names = self.task.parse_monster_names("小青蛇, 绿水灵 ,")
         self.assertEqual(["小青蛇", "绿水灵"], names)
 
-    def test_validate_attack_key(self):
-        for key in ("Attack Key", "Melee Attack Key"):  # 常规与近战攻击按键都要走按键合法性校验。
-            self.assertIsNone(self.task.validate_config(key, "a"))
-            self.assertIsNotNone(self.task.validate_config(key, "not_a_key"))
-        self.assertIsNone(self.task.validate_config("Melee Distance", 40))  # 近战距离合法非负数字。
-        self.assertIsNotNone(self.task.validate_config("Melee Distance", "abc"))  # 非数字报错。
-        self.assertIsNotNone(self.task.validate_config("Melee Distance", -1))  # 负数报错。
+    def test_shared_config_trimmed(self):
+        # 角色/怪物/攻击等共享配置已搬到看板，任务页只保留动作节奏类配置。
+        from src.dashboard_store import DASHBOARD_DEFAULTS  # 看板共享配置默认值。
+        for shared_key in DASHBOARD_DEFAULTS:  # 看板共享键不再出现在任务页。
+            self.assertNotIn(shared_key, self.task.default_config)
+        for kept in ("Move Interval", "Move Away Seconds", "Move Back Seconds", "Turn Interval", "Use Gray Scale", "GPU Match", "Frame Interval"):
+            self.assertIn(kept, self.task.default_config)  # 动作节奏类配置保留。
+
+    def test_validate_key_name(self):
+        # 按键合法性校验随配置搬到看板，看板存取层提供与框架规则一致的校验函数。
+        from src.dashboard_store import validate_key_name  # 看板按键校验。
+        self.assertTrue(validate_key_name("a"))  # 单字母合法。
+        self.assertTrue(validate_key_name("delete"))  # 框架命名键合法。
+        self.assertFalse(validate_key_name("not_a_key"))  # 非法按键拦截。
 
     def test_find_monster_flipped(self):
         # 整帧水平镜像后怪物朝向反转，镜像匹配应能命中并标记 flipped。
@@ -37,6 +44,13 @@ class TestMapleIdleSmoke(TaskTestCase):
         self.assertTrue(getattr(monsters[0], "flipped", False))
 
     def test_find_character_and_draw_overlay(self):
+        # 共享键已搬到看板，测试直接注入运行期等效值（与任务启动时 apply_shared_config 后的读取方式一致）。
+        self.task.config.update({
+            'Character Feature': '帽子',  # 测试图上的角色标注分类名，跟随模板页实际标注名。
+            'Attack Range X Min': -150, 'Attack Range X Max': 150,  # 绘制攻击范围框所需。
+            'Attack Range Y Min': -60, 'Attack Range Y Max': 60,
+            'Melee Distance': 40,  # 绘制近战范围框所需。
+        })
         self.task.config['Character Threshold'] = 0.75  # 角色模板在测试图上的得分为 0.79，用略低于该值的阈值避免临界抖动。
         self.task.config['Monster Threshold'] = 0.8  # 怪物匹配同样用严格阈值。
         self.task.config['Monster Mirror Threshold'] = 0.8  # 怪物镜像匹配同样用严格阈值。
@@ -64,6 +78,7 @@ class TestMapleIdleSmoke(TaskTestCase):
         self.set_image('ok_templates/0.png')
         frame = self.task.frame
         feature_set = self.task.executor.feature_set
+        self.task.config['Character Feature'] = '帽子'  # 角色分类名已搬到看板，测试直接注入模板页实际标注名。
         names = [self.task.config['Character Feature'], "绿水灵"]  # 角色与怪物各验一个。
         matcher = GpuTemplateMatcher(gray=bool(self.task.config.get("Use Gray Scale")))  # 按任务灰度配置建匹配器。
         for name in names:  # 注册原始与镜像模板，与任务运行时的注册方式一致。

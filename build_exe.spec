@@ -22,7 +22,8 @@ hiddenimports = [
     'src.globals',
     'src.tasks.MapleIdleTask',
     'src.tasks.MaplePatrolTask',
-    'src.ui.VisionTab',
+    'src.ui.DashboardTab',
+    'src.dashboard_store',
     'src.gpu_match',
 ] + collect_submodules('ok') + collect_submodules('openvino')
 

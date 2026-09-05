@@ -15,7 +15,7 @@ from PySide6.QtWidgets import QFileDialog, QHBoxLayout, QLabel, QSizePolicy, QWi
 from qfluentwidgets import BodyLabel, FluentIcon, PushButton, TextEdit  # 导入 Fluent 控件。
 
 from ok.gui.widget.CustomTab import CustomTab  # 导入自定义页签基类。
-from src.ui.VisionTab import VisionLabel  # 复用实时识图页签的自适应画面标签。
+from src.ui.DashboardTab import VisionLabel  # 复用看板页签的自适应画面标签。
 
 TICK_FPS_FALLBACK = 30  # 源帧率缺失时的回退帧率，与参考项目 FPS=30 一致。
 TIMEOUT_TICKS = 545  # 超时预算 545 tick@30fps（约 18 秒），与参考项目 solve_shape.rs 一致；实际按源帧率折算成视频时长。

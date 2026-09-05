@@ -45,6 +45,15 @@ class MyBaseTask(BaseTask):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
+    def apply_shared_config(self):  # 把看板共享配置（角色/怪物/测谎）覆盖进任务配置，全部任务共用同一份参数。
+        from src.dashboard_store import load_dashboard_config  # 延迟导入，避免配置层循环依赖。
+        try:  # 共享配置读取失败时任务沿用自身配置运行，不能阻断任务。
+            shared = load_dashboard_config()  # 读取 configs/Dashboard.json。
+        except Exception as e:  # 文件损坏等异常。
+            self.log_warning(f"Load dashboard shared config failed: {e}. 看板共享配置读取失败，沿用任务自身配置。")  # 提示后降级。
+            return  # 不覆盖任何值。
+        self.config.update(shared)  # 看板为单一数据源：任务页已移除这些键，运行时全部以看板为准。
+
 
 
 

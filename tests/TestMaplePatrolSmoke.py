@@ -9,8 +9,10 @@ import cv2
 from src.config import config
 from ok.test.TaskTestCase import TaskTestCase
 
-import src.tasks.MaplePatrolTask as patrol_module  # 导入巡逻任务模块，供 patch 模块级 og 用。
-from src.tasks.MaplePatrolTask import MaplePatrolTask, LIE_MOVE_MAX_STEP  # 导入任务类与解测谎鼠标步长常量。
+import src.tasks.MapleIdleTask as idle_module  # 导入挂机任务模块，测谎方法与 og 均已上提到父类，patch 模块级 og 用它。
+from src.tasks.MaplePatrolTask import MaplePatrolTask  # 导入巡逻任务类。
+from src.tasks.MapleIdleTask import LIE_MOVE_MAX_STEP  # 解测谎鼠标步长常量已随方法上提到挂机任务。
+from src.dashboard_store import DASHBOARD_DEFAULTS  # 看板共享配置默认值，验证共享键已从任务页裁剪。
 
 
 class TestMaplePatrolSmoke(TaskTestCase):
@@ -19,16 +21,19 @@ class TestMaplePatrolSmoke(TaskTestCase):
     config = config
 
     def test_config_trimmed(self):
-        # 定时位移与转身策略配置应被裁剪，攻击与巡逻配置应保留。
+        # 定时位移与转身策略配置应被裁剪，巡逻专属配置应保留，看板共享配置应全部从任务页移除。
         for removed in ("Move Interval", "Move Away Seconds", "Move Back Seconds", "Turn Interval"):
             self.assertNotIn(removed, self.task.default_config)
             self.assertNotIn(removed, self.task.config_description)
-        for kept in ("Attack Key", "Melee Attack Key", "Melee Distance", "Monster Features", "GPU Match", "Patrol Left Percent", "Patrol Right Percent", "Minimap Feature", "Character Facing Left Feature", "Character Facing Right Feature"):
+        for shared_key in DASHBOARD_DEFAULTS:  # 看板三栏共享键（含测谎五键与朝向模板）不再出现在任务页。
+            self.assertNotIn(shared_key, self.task.default_config)
+            self.assertNotIn(shared_key, self.task.config_description)
+        for kept in ("GPU Match", "Patrol Enabled", "Patrol Left Percent", "Patrol Right Percent", "Minimap Feature", "Del Key Interval Variance"):
             self.assertIn(kept, self.task.default_config)
 
     def test_validate_config(self):
-        self.assertIsNone(self.task.validate_config("Attack Key", "a"))  # 合法按键复用父类校验。
-        self.assertIsNotNone(self.task.validate_config("Melee Attack Key", "not_a_key"))  # 非法按键报错。
+        self.assertIsNone(self.task.validate_config("Attack Key", "a"))  # 按键校验已搬到看板，任务侧不再拦截。
+        self.assertIsNone(self.task.validate_config("Melee Attack Key", "not_a_key"))  # 同上，非法按键也在看板保存时拦截。
         self.assertIsNone(self.task.validate_config("Patrol Left Percent", 10.0))  # 合法占比。
         self.assertIsNotNone(self.task.validate_config("Patrol Left Percent", 120))  # 越界占比报错。
         self.assertIsNotNone(self.task.validate_config("Dot Hue Min", 200))  # 色相越界报错。
@@ -81,23 +86,20 @@ class TestMaplePatrolSmoke(TaskTestCase):
         self.assertFalse((canvas2 == frame).all())  # 画面确实被绘制过。
 
     def test_lie_detector_config(self):
-        # 解测谎配置：默认开启，标注分类名默认与模板页标注一致。
+        # 测谎配置已搬到看板（单一数据源），任务页不再展示；看板默认值保持原有约定。
         self.assertTrue(self.task.default_config["Patrol Enabled"])  # 巡逻打怪总开关默认开启。
-        self.assertTrue(self.task.default_config["Lie Detector Auto Solve"])  # 默认开启。
-        self.assertEqual("测谎触发", self.task.default_config["Lie Detector Trigger Feature"])  # 触发标注默认名。
-        self.assertEqual("测谎坐标框", self.task.default_config["Lie Detector Region Feature"])  # 坐标框标注默认名。
-        self.assertEqual("", self.task.default_config["Lie Alarm Sound"])  # 报警音频默认留空（未上传不报警）。
-        self.assertIsNone(self.task.validate_config("Lie Detector Threshold", 0.7))  # 合法阈值。
-        self.assertIsNotNone(self.task.validate_config("Lie Detector Threshold", "abc"))  # 非数字报错。
-        self.assertIsNotNone(self.task.validate_config("Lie Detector Threshold", 0))  # 0 不在开区间内报错。
-        self.assertIsNotNone(self.task.validate_config("Lie Detector Threshold", 1.5))  # 越界报错。
+        for lie_key in ("Lie Detector Auto Solve", "Lie Detector Trigger Feature", "Lie Detector Region Feature", "Lie Detector Threshold", "Lie Alarm Sound"):
+            self.assertNotIn(lie_key, self.task.default_config)  # 测谎五键已搬到看板。
+        self.assertTrue(DASHBOARD_DEFAULTS["Lie Detector Auto Solve"])  # 看板侧默认开启，全部任务默认支持。
+        self.assertEqual("测谎触发", DASHBOARD_DEFAULTS["Lie Detector Trigger Feature"])  # 触发标注默认名。
+        self.assertEqual("测谎坐标框", DASHBOARD_DEFAULTS["Lie Detector Region Feature"])  # 坐标框标注默认名。
+        self.assertEqual(0.75, DASHBOARD_DEFAULTS["Lie Detector Threshold"])  # 触发匹配阈值默认 0.75。
 
     def test_play_lie_alarm_guards(self):
-        # 报警守卫：未配置或文件不存在时不播放且不抛异常。
+        # 报警守卫：未配置或文件不存在时不播放且不抛异常（方法随上提由父类提供，继承可用）。
         self.assertFalse(self.task.play_lie_alarm(""))  # 留空不报警。
         self.assertFalse(self.task.play_lie_alarm(None))  # None 同样不报警。
         self.assertFalse(self.task.play_lie_alarm("assets/not_exist_alarm.mp3"))  # 文件不存在不报警。
-        self.assertIn("Lie Alarm Sound", self.task.config_description)  # 帮助文本已配置。
 
     def test_find_lie_box(self):
         with patch.object(self.task, "find_one", side_effect=ValueError("no annotation")):  # 标注未标注时框架抛 ValueError。
@@ -164,7 +166,7 @@ class TestMaplePatrolSmoke(TaskTestCase):
                 return trigger if state["tick"] == 1 else None  # 首轮命中，次轮消失代表测谎结束。
             return None  # 触发以外的标注不走模板匹配。
         fake_detector = SimpleNamespace(detect=lambda crop: [])  # 检测不到任何图形。
-        with patch.object(patrol_module, "og") as mock_og, \
+        with patch.object(idle_module, "og") as mock_og, \
                 patch.object(self.task, "find_lie_box", side_effect=fake_find_lie_box), \
                 patch.object(self.task, "get_lie_region_box", return_value=region), \
                 patch.object(self.task, "get_lie_detector", return_value=fake_detector), \

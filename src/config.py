@@ -85,7 +85,11 @@ config = {
         # optional, if set, will search the exe only
         # 'hwnd_class': 'UnrealWindow', #增加重名检查准确度
         'interaction': ['Pynput', 'PostMessage', 'Genshin', 'PyDirect','ForegroundPostMessage'], # Genshin:某些操作可以后台, 部分游戏支持 PostMessage:可后台点击, 极少游戏支持 ForegroundPostMessage:前台使用PostMessage Pynput/PyDirect:仅支持前台使用
-        'capture_method': ['WGC', 'BitBlt_RenderFull', 'BitBlt'],  # Windows版本支持的话, 优先使用WGC, 否则使用BitBlt_Full. 支持的capture有 BitBlt, WGC, BitBlt_RenderFull, DXGI
+        # 采集方式优先级。这里把 BitBlt_RenderFull 放在 WGC 前面，原因：播放器类窗口（如 QQPlayer 的 TXGuiFoundation）
+        # 视频画面走独立渲染层，WGC 的 FrameArrived 回调不触发，会陷入 "no frame for 10 sec, try to restart" 死循环，
+        # 且该自愈路径只重启 WGC 自身、永远不会降级到 BitBlt（降级只发生在刷新设备时的 1.5s 探测阶段）。
+        # 注意：configs/devices.json 的 capture 字段优先级更高，会被提到本列表首位，需一并保持为 BitBlt_RenderFull。
+        'capture_method': ['BitBlt_RenderFull', 'WGC', 'BitBlt'],  # 支持的capture有 BitBlt, WGC, BitBlt_RenderFull, DXGI
         'check_hdr': False, #当用户开启AutoHDR时候提示用户, 但不禁止使用
         'force_no_hdr': False, #True=当用户开启AutoHDR时候禁止使用
         'require_bg': True # 要求使用后台截图

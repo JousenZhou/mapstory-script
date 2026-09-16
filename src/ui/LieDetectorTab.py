@@ -10,7 +10,6 @@ import time
 import cv2  # 导入 OpenCV，用于读视频与叠加绘制。
 import numpy as np  # 导入 NumPy，用于画面矩阵。
 from PySide6.QtCore import Qt, QThread, QTimer, Signal  # 导入 Qt 线程、定时器与信号。
-from PySide6.QtGui import QImage, QPixmap  # 导入图像对象，用于把画面矩阵转成图片显示。
 from PySide6.QtWidgets import QFileDialog, QHBoxLayout, QLabel, QSizePolicy, QWidget  # 导入布局与控件。
 from qfluentwidgets import BodyLabel, FluentIcon, PushButton, TextEdit  # 导入 Fluent 控件。
 
@@ -439,10 +438,7 @@ class LieDetectorTab(CustomTab):  # 测谎检验页签：上传录像验证谎�
             pass
         if frame is None:
             return
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        height, width, channel = rgb.shape
-        image = QImage(rgb.data, width, height, channel * width, QImage.Format_RGB888)
-        self.image_label.set_frame(QPixmap.fromImage(image.copy()))
+        self.image_label.set_frame(frame)  # 直接把 BGR 画面矩阵交给标签，由它按当前尺寸预缩放后转图片显示。
 
     def closeEvent(self, event):  # 页签关闭时确保工作线程退出。
         if self.worker is not None and self.worker.isRunning():

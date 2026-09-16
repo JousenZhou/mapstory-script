@@ -14,8 +14,13 @@ logger = Logger.get_logger(__name__)
 DASHBOARD_CONFIG_FILE = os.path.join('configs', 'Dashboard.json')  # 看板共享配置文件路径。
 COCO_FILE = os.path.join('ok_templates', 'coco_annotations.json')  # 模板页标注文件，供按类别读取标注。
 
+_ANNOTATION_CACHE = {}  # 标注解析结果缓存，文件未变时直接复用。
+_ANNOTATION_CACHE_KEY = None  # 缓存对应的标注文件指纹（修改时间+大小），None 表示尚无可用缓存。
+
 SUPER_LIE_REGION = '测谎'  # 测谎区域标注的类别名（模板页标注的「类别」字段值）。
 SUPER_LIE_TRIGGER = '测谎触发'  # 测谎触发标注的类别名（模板页标注的「类别」字段值）。
+SUPER_CHARACTER = '角色'  # 角色标注的类别名，供看板角色栏「角色特征/左朝向/右朝向」三个单选下拉取值。
+SUPER_MONSTER = '怪物'  # 怪物标注的类别名，供看板怪物栏「怪物特征」多选下拉取值。
 
 DASHBOARD_DEFAULTS = {  # 看板共享配置默认值：键名与任务原配置键一致，任务运行时无缝读取。
     # —— 测谎栏 ——
@@ -23,6 +28,7 @@ DASHBOARD_DEFAULTS = {  # 看板共享配置默认值：键名与任务原配置
     'Lie Detector Region Feature': '测谎坐标框',  # 测谎区域标注：类别为「测谎」的标注分类名，直接采集坐标作为解测谎输入区域。
     'Lie Detector Trigger Feature': '测谎触发',  # 测谎触发标注：类别为「测谎触发」的标注分类名，画面匹配到即触发解测谎。
     'Lie Detector Threshold': 0.75,  # 测谎触发匹配阈值，越高越严格。
+    'Lie Detector Trigger Delay': 5.0,  # 匹配到测谎触发后延迟多少秒才开始解测谎（等弹窗完全展开、图形动画起势），0 表示立即解题。
     'Lie Alarm Sound': 'alarm.mp3',  # 测谎报警音频（支持 wav/mp3，相对路径相对项目根目录），留空不报警。
     # —— 角色栏 ——
     'Character Feature': '角色名',  # 角色标注分类名。
@@ -90,6 +96,26 @@ def save_dashboard_config(data):  # 保存看板共享配置，写失败记日�
 def load_annotations_by_supercategory():  # 按类别（supercategory）读取模板页标注，返回 {类别: {分类名: 标注信息}}。
     # 标注信息为 {'x','y','w','h','img_w','img_h'}：坐标为标注图源图尺寸，
     # 使用时需按 当前画面尺寸/源图尺寸 等比缩放到实际游戏画面。
+    # 结果按文件指纹缓存：看板每帧刷新都会调本函数，标注文件未变时直接复用上次解析结果，避免 30Hz 反复读盘解析 JSON。
+    global _ANNOTATION_CACHE, _ANNOTATION_CACHE_KEY  # 需要写模块级缓存。
+    key = _coco_fingerprint()  # 取当前标注文件指纹。
+    if key is not None and key == _ANNOTATION_CACHE_KEY:  # 文件自上次解析后未发生变化。
+        return _ANNOTATION_CACHE  # 直接命中缓存。
+    result = _parse_annotations()  # 重新读盘解析。
+    if key is not None:  # 文件存在才写缓存，避免把“文件缺失”的空结果长期钉住。
+        _ANNOTATION_CACHE, _ANNOTATION_CACHE_KEY = result, key  # 同时更新结果与指纹。
+    return result  # 返回解析结果。
+
+
+def _coco_fingerprint():  # 取标注文件指纹（修改时间与大小），文件不可读时返回 None。
+    try:
+        stat = os.stat(COCO_FILE)  # 只读文件元数据，比整文件读取便宜得多。
+        return stat.st_mtime_ns, stat.st_size  # 修改时间与大小共同构成指纹，重新标注后必定变化。
+    except OSError:  # 文件不存在或不可读。
+        return None  # 返回空指纹，调用方不写缓存。
+
+
+def _parse_annotations():  # 读盘并解析模板页标注文件，返回 {类别: {分类名: 标注信息}}。
     data = _read_json_utf8(COCO_FILE)
     result = {}
     if not isinstance(data, dict):

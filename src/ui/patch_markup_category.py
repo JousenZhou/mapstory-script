@@ -23,7 +23,8 @@ from ok.ui.qt.tasks.MarkUpWindow import (AnnotationCanvas, BBoxDialog, MarkUpWin
                                          save_coco)
 
 # 类别下拉预设：首个空项表示未分类，下拉可编辑也支持手输新类别。
-PRESET_SUPERCATEGORIES = ['', '测谎', '测谎触发']
+# 角色/怪物供看板角色栏与怪物栏按类别选标注，测谎/测谎触发供测谎栏使用。
+PRESET_SUPERCATEGORIES = ['', '角色', '怪物', '测谎', '测谎触发']
 
 _last_committed_supercategory = ''  # 最近一次在 BBoxDialog 点「确定」时的类别值（画框流程取值通道）。
 

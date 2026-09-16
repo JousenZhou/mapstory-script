@@ -1,16 +1,14 @@
 import random  # 导入标准库 random，用于 Del 间隔的随机浮动。
 import time  # 导入标准库 time，用于边界折返节奏、卡住计时与攻击节奏。
-import traceback  # 导入标准库 traceback，用于解测谎异常时记录完整堆栈定位问题。
 
 import cv2  # 导入 OpenCV，用于小地图模板匹配、黄点取色与画面标注绘制。
 import numpy as np  # 导入 NumPy，用于 HSV 取色掩码运算。
 
 from ok import og  # 导入全局对象，用于把带标注画面推送给 UI 实时展示。
-from ok.task.exceptions import TaskDisabledException  # 导入任务被禁用异常，用户停任务时的正常退出信号不能误判为解测谎故障。
 from qfluentwidgets import FluentIcon  # 导入 Fluent 图标，用于任务在 GUI 中显示图标。
 
-# 导入挂机任务复用全部检测/攻击/测谎能力；测谎常量与推理可用性标志也随方法上提到挂机任务统一维护。
-from src.tasks.MapleIdleTask import MapleIdleTask, CAPTURE_MIN_INTERVAL, LIE_SOLVER_AVAILABLE
+# 导入挂机任务复用全部检测/攻击能力；测谎监控与自动解题已抽离为独立服务 src/liedetector/service.py（由 Globals 后台常驻），任务不再直接解测谎，只需通过 pop_held_keys 上报持有键供服务暂停时释放。
+from src.tasks.MapleIdleTask import MapleIdleTask, MatchBatch, CAPTURE_MIN_INTERVAL
 
 MOVE_LEFT_KEY = "left"  # 左方向键：向左巡逻时持续按住。
 MOVE_RIGHT_KEY = "right"  # 右方向键：向右巡逻时持续按住。
@@ -29,14 +27,16 @@ class MaplePatrolTask(MapleIdleTask):  # 定义冒险岛小地图巡逻打怪任
     def __init__(self, *args, **kwargs):  # 构造函数，先复用父类全部配置再按巡逻场景裁剪。
         super().__init__(*args, **kwargs)  # 父类构造已填好角色/怪物/攻击等全部配置项与帮助文本。
         self.name = "Maple Patrol"  # 任务显示名称。
-        self.description = "Minimap patrol with combat: locate the minimap by template and track the character with the yellow dot color, hold the direction key to walk back and forth between the left/right percent boundaries; when a monster enters the attack range, stop and attack the nearest one until it disappears; red vertical lines mark the boundaries in the live vision; character/monster/lie detector parameters come from the dashboard config, when the lie detector trigger appears the task pauses patrol and auto solves it; patrol itself can be disabled to keep a watch-only mode.  # 任务描述：小地图巡逻+打怪，黄点跟踪往返边界，攻击范围内有怪就停下打最近一只，边界用红色竖线标出；角色/怪物/测谎参数统一从看板采集，识别到测谎触发时暂停巡逻自动解测谎，可用开关关闭巡逻只保留监视与解测谎。"
+        self.description = "Minimap patrol with combat: locate the minimap by template and track the character with the yellow dot color, hold the direction key to walk back and forth between the left/right percent boundaries; when a monster enters the attack range, stop and attack the nearest one until it disappears; red vertical lines mark the boundaries in the live vision; character/monster parameters come from the dashboard config; patrol itself can be disabled to keep a watch-only mode that only pushes the live vision. The lie detector is handled by an independent service, decoupled from this task.  # 任务描述：小地图巡逻+打怪，黄点跟踪往返边界，攻击范围内有怪就停下打最近一只，边界用红色竖线标出；角色/怪物参数统一从看板采集，可用开关关闭巡逻只保留监视画面推送。测谎由独立服务值守，与本任务解耦。"
         self.icon = FluentIcon.PLAY  # 任务图标。
+        self._held_move_key = None  # 当前持续按住的移动方向键；改为实例属性，独立测谎服务暂停任务时可读取并通过 pop_held_keys 释放它。
+        self._held_attack_key = None  # 当前持续按住的攻击键（近战或常规）；改为实例属性，独立测谎服务暂停任务时可读取并通过 pop_held_keys 释放它。
         for key in ("Move Interval", "Move Away Seconds", "Move Back Seconds", "Turn Interval"):  # 定时位移与转身策略由小地图巡逻取代，裁剪掉对应配置。
             self.default_config.pop(key, None)  # 移除默认值。
             self.config_description.pop(key, None)  # 移除帮助文本。
-        for key in ("Character Facing Left Feature", "Character Facing Right Feature",  # 朝向模板与测谎五键已搬到看板统一配置（见 src/dashboard_store.py），任务页不再展示。
+        for key in ("Character Facing Left Feature", "Character Facing Right Feature",  # 朝向模板与测谎六键已搬到看板统一配置（见 src/dashboard_store.py），任务页不再展示。
                     "Lie Detector Auto Solve", "Lie Detector Trigger Feature", "Lie Detector Region Feature",
-                    "Lie Detector Threshold", "Lie Alarm Sound"):
+                    "Lie Detector Threshold", "Lie Detector Trigger Delay", "Lie Alarm Sound"):
             self.default_config.pop(key, None)  # 移除默认值，框架加载旧配置时会自动清理已保存的旧键。
             self.config_description.pop(key, None)  # 同步移除帮助文本。
         self.default_config.update({  # 巡逻专属配置项，父类没有需自行补充。
@@ -100,15 +100,12 @@ class MaplePatrolTask(MapleIdleTask):  # 定义冒险岛小地图巡逻打怪任
             return base  # 直接返回基础值。
         return max(0.1, base + random.uniform(-variance, variance))  # 基础值 ±浮动量内随机，下限 0.1 秒防止浮动过大导致连续快速按键。
 
-    def find_one_raw(self, feature_name, frame, threshold):  # 仅用原始朝向匹配单个模板（不做镜像回退），返回置信度最高的框或 None。
-        try:  # 标注不存在时框架会抛 ValueError，不能中断主流程。
-            return self.find_one(feature_name, frame=frame, threshold=threshold, use_gray_scale=self.config.get("Use Gray Scale"), horizontal_variance=1, vertical_variance=1)  # variance=1 表示全屏搜索，朝向模板不能用镜像否则左右会互串。
-        except ValueError:  # 该分类名未在模板页标注。
-            return None  # 按未匹配处理。
-
-    def detect_template_facing(self, frame, left_name, right_name, threshold):  # 用左右朝向模板判定角色实际朝向：-1=朝左、1=朝右，都未命中返回 None。
+    def detect_template_facing(self, frame, left_name, right_name, threshold):  # 串行版：用左右朝向模板判定角色实际朝向，两个匹配都在当前线程跑。
         left_box = self.find_one_raw(left_name, frame, threshold)  # 匹配左朝向模板。
         right_box = self.find_one_raw(right_name, frame, threshold)  # 匹配右朝向模板。
+        return self.resolve_template_facing(left_box, right_box)  # 交由统一判定逻辑得出朝向。
+
+    def resolve_template_facing(self, left_box, right_box):  # 由左右朝向匹配框判定角色实际朝向：-1=朝左、1=朝右，都未命中返回 None；匹配框可来自并发批次。
         if left_box is None and right_box is None:  # 两个模板都未命中。
             return None  # 朝向未知，保持系统当前记录。
         if left_box is None:  # 只有右朝向命中。
@@ -156,6 +153,7 @@ class MaplePatrolTask(MapleIdleTask):  # 定义冒险岛小地图巡逻打怪任
         last_del_time = time.time()  # 上次按 Del 键的时间，从任务启动开始计时。
         next_del_interval = self.next_del_interval(del_interval, del_variance)  # 首段间隔也带随机浮动，方法复用父类。
         minimap_threshold = float(self.config.get("Minimap Threshold"))  # 读取小地图匹配阈值。
+        char_threshold = self.config.get("Character Threshold")  # 读取角色匹配阈值，朝向校准沿用同一阈值；提前取成局部变量，并发匹配线程就不再读配置字典。
         left_pct, right_pct = sorted((float(self.config.get("Patrol Left Percent")), float(self.config.get("Patrol Right Percent"))))  # 读取巡逻左右边界（百分比），填反时自动交换。
         if patrol_enabled and left_pct >= right_pct:  # 巡逻模式下左右边界相同没有可巡逻区间。
             self.log_warning("Left and right patrol percents are the same, nothing to patrol. 左右巡逻占比相同，无可巡逻区间，任务退出。")  # 提示配置问题。
@@ -164,25 +162,13 @@ class MaplePatrolTask(MapleIdleTask):  # 定义冒险岛小地图巡逻打怪任
         dot_min_pixels = max(1, int(self.config.get("Dot Min Pixels")))  # 读取黄点最小面积，至少 1 像素。
         stuck_seconds = float(self.config.get("Stuck Seconds") or 0)  # 读取卡住判定时长，0 表示禁用。
         resume_wait = float(self.config.get("Resume Wait Seconds") or 0)  # 读取脱困后的等待秒数。
-        lie_enabled = bool(self.config.get("Lie Detector Auto Solve"))  # 读取看板测谎总开关，默认开启，全部任务默认支持。
-        lie_trigger_name = str(self.config.get("Lie Detector Trigger Feature") or '').strip()  # 读取【测谎触发】标注分类名。
-        lie_region_name = str(self.config.get("Lie Detector Region Feature") or '').strip()  # 读取【测谎坐标框】标注分类名。
-        lie_threshold = float(self.config.get("Lie Detector Threshold") or 0.75)  # 读取测谎触发匹配阈值。
-        alarm_sound = str(self.config.get("Lie Alarm Sound") or '').strip()  # 读取报警音频路径，留空表示不报警。
-        if lie_enabled and not LIE_SOLVER_AVAILABLE:  # 开关打开但推理模块不可用。
-            self.log_warning("Lie detector module unavailable, auto solve disabled. 测谎推理模块不可用，自动解测谎已禁用。")  # 提示并降级。
-            lie_enabled = False  # 禁用后不影响巡逻。
-        for lie_name in (lie_trigger_name, lie_region_name):  # 两个测谎标注都必须在模板页标注过才能启用。
-            if lie_enabled and (not lie_name or not self.feature_ready(lie_name)):  # 标注名为空或未标注。
-                self.log_warning(f"Lie detector annotation missing, auto solve disabled: {lie_name}. 测谎标注缺失，自动解测谎已禁用：{lie_name}。")  # 提示并降级，不阻断巡逻。
-                lie_enabled = False  # 禁用。
         frame_interval = float(self.config.get("Frame Interval") or 0)  # 读取配置帧间隔，0 表示不额外限速。
         loop_interval = max(frame_interval, CAPTURE_MIN_INTERVAL)  # 截图采集固定 30FPS，配置更慢则尊重配置。
         gpu = self.build_gpu_matcher(char_name, monster_names) if patrol_enabled else None  # 巡逻模式才构建 GPU 匹配器，监视模式不需要角色/怪物匹配。
         direction = 1  # 巡逻方向：1=向右、-1=向左，默认先向右走。
         facing = None  # 角色当前朝向：1=右、-1=左、None=未知，移动时与方向同步，攻击时用于换向判定。
-        held_move_key = None  # 当前持续按住的移动方向键，换向/攻击/退出时必须松开它。
-        held_attack_key = None  # 当前持续按住的攻击键（近战或常规），切换/目标消失/退出时必须松开它。
+        self._held_move_key = None  # 当前持续按住的移动方向键，换向/攻击/退出时必须松开它；改为实例属性，独立测谎服务暂停任务时可通过 pop_held_keys 释放它。
+        self._held_attack_key = None  # 当前持续按住的攻击键（近战或常规），切换/目标消失/退出时必须松开它；改为实例属性，独立测谎服务暂停任务时可通过 pop_held_keys 释放它。
         anchor_x = None  # 卡住判定的位置锚点，黄点移动超过阈值时重置。
         anchor_time = time.time()  # 位置锚点上次更新时间。
         dot_missing_since = None  # 黄点开始丢失的时间戳，None 表示当前能检测到。
@@ -205,56 +191,42 @@ class MaplePatrolTask(MapleIdleTask):  # 定义冒险岛小地图巡逻打怪任
                     self.sleep(loop_interval)  # 按固定 30FPS 节拍等待。
                     loop_start = time.time()  # 重置本轮起点，避免下轮再补等待。
                     continue  # 进入下一帧处理。
-                if lie_enabled:  # 自动解测谎已启用：每帧优先检查触发标注，命中则暂停其他全部功能。
-                    trigger_box = self.find_lie_box(lie_trigger_name, frame, lie_threshold)  # 全屏匹配【测谎触发】标注。
-                    if trigger_box is not None:  # 识别到触发标注，代表测谎已触发。
-                        if held_move_key is not None:  # 先松开当前按住的移动方向键。
-                            self.send_key_up(held_move_key)  # 松开方向键。
-                            held_move_key = None  # 清空按住状态。
-                        if held_attack_key is not None:  # 再松开当前按住的攻击键。
-                            self.send_key_up(held_attack_key)  # 松开攻击键。
-                            held_attack_key = None  # 清空按住状态。
-                        self.play_lie_alarm(alarm_sound)  # 播放报警音频（未配置或文件不存在时自动跳过）。
-                        lie_region_box = self.get_lie_region_box(lie_region_name)  # 直接采集【测谎坐标框】标注的坐标供画面框选，不做模板匹配。
-                        og.my_app.update_vision(self.draw_lie_annotations(frame, trigger_box, lie_region_box))  # 触发瞬间立即把两个标注框选推送到实时画面。
-                        try:  # 进入解测谎子循环，直到【测谎触发】标注消失才返回。
-                            self.solve_lie_detector(frame, lie_trigger_name, lie_region_name, lie_threshold)  # 优先处理解测谎。
-                        except TaskDisabledException:  # 用户手动停任务/任务被禁用是正常退出信号。
-                            raise  # 透传给框架结束任务，绝不能当成解测谎故障禁用自动解测谎。
-                        except Exception as e:  # 推理流水线异常不拖垮巡逻。
-                            self.log_warning(f"Lie solve error, auto solve disabled: {e}\n{traceback.format_exc()} 解测谎异常，已禁用自动解测谎（含完整堆栈）。")  # 记录异常原因与完整堆栈供定位。
-                            lie_enabled = False  # 本次运行不再尝试解测谎。
-                        anchor_x, dot_missing_since = None, None  # 清空卡住锚点与黄点丢失计时，恢复后重新评估。
-                        self.sleep(0.5)  # 等弹窗关闭后画面稳定再继续巡逻。
-                        continue  # 重新取帧恢复巡逻打怪。
-                if not patrol_enabled:  # 监视模式：不巡逻不打怪，只推送带测谎标注框选的画面。
-                    watch_region = self.get_lie_region_box(lie_region_name) if lie_region_name else None  # 坐标框标注配置了才采集坐标，供画面框选。
-                    og.my_app.update_vision(self.draw_lie_annotations(frame, None, watch_region))  # 推送画面：触发标注已在上方框选过，这里补坐标框常态框选。
+                if not patrol_enabled:  # 监视模式：不巡逻不打怪，直接推送原始帧（测谎标注由独立服务负责绘制，任务不再介入）。
+                    og.my_app.update_vision(frame)  # 推送原始画面供 UI 展示。
                     self.info_set("Status", "Watch only")  # 在 GUI 显示监视状态。
                     continue  # 跳过后续全部巡逻与攻击逻辑，循环顶部按 30FPS 节拍等待。
-                if facing_check and time.time() - last_facing_check >= FACING_CHECK_INTERVAL:  # 配置了朝向模板时定期用图像校准实际朝向。
+                facing_due = facing_check and time.time() - last_facing_check >= FACING_CHECK_INTERVAL  # 本轮是否需要用图像校准朝向，提前算好以便把朝向匹配一并提交并发。
+                batch = MatchBatch()  # 本帧并发匹配批次：朝向与小地图匹配始终走 CPU，角色/怪物匹配仅在 GPU 不可用时一并提交。
+                if facing_due:  # 朝向校准到期才提交，未到期不白烧两个核心。
+                    batch.submit("face_l", lambda: self.find_one_raw(facing_left_name, frame, char_threshold))  # 左朝向模板匹配，朝向模板绝不能用镜像否则左右会互串。
+                    batch.submit("face_r", lambda: self.find_one_raw(facing_right_name, frame, char_threshold))  # 右朝向模板匹配。
+                batch.submit("minimap", lambda: self.find_minimap(minimap_name, frame, minimap_threshold))  # 小地图模板匹配定位小地图框。
+                cpu_matches_submitted = gpu is None  # 角色/怪物匹配是否已随本批次一并提交，GPU 可用时改由显卡批量匹配。
+                if cpu_matches_submitted:  # CPU 路径：角色与全部怪物匹配也一并投递，与朝向/小地图匹配和下面的巡逻判定并行跑。
+                    self.submit_char_monster_matches(batch, frame, char_name, monster_names)  # 提交角色与全部怪物的原始/镜像匹配。
+                if facing_due:  # 配置了朝向模板时定期用图像校准实际朝向。
                     last_facing_check = time.time()  # 记录本次校准时间。
-                    actual_facing = self.detect_template_facing(frame, facing_left_name, facing_right_name, self.config.get("Character Threshold"))  # 左右朝向模板取置信度高者。
+                    actual_facing = self.resolve_template_facing(batch.get("face_l"), batch.get("face_r"))  # 左右朝向模板取置信度高者。
                     if actual_facing is not None and facing is None:  # 朝向未知（如任务刚启动）时用图像结果初始化。
                         facing = actual_facing  # 直接采信图像朝向。
                     elif actual_facing is not None and actual_facing != facing:  # 图像识别的朝向与系统记录不一致。
                         self.log_info(f"Facing corrected by template: {facing} -> {actual_facing}. 朝向已由图像校准修正：{facing} -> {actual_facing}。")  # 记录修正供排查。
                         facing = actual_facing  # 及时按图像修正，后续转身判定会自动补发转身键。
-                minimap = self.find_minimap(minimap_name, frame, minimap_threshold)  # 模板匹配定位小地图框。
+                minimap = batch.get("minimap")  # 取回小地图匹配结果。
                 rect = self.map_rect(minimap) if minimap is not None else None  # 计算实际地图区域（画面坐标）。
                 dot = self.detect_dot(frame, rect, hue_min, hue_max, dot_min_pixels) if rect is not None else None  # 在地图区域内直接检测角色黄点，不做跨帧追踪。
                 if minimap is None:  # 找不到小地图时停止巡逻移动，攻击判定照常进行。
-                    if held_move_key is not None:  # 有按住的移动键。
-                        self.send_key_up(held_move_key)  # 松开方向键停止移动。
-                        held_move_key = None  # 清空按住状态。
+                    if self._held_move_key is not None:  # 有按住的移动键。
+                        self.send_key_up(self._held_move_key)  # 松开方向键停止移动。
+                        self._held_move_key = None  # 清空按住状态。
                     anchor_x, dot_missing_since = None, None  # 清空卡住锚点与丢失计时。
                 elif dot is None:  # 小地图在但黄点检测不到：短暂保持移动，长时间丢失则松键等待。
                     anchor_x = None  # 黄点丢失时卡住锚点失效。
                     if dot_missing_since is None:  # 刚开始丢失。
                         dot_missing_since = time.time()  # 开始丢失计时。
-                    elif held_move_key is not None and time.time() - dot_missing_since >= DOT_MISSING_HOLD_SECONDS:  # 丢失超时仍按住方向键有盲走风险。
-                        self.send_key_up(held_move_key)  # 松开方向键等黄点恢复。
-                        held_move_key = None  # 清空按住状态。
+                    elif self._held_move_key is not None and time.time() - dot_missing_since >= DOT_MISSING_HOLD_SECONDS:  # 丢失超时仍按住方向键有盲走风险。
+                        self.send_key_up(self._held_move_key)  # 松开方向键等黄点恢复。
+                        self._held_move_key = None  # 清空按住状态。
                 else:  # 小地图与黄点都就绪，执行巡逻判断。
                     dot_missing_since = None  # 黄点恢复，清空丢失计时。
                     percent = (dot[0] - rect[0]) / rect[2] * 100  # 黄点横向位置相对地图区域宽度的百分比。
@@ -266,11 +238,11 @@ class MaplePatrolTask(MapleIdleTask):  # 定义冒险岛小地图巡逻打怪任
                         direction = 1  # 切换巡逻方向为向右。
                         self.log_info(f"Reached left bound {left_pct:g}%, turn right. 到达左边界 {left_pct:g}%，改为向右巡逻。")  # 记录折返供排查。
                     anchor_x, anchor_time = self.update_stuck_anchor(dot[0], anchor_x, anchor_time, rect[2])  # 更新卡住判定锚点。
-                    if stuck_seconds > 0 and held_move_key is not None and time.time() - anchor_time >= stuck_seconds:  # 按住方向键但位置长期不动视为卡住。
-                        direction = self.recover_stuck(held_move_key, direction, resume_wait)  # 反向短移脱困并翻转巡逻方向。
-                        held_move_key = None  # 恢复过程已松键，随后重新按住新方向键。
+                    if stuck_seconds > 0 and self._held_move_key is not None and time.time() - anchor_time >= stuck_seconds:  # 按住方向键但位置长期不动视为卡住。
+                        direction = self.recover_stuck(self._held_move_key, direction, resume_wait)  # 反向短移脱困并翻转巡逻方向。
+                        self._held_move_key = None  # 恢复过程已松键，随后重新按住新方向键。
                         anchor_x, anchor_time = None, time.time()  # 脱困后重置卡住锚点。
-                    if held_move_key is not None:  # 确实在移动时朝向与移动方向一致。
+                    if self._held_move_key is not None:  # 确实在移动时朝向与移动方向一致。
                         facing = direction  # 同步朝向，供攻击换向判定直接使用，减少转身探测。
                 gm = None  # 本帧 GPU 匹配句柄，默认不可用。
                 if gpu is not None:  # GPU 匹配器可用时才尝试批量匹配。
@@ -284,11 +256,10 @@ class MaplePatrolTask(MapleIdleTask):  # 定义冒险岛小地图巡逻打怪任
                     monsters = []  # 收集本帧全部怪物匹配框。
                     for name in monster_names:  # 逐个怪物分类取全部达标框。
                         monsters.extend(self.gpu_lookup_all(gm, name, self.config.get("Monster Threshold"), self.config.get("Monster Mirror Threshold")))  # 原始与镜像各自阈值，合并后去重。
-                else:  # CPU 路径：逐个模板调用 OpenCV 匹配，行为与 GPU 路径一致。
-                    character = self.find_one_feature(char_name, frame, self.config.get("Character Threshold"))  # 用角色标注模板在本帧做匹配，角色用独立阈值。
-                    monsters = []  # 收集本帧全部怪物匹配框。
-                    for name in monster_names:  # 逐个怪物分类匹配，支持多个怪物。
-                        monsters.extend(self.find_all_features(name, frame, self.config.get("Monster Threshold"), self.config.get("Monster Mirror Threshold")))  # 追加该分类的全部匹配框，怪物与怪物镜像各用独立阈值。
+                else:  # CPU 路径：按与串行完全一致的顺序取回线程池里的匹配结果，行为与 GPU 路径一致。
+                    if not cpu_matches_submitted:  # 本帧刚走 GPU 分支异常回退 CPU，角色/怪物匹配还没提交。
+                        self.submit_char_monster_matches(batch, frame, char_name, monster_names)  # 补提交本帧全部匹配。
+                    character, monsters = self.collect_char_monster_matches(batch, monster_names)  # 取回角色框与全部怪物框。
                 if character is not None and monsters:  # 角色存在时先剔除压在角色身上的怪物框。
                     kept = []  # 过滤后的怪物框列表。
                     for monster in monsters:  # 逐只检查是否与角色框重叠。
@@ -320,32 +291,32 @@ class MaplePatrolTask(MapleIdleTask):  # 定义冒险岛小地图巡逻打怪任
                         target = min(in_range, key=lambda m: self.center_distance(character, m))  # 优先攻击距离最近的目标，另一侧出现更近的怪立即转身换打，不做同侧锁定。
                 og.my_app.update_vision(self.draw_overlay(frame, minimap, rect, dot, left_pct, right_pct, character, monsters, nearest, target))  # 把带标注画面推送给 UI 实时展示。
                 if target is not None:  # 攻击范围内有怪物时停下巡逻原地攻击。
-                    if held_move_key is not None:  # 进入攻击前先松开移动键，站着打不边走边打。
-                        self.send_key_up(held_move_key)  # 松开方向键。
-                        held_move_key = None  # 清空按住状态。
+                    if self._held_move_key is not None:  # 进入攻击前先松开移动键，站着打不边走边打。
+                        self.send_key_up(self._held_move_key)  # 松开方向键。
+                        self._held_move_key = None  # 清空按住状态。
                     dx, dy = self.center_offset(character, target)  # 计算目标怪物相对角色的方向。
                     want_direction = 1 if dx > 0 else -1  # 1=怪在右侧，-1=怪在左侧。
                     want_key = melee_key if abs(dx) <= melee_distance else attack_key  # 横向距离在近战距离内用近战键，否则用常规攻击键，怪物走近走远时自动切换。
-                    if held_attack_key is not None and held_attack_key != want_key:  # 换攻击键（近战/常规切换）时先松开旧键，避免两键同时按住。
-                        self.send_key_up(held_attack_key)  # 松开当前按住的攻击键。
-                        held_attack_key = None  # 清空按住状态。
+                    if self._held_attack_key is not None and self._held_attack_key != want_key:  # 换攻击键（近战/常规切换）时先松开旧键，避免两键同时按住。
+                        self.send_key_up(self._held_attack_key)  # 松开当前按住的攻击键。
+                        self._held_attack_key = None  # 清空按住状态。
                     if facing != want_direction:  # 朝向与怪物方向不一致时执行转身序列，绝不持续按住方向键造成移动。
-                        if held_attack_key is not None:  # 先松开攻击键：攻击后摇期间方向键输入会被游戏吞掉，导致转身失败后长时间空打。
-                            self.send_key_up(held_attack_key)  # 松开攻击键。
-                            held_attack_key = None  # 清空按住状态，转身完成后重新按住。
+                        if self._held_attack_key is not None:  # 先松开攻击键：攻击后摇期间方向键输入会被游戏吞掉，导致转身失败后长时间空打。
+                            self.send_key_up(self._held_attack_key)  # 松开攻击键。
+                            self._held_attack_key = None  # 清空按住状态，转身完成后重新按住。
                             self.sleep(0.5)  # 等攻击后摇结束再发方向键，与转身策略验证过的防吞值一致。
                         self.send_key(MOVE_RIGHT_KEY if want_direction == 1 else MOVE_LEFT_KEY, down_time=0.05)  # 单次短按方向键只触发转身动画，按住时间越短越不容易产生位移。
                         facing = want_direction  # 记录当前朝向，同一方向不再重复按键，避免持续位移。
                         self.sleep(0.08)  # 等待转身动作生效后再攻击。
-                    if held_attack_key is None:  # 当前没有按住攻击键时才按下，已按住则保持不重复发送。
+                    if self._held_attack_key is None:  # 当前没有按住攻击键时才按下，已按住则保持不重复发送。
                         self.send_key_down(want_key)  # 持续按住近战或常规攻击键不放。
-                        held_attack_key = want_key  # 记录当前按住的键。
+                        self._held_attack_key = want_key  # 记录当前按住的键。
                     self.info_set("Status", "Attacking")  # 在 GUI 显示攻击状态。
                     self.sleep(0.1)  # 按住期间每 0.1 秒重新识别一次校准目标。
                     continue  # 目标消失时自动停止攻击重新扫描。
-                if held_attack_key is not None:  # 目标消失时松开持续按住的攻击键并准备恢复巡逻。
-                    self.send_key_up(held_attack_key)  # 松开攻击键。
-                    held_attack_key = None  # 清空按住状态。
+                if self._held_attack_key is not None:  # 目标消失时松开持续按住的攻击键并准备恢复巡逻。
+                    self.send_key_up(self._held_attack_key)  # 松开攻击键。
+                    self._held_attack_key = None  # 清空按住状态。
                     patrol_resume_at = time.time() + ATTACK_TO_MOVE_WAIT  # 攻击后摇会吞方向键输入，短暂等待后再恢复移动。
                 if time.time() < patrol_resume_at:  # 攻击刚结束的等待期内只识图不移动。
                     self.info_set("Status", "Resuming patrol")  # 在 GUI 显示恢复巡逻等待状态。
@@ -353,20 +324,30 @@ class MaplePatrolTask(MapleIdleTask):  # 定义冒险岛小地图巡逻打怪任
                     continue  # 等待期结束后自动恢复巡逻。
                 if minimap is not None:  # 小地图可用时按巡逻方向持续移动。
                     want_key = MOVE_RIGHT_KEY if direction == 1 else MOVE_LEFT_KEY  # 当前巡逻方向需要的方向键。
-                    if held_move_key != want_key:  # 换向时先松开旧键再按新键，避免两键同时按住。
-                        if held_move_key is not None:  # 有旧键按住。
-                            self.send_key_up(held_move_key)  # 松开旧方向键。
+                    if self._held_move_key != want_key:  # 换向时先松开旧键再按新键，避免两键同时按住。
+                        if self._held_move_key is not None:  # 有旧键按住。
+                            self.send_key_up(self._held_move_key)  # 松开旧方向键。
                         self.send_key_down(want_key)  # 持续按住新方向键保持移动。
-                        held_move_key = want_key  # 记录当前按住的键。
+                        self._held_move_key = want_key  # 记录当前按住的键。
                     self.info_set("Status", "Patrolling right" if direction == 1 else "Patrolling left")  # 在 GUI 显示当前巡逻方向。
                 else:  # 小地图不可用时保持静止等待。
                     self.info_set("Status", "Minimap not found")  # 在 GUI 显示未找到小地图。
                 self.sleep(loop_interval)  # 按固定 30FPS 节拍等待后处理下一帧。
         finally:  # 用户停止任务或异常退出时兜底松键，防止按键卡住。
-            if held_attack_key is not None:  # 有按住未松的攻击键。
-                self.send_key_up(held_attack_key)  # 松开它。
-            if held_move_key is not None:  # 有按住未松的方向键。
-                self.send_key_up(held_move_key)  # 松开它。
+            if self._held_attack_key is not None:  # 有按住未松的攻击键。
+                self.send_key_up(self._held_attack_key)  # 松开它。
+            if self._held_move_key is not None:  # 有按住未松的方向键。
+                self.send_key_up(self._held_move_key)  # 松开它。
+
+    def pop_held_keys(self):  # 上报并清空巡逻任务当前持有的按键（移动键+攻击键），供独立测谎服务暂停任务后释放（纯属性操作，不调用执行器，线程安全）。
+        keys = []  # 收集当前持有的按键。
+        if self._held_move_key is not None:  # 有持续按住的移动方向键。
+            keys.append(self._held_move_key)  # 加入待释放列表。
+            self._held_move_key = None  # 清空属性，任务恢复后 run() 会按需重新按下。
+        if self._held_attack_key is not None:  # 有持续按住的攻击键。
+            keys.append(self._held_attack_key)  # 加入待释放列表。
+            self._held_attack_key = None  # 清空属性，任务恢复后 run() 会按需重新按下。
+        return keys  # 返回持有的按键列表。
 
     def find_minimap(self, feature_name, frame, threshold):  # 在整帧画面模板匹配小地图，返回小地图框或 None。
         try:  # 标注不存在时框架会抛 ValueError，不能中断主流程。

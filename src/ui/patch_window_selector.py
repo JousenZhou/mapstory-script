@@ -12,13 +12,28 @@
 # 重装依赖后仍生效。只需在启动 GUI 之前 import 本模块。
 import json  # 导入 json，用于读写窗口选择缓存文件。
 import os  # 导入 os，用于定位缓存文件路径。
+import threading  # 导入 threading，resize 需等待窗口尺寸稳定，放子线程执行避免冻结界面。
 
-from PySide6.QtCore import Qt, QStringListModel
-from PySide6.QtWidgets import QAbstractItemView, QComboBox, QCompleter
+from PySide6.QtCore import QObject, Qt, QStringListModel, Signal
+from PySide6.QtWidgets import QAbstractItemView, QComboBox, QCompleter, QHBoxLayout, QWidget
+from qfluentwidgets import BodyLabel, PushButton, SpinBox  # Fluent 控件：窗口大小输入框与应用按钮。
 
 import ok.ui.qt.start.StartTab as _start_tab_module
+from ok.util.logger import Logger  # 框架日志器，记录 resize 结果。
 
 _StartTab = _start_tab_module.StartTab
+
+logger = Logger.get_logger(__name__)  # 本补丁模块日志器。
+
+DEFAULT_RESIZE_WIDTH = 1366  # 窗口大小控件默认宽度（客户区像素）。
+DEFAULT_RESIZE_HEIGHT = 768  # 窗口大小控件默认高度（客户区像素）。
+RESIZE_BUTTON_TEXT = "Apply Size 应用大小"  # 应用按钮常态文案。
+RESIZE_BUTTON_BUSY_TEXT = "Applying 调整中..."  # 应用按钮 resize 进行中文案。
+
+
+class _ResizeSignals(QObject):  # resize 子线程与 GUI 线程之间的信号桥：跨线程 emit 会自动排队到主线程执行。
+    finished = Signal(bool, str)  # 参数为（是否成功, 提示文本）。
+
 
 _original_init = _StartTab.__init__
 _original_update_capture = _StartTab.update_capture
@@ -108,8 +123,105 @@ def _install_searchable_combo(self):  # 用可搜索下拉框替换原窗口列�
     combo.lineEdit().textChanged.connect(lambda text: _on_search_text_changed(self, text))  # 输入即弹下拉展示过滤后的窗口。
     if layout is not None:
         layout.addWidget(combo)
+        layout.addWidget(_build_resize_row(self))  # 下拉框下方追加“窗口大小”resize 控件行。
     self.device_combo = combo
     self.device_list_row = -1
+
+
+def _build_resize_row(self):  # 构造“窗口大小 [宽] x [高] [应用]”控件行，把选中窗口 resize 到指定客户区大小。
+    widget = QWidget()  # 控件行容器。
+    row = QHBoxLayout(widget)  # 水平布局。
+    row.setContentsMargins(0, 0, 0, 0)  # 去掉外边距，与下拉框对齐。
+    row.setSpacing(6)  # 控件间距。
+    row.addWidget(BodyLabel("Window Size 窗口大小"))  # 标签。
+    self.resize_width_spin = SpinBox()  # 宽度输入框。
+    self.resize_width_spin.setRange(320, 7680)  # 合理宽度范围。
+    self.resize_width_spin.setValue(DEFAULT_RESIZE_WIDTH)  # 默认 1366。
+    self.resize_width_spin.setSuffix(" px")  # 单位后缀。
+    self.resize_width_spin.setMinimumWidth(96)  # 保证四位数加后缀能完整显示。
+    row.addWidget(self.resize_width_spin)  # 加入宽度框。
+    row.addWidget(BodyLabel("x"))  # 宽高分隔符。
+    self.resize_height_spin = SpinBox()  # 高度输入框。
+    self.resize_height_spin.setRange(240, 4320)  # 合理高度范围。
+    self.resize_height_spin.setValue(DEFAULT_RESIZE_HEIGHT)  # 默认 768。
+    self.resize_height_spin.setSuffix(" px")  # 单位后缀。
+    self.resize_height_spin.setMinimumWidth(96)  # 保证四位数加后缀能完整显示。
+    row.addWidget(self.resize_height_spin)  # 加入高度框。
+    self.resize_button = PushButton(RESIZE_BUTTON_TEXT)  # 应用按钮。
+    self.resize_button.clicked.connect(lambda: _resize_selected_window(self))  # 点击 resize 当前选中窗口。
+    row.addWidget(self.resize_button)  # 加入按钮。
+    row.addStretch(1)  # 右侧留白，控件靠左。
+    self._resize_signals = _ResizeSignals()  # 子线程完成后经此信号回主线程恢复按钮并提示。
+    self._resize_signals.finished.connect(lambda ok, text: _on_resize_finished(self, ok, text))
+    return widget  # 返回控件行。
+
+
+def _resolve_selected_hwnd():  # 解析当前选中窗口句柄：框架实时句柄 -> 首选设备记录 -> 配置里的 selected_hwnd。
+    from ok import og  # 延迟导入，避免补丁加载期循环依赖。
+    device_manager = getattr(og, 'device_manager', None)  # 设备管理器。
+    if device_manager is None:
+        return 0
+    hwnd_window = getattr(device_manager, 'hwnd_window', None)  # 当前窗口句柄管理器。
+    if hwnd_window is not None:
+        try:
+            hwnd_window.do_update_window_size()  # 强制刷新一次，确保拿到的是最新句柄。
+        except Exception as e:  # 刷新失败不阻断，继续走后面的回退来源。
+            logger.debug(f"refresh window size before resize failed: {e}")
+        hwnd = int(getattr(hwnd_window, 'hwnd', 0) or 0)
+        if hwnd:
+            return hwnd
+    device = device_manager.get_preferred_device()  # 回退一：首选设备记录里的真实句柄。
+    hwnd = int(device.get('real_hwnd') or 0) if device else 0
+    if hwnd:
+        return hwnd
+    return int(device_manager.config.get('selected_hwnd') or 0)  # 回退二：设备配置里锁定的句柄。
+
+
+def _resize_worker(hwnd, target_w, target_h, signals):  # 后台线程执行 resize：resize_window 内部最长会等待约 5 秒，不能占用 GUI 线程。
+    from ok import og
+    from ok.util.window import get_window_bounds, resize_window, show_title_bar  # 框架现成的窗口尺寸工具。
+    try:
+        show_title_bar(hwnd)  # 确保有标题栏，边框与标题栏高度才可计算。
+        _, _, window_width, window_height, client_w, client_h, _ = get_window_bounds(hwnd)  # 取窗口外框与客户区尺寸。
+        border = max(window_width - client_w, 0)  # 左右边框总宽。
+        title_height = max(window_height - client_h, 0)  # 标题栏 + 上下边框高。
+        resize_window(hwnd, target_w + border, target_h + title_height)  # 客户区达到目标尺寸，窗口自动居中。
+        new_w, new_h = target_w, target_h
+        hwnd_window = getattr(getattr(og, 'device_manager', None), 'hwnd_window', None)
+        if hwnd_window is not None:
+            hwnd_window.do_update_window_size()  # 立即刷新框架记录的窗口尺寸与坐标。
+            new_w = int(getattr(hwnd_window, 'width', target_w) or target_w)  # 刷新后的实际采集宽。
+            new_h = int(getattr(hwnd_window, 'height', target_h) or target_h)  # 刷新后的实际采集高。
+        logger.info(f"resize window {hwnd} to client {target_w}x{target_h} "
+                    f"(window {target_w + border}x{target_h + title_height}), now {new_w}x{new_h}")
+        signals.finished.emit(True, f"Window resized to 窗口已调整为 {new_w}x{new_h}")  # 提示实际生效尺寸。
+    except Exception as e:  # resize 异常不能拖垮界面，转成提示交给主线程。
+        logger.error(f"resize window failed: {e}")
+        signals.finished.emit(False, f"Resize failed 调整失败: {e}")
+
+
+def _on_resize_finished(self, ok, text):  # 信号槽（GUI 线程执行）：恢复按钮状态并弹出提示。
+    self.resize_button.setEnabled(True)
+    self.resize_button.setText(RESIZE_BUTTON_TEXT)
+    from ok.ui.qt.util.Alert import alert_error, alert_info  # 结果提示走通知，不阻塞界面。
+    if ok:
+        alert_info(text)
+    else:
+        alert_error(text)
+
+
+def _resize_selected_window(self):  # 点击“应用大小”：解析句柄后把耗时的 resize 交给后台线程。
+    from ok.ui.qt.util.Alert import alert_error  # 无窗口时的即时提示。
+    hwnd = _resolve_selected_hwnd()
+    if not hwnd:  # 没有选中任何窗口。
+        alert_error("No window selected 未选择窗口，请先在下拉框里选择一个窗口")
+        return
+    target_w = self.resize_width_spin.value()  # 目标客户区宽。
+    target_h = self.resize_height_spin.value()  # 目标客户区高。
+    self.resize_button.setEnabled(False)  # resize 期间禁用按钮，避免重复点击叠加 SetWindowPos。
+    self.resize_button.setText(RESIZE_BUTTON_BUSY_TEXT)
+    threading.Thread(target=_resize_worker, args=(hwnd, target_w, target_h, self._resize_signals),
+                     daemon=True, name='resize-window').start()
 
 
 def _on_combo_changed(self, index):  # 下拉选中变化 -> 设为首选设备并刷新采集/交互列表，同时缓存选择。

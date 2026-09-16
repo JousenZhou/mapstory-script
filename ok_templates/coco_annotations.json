@@ -107,6 +107,48 @@
       "file_name": "17.png",
       "width": 1340,
       "height": 754
+    },
+    {
+      "id": 22,
+      "file_name": "18.png",
+      "width": 1366,
+      "height": 768
+    },
+    {
+      "id": 23,
+      "file_name": "19.png",
+      "width": 1366,
+      "height": 768
+    },
+    {
+      "id": 24,
+      "file_name": "20.png",
+      "width": 1366,
+      "height": 768
+    },
+    {
+      "id": 25,
+      "file_name": "21.png",
+      "width": 1366,
+      "height": 768
+    },
+    {
+      "id": 26,
+      "file_name": "22.png",
+      "width": 1366,
+      "height": 768
+    },
+    {
+      "id": 29,
+      "file_name": "25.png",
+      "width": 1366,
+      "height": 768
+    },
+    {
+      "id": 30,
+      "file_name": "23.png",
+      "width": 1366,
+      "height": 768
     }
   ],
   "annotations": [
@@ -421,6 +463,32 @@
       ],
       "area": 341055,
       "iscrowd": 0
+    },
+    {
+      "id": 25,
+      "image_id": 30,
+      "category_id": 25,
+      "bbox": [
+        576,
+        638,
+        209,
+        28
+      ],
+      "area": 5852,
+      "iscrowd": 0
+    },
+    {
+      "id": 26,
+      "image_id": 30,
+      "category_id": 26,
+      "bbox": [
+        316,
+        137,
+        734,
+        488
+      ],
+      "area": 358192,
+      "iscrowd": 0
     }
   ],
   "categories": [
@@ -442,7 +510,7 @@
     {
       "id": 4,
       "name": "角色名",
-      "supercategory": ""
+      "supercategory": "角色"
     },
     {
       "id": 5,
@@ -487,7 +555,7 @@
     {
       "id": 13,
       "name": "小青蛇1",
-      "supercategory": ""
+      "supercategory": "怪物"
     },
     {
       "id": 14,
@@ -497,7 +565,7 @@
     {
       "id": 15,
       "name": "小青蛇2",
-      "supercategory": ""
+      "supercategory": "怪物"
     },
     {
       "id": 16,
@@ -522,12 +590,12 @@
     {
       "id": 20,
       "name": "测谎坐标框2",
-      "supercategory": ""
+      "supercategory": "测谎"
     },
     {
       "id": 21,
       "name": "测谎坐标框",
-      "supercategory": ""
+      "supercategory": "测谎"
     },
     {
       "id": 22,
@@ -537,12 +605,22 @@
     {
       "id": 23,
       "name": "测谎触发",
-      "supercategory": ""
+      "supercategory": "测谎触发"
     },
     {
       "id": 24,
       "name": "测谎触发2",
       "supercategory": ""
+    },
+    {
+      "id": 25,
+      "name": "测谎触发TEXT",
+      "supercategory": "测谎触发"
+    },
+    {
+      "id": 26,
+      "name": "测谎窗口",
+      "supercategory": "测谎"
     }
   ]
 }

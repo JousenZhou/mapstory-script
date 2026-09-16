@@ -1,7 +1,8 @@
-# 屏蔽主窗口的【脚本】【开发工具】【运行代码】【关于】四个默认菜单。
+# 屏蔽主窗口的【脚本】【开发工具】【运行代码】【关于】【任务】五个默认菜单。
 #
 # 框架 MainWindow 会按 debug 模式 / 自定义脚本情况添加 DebugTab、RunCodeTab、EditTaskTab、
-# AboutTab 等页签，本项目不使用这些功能，因此在导航层直接屏蔽：
+# AboutTab 等页签，本项目不使用这些功能；此外【任务】页（OneTimeTaskTab）的挂机/巡逻两个脚本
+# 已迁移进看板页签的任务控制栏（见 src/ui/DashboardTaskPanel.py），原导航项一并屏蔽：
 # 包装 MainWindow.addSubInterface，导航项文本命中屏蔽名单时跳过加入导航。
 # 页签对象本身仍被框架正常构造（如 MainWindow 后续还引用 self.about_tab.update_card），
 # 只是不进导航栏，无其他副作用。
@@ -19,6 +20,7 @@ _HIDDEN_TAB_TEXTS = {
     '开发工具', 'Debug',
     '运行代码', 'Run Code',
     '关于', 'About',
+    '任务', 'Tasks',  # 挂机/巡逻脚本已迁移到看板页签的任务控制栏，屏蔽原【任务】导航项。
 }
 
 _original_add_sub_interface = MainWindow.addSubInterface

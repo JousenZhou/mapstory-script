@@ -6,7 +6,7 @@ import cv2
 from src.config import config
 from ok.test.TaskTestCase import TaskTestCase
 
-from src.tasks.MapleIdleTask import MapleIdleTask
+from src.tasks.MapleIdleTask import MapleIdleTask, MatchBatch
 
 
 class TestMapleIdleSmoke(TaskTestCase):
@@ -66,6 +66,36 @@ class TestMapleIdleSmoke(TaskTestCase):
         dx, dy = self.task.center_offset(character, monsters[0])
         self.assertIsInstance(dx, int)
         self.assertIsInstance(dy, int)
+
+    def test_concurrent_match_consistent_with_serial(self):
+        # 并发匹配批次与串行逐个匹配对同一帧的结果必须完全一致（框数量、坐标、置信度、镜像标记与顺序）。
+        self.task.config.update({
+            'Character Feature': '帽子',  # 测试图上的角色标注分类名，跟随模板页实际标注名。
+            'Character Threshold': 0.75,  # 与 test_find_character_and_draw_overlay 保持一致的角色阈值。
+            'Monster Threshold': 0.8,  # 测试图用严格阈值，避免误检干扰一致性对比。
+            'Monster Mirror Threshold': 0.8,  # 怪物镜像匹配同样用严格阈值。
+        })
+        self.set_image('ok_templates/0.png')
+        frame = self.task.frame
+        char_name = self.task.config['Character Feature']  # 角色分类名。
+        monster_names = ["绿水灵"]  # 测试图上有标注的怪物分类。
+        serial_char = self.task.find_one_feature(char_name, frame, self.task.config['Character Threshold'])  # 串行角色匹配。
+        serial_monsters = []  # 串行怪物匹配结果。
+        for name in monster_names:  # 逐个分类串行匹配，与改造前 run() 的 CPU 路径一致。
+            serial_monsters.extend(self.task.find_all_features(name, frame, self.task.config['Monster Threshold'], self.task.config['Monster Mirror Threshold']))  # 原始与镜像合并去重。
+        batch = MatchBatch()  # 新建本帧并发匹配批次。
+        self.task.submit_char_monster_matches(batch, frame, char_name, monster_names)  # 一次性提交角色与全部怪物的原始/镜像匹配。
+        conc_char, conc_monsters = self.task.collect_char_monster_matches(batch, monster_names)  # 按串行原顺序取回结果。
+        self.assertIsNotNone(conc_char)  # 测试图上角色必须能匹配到，否则本用例没有真正对比到东西。
+        self.assertEqual(self.describe_box(serial_char), self.describe_box(conc_char))  # 角色框完全一致。
+        self.assertEqual([self.describe_box(b) for b in serial_monsters],  # 全部怪物框的内容与顺序都一致。
+                         [self.describe_box(b) for b in conc_monsters])
+
+    @staticmethod
+    def describe_box(box):  # 把匹配框压成可比较的元组，None 保持 None。
+        if box is None:  # 未匹配到目标。
+            return None  # 用 None 参与对比。
+        return box.name, box.x, box.y, box.width, box.height, round(box.confidence, 6), bool(getattr(box, "flipped", False))  # 分类名、位置、尺寸、置信度与镜像标记。
 
     def test_gpu_match_consistent_with_cpu(self):
         # GPU 路径与 CPU 路径对同一帧的最佳匹配位置与分数应一致，位置容差 3 像素、分数容差 0.02。

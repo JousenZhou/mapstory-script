@@ -6,6 +6,8 @@ from PySide6.QtCore import QObject
 
 from ok import Logger
 
+from src.liedetector.service import LieDetectorService  # 导入独立测谎监控服务，由 Globals 持有并随 app 启动。
+
 logger = Logger.get_logger(__name__)
 
 
@@ -19,6 +21,10 @@ class Globals(QObject):
         self._vision_lock = threading.Lock()  # 保护实时画面在任务线程与 UI 线程间的读写。
         self._vision_frame = None  # 最新一帧带标注的游戏画面（BGR 矩阵）。
         self._vision_time = 0.0  # 最新一帧的写入时间戳，用于判断画面是否过期。
+        # 独立测谎监控服务：脱离脚本任务运行，值守看板【测谎触发】标注，命中即暂停当前任务并自动解测谎、结束后恢复。
+        # Globals(og.my_app) 在 og.executor/og.device_manager 之后创建，此处启动后台守护线程可安全引用二者。
+        self.lie_service = LieDetectorService(exit_event)  # 创建服务，与 app 共用退出事件。
+        self.lie_service.start()  # 启动后台守护线程，随进程退出。
 
     def update_vision(self, frame):  # 任务线程写入最新一帧带标注画面，供 UI 实时展示。
         with self._vision_lock:  # 加锁避免 UI 线程读到写一半的数据。

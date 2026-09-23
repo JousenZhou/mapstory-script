@@ -27,27 +27,3 @@ docs = [
 gpu = [
     "cupy-cuda12x[ctk]",
 ]
-# Optional: ONNX Runtime CUDA inference used by LieDetectorTab (测谎检验).
-# onnxruntime-gpu 1.23.x is the CUDA 12 generation (1.29+ requires CUDA 13);
-# NVIDIA pip wheels supply cuBLAS/cuFFT/cuDNN runtimes on machines without a
-# system CUDA Toolkit. The tab disables itself when this extra is missing.
-inference = [
-    "onnxruntime-gpu==1.23.2",
-    "scipy>=1.14",
-    "nvidia-cudnn-cu12",
-    "nvidia-cublas-cu12",
-    "nvidia-cufft-cu12",
-    "nvidia-cuda-runtime-cu12",
-    "nvidia-nvjitlink-cu12",
-]
-# Optional: ultralytics YOLO detection accelerated on NVIDIA GPU, used by
-# Globals.detect (src/globals.py). torch must be a CUDA build matching the GPU
-# generation; for Blackwell (RTX 50xx, sm_120) install from the cu128 index:
-#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
-#   pip install ultralytics
-# Globals.detect falls back to CPU / disables itself when this extra is missing.
-yolo = [
-    "torch",
-    "torchvision",
-    "ultralytics>=8.4",
-]

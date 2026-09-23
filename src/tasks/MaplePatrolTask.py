@@ -116,6 +116,7 @@ class MaplePatrolTask(MapleIdleTask):  # 定义冒险岛小地图巡逻打怪任
 
     def run(self):  # 任务运行入口：小地图巡逻移动 + 攻击范围内停下打怪的双层循环。
         self.apply_shared_config()  # 从看板读取共享的角色/怪物/测谎参数覆盖任务配置（单一数据源）。
+        self._ensure_lie_service()  # 随首个脚本任务启动后台测谎服务（方法继承自 MapleIdleTask，服务自身幂等）。
         char_name = self.config.get("Character Feature")  # 读取角色标注分类名。
         monster_names = self.parse_monster_names(self.config.get("Monster Features"))  # 解析逗号分隔的怪物分类名列表。
         minimap_name = str(self.config.get("Minimap Feature") or '').strip()  # 读取小地图标注分类名。
@@ -191,8 +192,9 @@ class MaplePatrolTask(MapleIdleTask):  # 定义冒险岛小地图巡逻打怪任
                     self.sleep(loop_interval)  # 按固定 30FPS 节拍等待。
                     loop_start = time.time()  # 重置本轮起点，避免下轮再补等待。
                     continue  # 进入下一帧处理。
-                if not patrol_enabled:  # 监视模式：不巡逻不打怪，直接推送原始帧（测谎标注由独立服务负责绘制，任务不再介入）。
+                if not patrol_enabled:  # 监视模式：不巡逻不打怪，直接推送原始帧，并用 CPU 检测【测谎触发】【掉线2】发布给后台测谎服务。
                     og.my_app.update_vision(frame)  # 推送原始画面供 UI 展示。
+                    self.publish_lie_detection(None, frame)  # 监视模式 gpu=None，走 CPU 发布分支检测测谎/掉线并发布（方法继承自 MapleIdleTask）。
                     self.info_set("Status", "Watch only")  # 在 GUI 显示监视状态。
                     continue  # 跳过后续全部巡逻与攻击逻辑，循环顶部按 30FPS 节拍等待。
                 facing_due = facing_check and time.time() - last_facing_check >= FACING_CHECK_INTERVAL  # 本轮是否需要用图像校准朝向，提前算好以便把朝向匹配一并提交并发。
@@ -290,6 +292,7 @@ class MaplePatrolTask(MapleIdleTask):  # 定义冒险岛小地图巡逻打怪任
                     if in_range:  # 区域内有怪物时选定目标。
                         target = min(in_range, key=lambda m: self.center_distance(character, m))  # 优先攻击距离最近的目标，另一侧出现更近的怪立即转身换打，不做同侧锁定。
                 og.my_app.update_vision(self.draw_overlay(frame, minimap, rect, dot, left_pct, right_pct, character, monsters, nearest, target))  # 把带标注画面推送给 UI 实时展示。
+                self.publish_lie_detection(gm, frame)  # 用同一帧与同一匹配器检测【测谎触发】【掉线2】并发布给后台测谎服务（GPU 可用走 gm，否则走 CPU）。
                 if target is not None:  # 攻击范围内有怪物时停下巡逻原地攻击。
                     if self._held_move_key is not None:  # 进入攻击前先松开移动键，站着打不边走边打。
                         self.send_key_up(self._held_move_key)  # 松开方向键。

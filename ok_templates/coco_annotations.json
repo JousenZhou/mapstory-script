@@ -438,7 +438,7 @@
     {
       "id": 20,
       "image_id": 19,
-      "category_id": 23,
+      "category_id": 21,
       "bbox": [
         575,
         632,
@@ -451,7 +451,7 @@
     {
       "id": 21,
       "image_id": 19,
-      "category_id": 21,
+      "category_id": 44,
       "bbox": [
         300,
         109,
@@ -851,8 +851,8 @@
     },
     {
       "id": 21,
-      "name": "测谎坐标框",
-      "supercategory": "测谎"
+      "name": "测谎触发正式",
+      "supercategory": "测谎触发"
     },
     {
       "id": 22,
@@ -860,14 +860,9 @@
       "supercategory": ""
     },
     {
-      "id": 23,
-      "name": "测谎触发",
-      "supercategory": "测谎触发"
-    },
-    {
       "id": 24,
       "name": "测谎触发2",
-      "supercategory": ""
+      "supercategory": "测谎触发"
     },
     {
       "id": 25,
@@ -963,6 +958,11 @@
       "id": 43,
       "name": "开始游戏",
       "supercategory": ""
+    },
+    {
+      "id": 44,
+      "name": "测谎坐标框正式",
+      "supercategory": "测谎"
     }
   ]
 }

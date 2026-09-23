@@ -1,14 +1,15 @@
-# 独立测谎监控服务：脱离脚本任务单独运行，值守看板配置的【测谎触发】标注。
-# 命中触发即：暂停当前脚本任务 -> 自动解测谎（DIS 稠密光流+粒子滤波，与测谎检验页签同一套解法，无神经网络）-> 结束后恢复任务；
-# 无脚本任务运行时也能独立监控与求解。
+# 独立测谎监控服务：值守看板配置的【测谎触发】标注，命中即暂停当前脚本任务并自动解测谎。
+# 命中触发即：暂停当前脚本任务 -> 自动解测谎（DIS 稠密光流+粒子滤波，与测谎检验页签同一套解法，无神经网络）-> 结束后恢复任务。
+# 值守检测不再自行截图/CPU 匹配：改为消费脚本任务每帧用共享 GPU 匹配器发布的检测结果（见 Globals.publish_detection），
+# 因此测谎/掉线值守仅在脚本任务运行时生效，无任务发布时服务 park，不再 24h 空转。
 #
-# 扩展：掉线自动重登——复用同一监控循环与截图/模板匹配资源，检测【掉线2】模板命中后
+# 扩展：掉线自动重登——消费同一发布通道的【掉线2】命中结果，触发后
 # 暂停任务、处理掉线弹窗、切换全桌面截图执行重登序列（连接→服务区→频道→开始游戏），完成后恢复任务。
 #
 # 设计要点：
-#   - 服务是 app 级后台守护线程，由 Globals(og.my_app) 创建并启动，生命周期与进程一致。
-#   - 截图与模板匹配复用框架 device_manager.capture_method 与 executor.feature_set
-#     （两者均线程安全：get_frame 内部加锁、FeatureSet 有 self.lock，与任务的并发匹配 MatchBatch 同源）。
+#   - 服务由 Globals(og.my_app) 创建，随首个脚本任务启动（见任务 _ensure_lie_service），守护线程随进程退出。
+#   - 值守段的检测数据来自任务发布（og.my_app.get_latest_detection）；仅求解/重登阶段任务已暂停，
+#     服务才自行截图（device_manager.capture_method）与模板匹配（executor.feature_set），此时无重复截图。
 #   - 暂停/恢复：读取 executor.current_task，调用 task.pause()/unpause()；暂停后先等任务线程
 #     阻塞到 sleep（PAUSE_SETTLE_SECONDS），再释放任务持有的按键（pop_held_keys），
 #     避免解测谎期间任务残留按住方向键/攻击键。用户已手动暂停的任务不自动恢复，尊重用户意图。
@@ -86,6 +87,7 @@ class LieDetectorService:  # 独立测谎监控服务：后台守护线程值守
         self._trigger_hits = 0  # 连续命中【测谎触发】的帧数，达到 LIE_TRIGGER_CONFIRM_FRAMES 才真正进入解题（防抖）。
         self._cooldown_until = 0.0  # 冷却截止时间戳：一局结束后这段时间内不响应新触发，避免弹窗残留画面重复触发。
         self._disconnect_hits = 0  # 连续命中【掉线2】的帧数，达到 DISCONNECT_CONFIRM_FRAMES 才触发重登（防抖）。
+        self._last_det_seq = 0  # 上次处理的任务发布检测序号，用于去重：同一帧不重复计数，保证“连续帧”防抖语义正确。
 
     def start(self):  # 启动后台守护线程；重复调用只启动一次。
         if self._thread is not None:  # 已启动过。
@@ -131,20 +133,32 @@ class LieDetectorService:  # 独立测谎监控服务：后台守护线程值守
                 auto_login_cfg = self._read_auto_login_config()  # 读取自动登录配置。
     
                 # —— 掉线检测（优先级高于测谎：游戏都掉了，测谎无意义）——
+                det = self._latest_detection()  # 取脚本任务最近一帧发布的检测结果（不再自行截图/CPU 匹配）。
+                if det is None:  # 无任务运行或结果已过期：服务 park，不空转截图。
+                    self._trigger_hits = 0  # 无检测数据，测谎确认计数清零。
+                    self._disconnect_hits = 0  # 无检测数据，掉线确认计数清零。
+                    self._set_status("idle: no task")  # 记录空闲（无任务）状态。
+                    self._idle_sleep(MONITOR_INTERVAL)  # 空闲等待。
+                    continue  # 下一轮。
+                seq = det.get('seq')  # 本次检测结果的发布序号。
+                if seq == self._last_det_seq:  # 同一帧已处理过（任务尚未发布新帧）：不重复计数，保证“连续帧”防抖语义正确。
+                    self._idle_sleep(MONITOR_INTERVAL)  # 等待任务发布新帧。
+                    continue  # 下一轮。
+                self._last_det_seq = seq  # 记录已处理的发布序号。
+                frame = det.get('frame')  # 任务采集并发布的游戏画面，命中后交给处理流程复用（求解/重登阶段服务再自行截图）。
                 if auto_login_cfg['enabled'] and self._feature_ready(DISCONNECT_TEMPLATE):  # 自动登录开启且掉线模板已标注。
-                    frame = self._capture()  # 采集一帧游戏窗口画面。
-                    if frame is not None:  # 取到画面才做匹配。
-                        disconnect_box = self._find_trigger(frame, DISCONNECT_TEMPLATE, auto_login_cfg['threshold'])  # 全屏匹配【掉线2】。
-                        if disconnect_box is not None:  # 本帧命中掉线标志。
-                            self._disconnect_hits += 1  # 累计连续命中帧数。
-                            if self._disconnect_hits >= DISCONNECT_CONFIRM_FRAMES:  # 达到确认帧数，触发重登。
-                                self._disconnect_hits = 0  # 清零计数。
-                                self._handle_disconnect(frame, auto_login_cfg)  # 执行掉线重登流程（阻塞直到完成）。
-                                continue  # 重登完成后跳过本轮测谎检测。
-                        else:  # 本帧未命中。
-                            self._disconnect_hits = 0  # 命中中断，确认计数清零重新累计。
+                    disconnect_box = det.get('disconnect_box')  # 任务发布的【掉线2】最高分命中框。
+                    disconnect_hit = disconnect_box is not None and float(det.get('disconnect_score') or 0.0) >= auto_login_cfg['threshold']  # 按实时看板阈值判定命中：任务发布原始最高分，阈值判定留给服务以保留热更新能力。
+                    if disconnect_hit:  # 本帧命中掉线标志。
+                        self._disconnect_hits += 1  # 累计连续命中帧数。
+                        if self._disconnect_hits >= DISCONNECT_CONFIRM_FRAMES:  # 达到确认帧数，触发重登。
+                            self._disconnect_hits = 0  # 清零计数。
+                            self._handle_disconnect(frame, auto_login_cfg)  # 执行掉线重登流程（阻塞直到完成，此阶段任务已暂停、服务自行截图）。
+                            continue  # 重登完成后跳过本轮测谎检测。
+                    else:  # 本帧未命中。
+                        self._disconnect_hits = 0  # 命中中断，确认计数清零重新累计。
     
-                # —— 测谎检测（原有逻辑不变）——
+                # —— 测谎检测（消费任务发布结果，防抖/冷却/延迟/求解逻辑不变）——
                 if not auto_solve:  # 自动解测谎关闭。
                     self._set_status("auto solve off")  # 记录状态。
                     self._idle_sleep(MONITOR_INTERVAL)  # 空闲等待。
@@ -162,16 +176,11 @@ class LieDetectorService:  # 独立测谎监控服务：后台守护线程值守
                     self._idle_sleep(MONITOR_INTERVAL)  # 空闲等待到冷却结束。
                     continue  # 下一轮。
                 self._set_status("watching")  # 标注就绪且不在冷却期，进入值守状态。
-                frame = self._capture()  # 采集一帧画面。
-                if frame is None:  # 取不到画面（窗口未就绪等）。
-                    self._idle_sleep(MONITOR_INTERVAL)  # 空闲等待后重试。
-                    continue  # 下一轮。
-                trigger_box = self._find_trigger(frame, trigger_name, threshold)  # 全屏匹配【测谎触发】标注。
-                if trigger_box is None:  # 未触发测谎。
+                trigger_box = det.get('trigger_box')  # 任务发布的【测谎触发】最高分命中框（原始最高分，未阈值化）。
+                trigger_score = float(det.get('trigger_score') or 0.0)  # 任务发布的【测谎触发】最高分。
+                if trigger_box is None or trigger_score < threshold:  # 未触发测谎（按实时看板阈值判定命中）。
                     self._trigger_hits = 0  # 命中中断，确认计数清零重新累计。
-                    if self._current_task() is None:  # 无脚本任务运行时，服务独立推送监视画面（框选坐标框）。
-                        region_box = self._get_region_box(frame, region_name)  # 采集坐标框供画面框选。
-                        self._update_vision(self.draw_lie_annotations(frame, None, region_box))  # 推送监视画面；有任务运行时让任务自己推送，避免争用画面通道。
+                    self._probe_published_trigger_score(trigger_name, trigger_score, threshold)  # 限频用发布分数记诊断日志，区分弹窗未出现/阈值偏高/模板不符。
                     self._idle_sleep(MONITOR_INTERVAL)  # 空闲等待。
                     continue  # 下一轮。
                 self._trigger_hits += 1  # 本帧命中，累计连续命中帧数。
@@ -515,6 +524,16 @@ class LieDetectorService:  # 独立测谎监控服务：后台守护线程值守
         except Exception:  # 截图异常。
             return None  # 按取不到画面处理。
 
+    def _latest_detection(self):  # 取脚本任务最近一帧发布的检测结果（测谎/掉线命中框与分数），无任务或过期返回 None。
+        app = getattr(og, "my_app", None)  # 取 app 级全局对象（Globals，持有检测发布通道）。
+        getter = getattr(app, "get_latest_detection", None) if app is not None else None  # 取发布通道的读取函数。
+        if not callable(getter):  # 通道不可用（启动早期或旧版 Globals）。
+            return None  # 无检测结果，服务 park。
+        try:  # 读取异常不能让服务崩溃。
+            return getter()  # 返回最新检测结果 dict 或 None（过期）。
+        except Exception:  # 读取异常。
+            return None  # 按无检测结果处理。
+
     def _interaction(self):  # 取框架输入设备接口（鼠标/键盘），不可用时返回 None。
         device_manager = getattr(og, "device_manager", None)  # 取设备管理器。
         return getattr(device_manager, "interaction", None) if device_manager is not None else None  # 返回输入接口或 None。
@@ -557,6 +576,13 @@ class LieDetectorService:  # 独立测谎监控服务：后台守护线程值守
         except Exception:  # 探测失败静默跳过。
             return  # 不记录。
         logger.info(f"Lie trigger not matched: {feature_name} best score={score:.3f} < threshold={threshold}. 测谎触发未达阈值：最高分={score:.3f}，阈值={threshold}。分数接近阈值=弹窗在画面但相似度不足；分数很低=弹窗未出现或模板不符。")
+
+    def _probe_published_trigger_score(self, trigger_name, score, threshold):  # 诊断：限频用任务发布的【测谎触发】最高分记日志，区分弹窗未出现/阈值偏高/模板不符（不再自行匹配）。
+        now = time.time()  # 当前时间。
+        if now - self._last_trigger_probe < TRIGGER_PROBE_INTERVAL:  # 限频，避免每帧刷日志。
+            return  # 未到探测间隔。
+        self._last_trigger_probe = now  # 记录本次探测时间。
+        logger.info(f"Lie trigger not matched: {trigger_name} best score={score:.3f} < threshold={threshold}. 测谎触发未达阈值：最高分={score:.3f}，阈值={threshold}。分数接近阈值=弹窗在画面但相似度不足；分数很低=弹窗未出现或模板不符。")
 
     def _get_region_box(self, frame, region_name):  # 直接采集【测谎坐标框】标注记录的坐标框信息作为解测谎输入区域，不做模板匹配；未标注返回 None。
         feature_set = self._feature_set()  # 取特征集。

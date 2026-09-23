@@ -11,9 +11,11 @@ from ok.feature.Box import Box  # 导入 Box 类，用于镜像匹配结果的�
 from qfluentwidgets import FluentIcon  # 导入 Fluent 图标，用于任务在 GUI 中显示图标。
 
 from src.tasks.MyBaseTask import MyBaseTask  # 导入项目任务基类，导入时会同时生效标注文件 UTF-8 读取补丁。
+from src.liedetector.service import DISCONNECT_TEMPLATE  # 导入掉线确认模板名常量，与测谎服务共用同一名称值守【掉线2】。
 
-# 测谎监控与自动解题已抽离为独立服务 src/liedetector/service.py（由 Globals 后台常驻），
-# 任务不再直接解测谎，只需把持有的按键上报给服务（见 pop_held_keys）以便暂停时被释放。
+# 测谎监控与自动解题已抽离为独立服务 src/liedetector/service.py（随首个脚本任务启动，无任务时不空转），
+# 任务每帧用共享 GPU 匹配器检测【测谎触发】【掉线2】并发布给服务（见 publish_lie_detection），
+# 服务消费发布结果做防抖/冷却/暂停→光流求解→重登→恢复；暂停时任务把持有按键上报给服务（见 pop_held_keys）以便释放。
 
 MOVE_LEFT_KEY = "left"  # 左方向键：单击用于换方向，定时位移时按住用于移动。
 MOVE_RIGHT_KEY = "right"  # 右方向键：单击用于换方向，定时位移时按住用于移动。
@@ -92,6 +94,7 @@ class MapleIdleTask(MyBaseTask):  # 定义冒险岛挂机任务，继承项目�
 
     def run(self):  # 任务运行入口。
         self.apply_shared_config()  # 从看板读取共享的角色/怪物/测谎参数覆盖任务配置（单一数据源）。
+        self._ensure_lie_service()  # 随首个脚本任务启动后台测谎服务（服务自身幂等），之后由本任务每帧发布检测结果驱动它。
         char_name = self.config.get("Character Feature")  # 读取角色标注分类名。
         monster_names = self.parse_monster_names(self.config.get("Monster Features"))  # 解析逗号分隔的怪物分类名列表。
         frame = self.wait_frame()  # 先取到一帧画面，让 FeatureSet 确定画面尺寸。
@@ -232,6 +235,7 @@ class MapleIdleTask(MyBaseTask):  # 定义冒险岛挂机任务，继承项目�
                         pool = same_side if same_side else in_range  # 同侧还有怪就锁定该侧，清完才允许换侧，避免两侧反复转身。
                         target = min(pool, key=lambda m: self.center_distance(character, m))  # 取候选池中最近的一只，一直攻击直到它消失。
                 og.my_app.update_vision(self.draw_overlay(frame, character, monsters, nearest, target))  # 把带标注画面推送给 UI 实时展示。
+                self.publish_lie_detection(gm, frame)  # 用同一帧与同一匹配器检测【测谎触发】【掉线2】并发布给后台测谎服务（GPU 可用走 gm，否则走 CPU）。
                 if target is not None:  # 攻击范围内有怪物时原地攻击。
                     dx, dy = self.center_offset(character, target)  # 计算目标怪物相对角色的方向。
                     direction = 1 if dx > 0 else -1  # 1=怪在右侧，-1=怪在左侧。
@@ -351,11 +355,69 @@ class MapleIdleTask(MyBaseTask):  # 定义冒险岛挂机任务，继承项目�
                     return None  # 回退 CPU 保证行为一致。
                 matcher.add_template(name, feature.mat)  # 注册原始朝向模板。
                 matcher.add_template(name + "__flip", cv2.flip(feature.mat, 1))  # 注册水平镜像模板。
+            self._register_lie_templates(matcher, feature_set)  # 追加注册【测谎触发】【掉线2】模板（不镜像），供每帧共享检测发布。
             self.log_info("GPU template match enabled. 已启用显卡模板匹配加速。")  # 提示加速已生效。
             return matcher  # 返回可用的匹配器。
         except Exception as e:  # 初始化任何环节异常都不影响任务运行。
             self.log_warning(f"GPU match init failed, use CPU: {e}. GPU 匹配初始化失败，使用 CPU。")  # 记录异常原因。
             return None  # 回退 CPU。
+
+    def _ensure_lie_service(self):  # 确保后台测谎服务已启动：随首个脚本任务启动，服务本身幂等（start 内部判重）。
+        app = getattr(og, "my_app", None)  # 取全局 app（Globals），未就绪时跳过。
+        service = getattr(app, "lie_service", None) if app is not None else None  # 取测谎服务实例。
+        if service is not None:  # 服务存在才启动。
+            service.start()  # 幂等启动后台守护线程，无任务发布时自行 park。
+
+    def _lie_watch_templates(self):  # 依据看板开关返回本任务需要值守/发布的测谎模板名列表。
+        names = []  # 收集需要注册的模板名。
+        if bool(self.config.get("Lie Detector Auto Solve")):  # 开启自动解测谎才值守【测谎触发】。
+            trigger = str(self.config.get("Lie Detector Trigger Feature") or '').strip()  # 读取触发标注名。
+            if trigger:  # 名称非空才加入。
+                names.append(trigger)  # 加入触发模板名。
+        if bool(self.config.get("Auto Login Enabled")):  # 开启自动登录才值守【掉线2】。
+            names.append(DISCONNECT_TEMPLATE)  # 加入掉线确认模板名。
+        return names  # 返回需值守的模板名列表。
+
+    def _register_lie_templates(self, matcher, feature_set):  # 把测谎/掉线模板追加注册进 GPU 匹配器，与角色/怪物共享同一帧批量匹配。
+        for name in self._lie_watch_templates():  # 逐个待值守模板。
+            try:  # 单个模板异常不影响其余模板与角色/怪物的 GPU 匹配。
+                if not feature_set.feature_exists(name):  # 未在模板页标注。
+                    continue  # 跳过，交由 CPU 发布分支处理（find_one_raw 内部会吞掉 ValueError）。
+                feature_set.ensure_feature(name)  # 确保标注已加载。
+                feature = feature_set.feature_dict.get(name)  # 取特征对象。
+                if feature is None or getattr(feature, "mask", None) is not None:  # 缺失或带掩码无法 GPU 等价匹配。
+                    continue  # 跳过，该模板走 CPU 发布分支。
+                matcher.add_template(name, feature.mat)  # 仅注册原始朝向（测谎/掉线标志不镜像）。
+            except Exception:  # 任何异常都不影响主匹配器构建。
+                continue  # 跳过该模板。
+
+    def _lookup_best(self, gm, frame, name):  # 取一个模板在本帧的最高分命中框与分数（不做阈值判定，阈值由服务按实时看板决定）。
+        if not name:  # 模板名为空。
+            return None, 0.0  # 无命中。
+        if gm is not None and name in gm.matcher.templates:  # GPU 路径且该模板已注册。
+            try:  # GPU 计算异常时回退 CPU。
+                x, y, score = gm.best(name)  # 最高分与位置（无论是否达标）。
+                td = gm.matcher.templates[name]  # 取模板尺寸。
+                return Box(int(x), int(y), td["w"], td["h"], confidence=float(score), name=name), float(score)  # 包装成 Box 返回。
+            except Exception:  # GPU 异常。
+                pass  # 落到下面的 CPU 分支。
+        best = self.find_one_raw(name, frame, 0.01)  # CPU 路径：极低阈值取全局最高分框，语义与 gm.best 一致。
+        if best is None:  # 未标注或无命中。
+            return None, 0.0  # 无命中。
+        return best, float(getattr(best, "confidence", 0.0))  # 返回最高分框与分数。
+
+    def publish_lie_detection(self, gm, frame):  # 每帧检测【测谎触发】【掉线2】并把结果发布给后台测谎服务，取代服务自行截图/CPU 匹配。
+        app = getattr(og, "my_app", None)  # 取全局 app（Globals）。
+        if app is None or not hasattr(app, "publish_detection"):  # app 或发布通道不可用。
+            return  # 跳过发布。
+        trigger_box, trigger_score = None, 0.0  # 默认无触发命中。
+        if bool(self.config.get("Lie Detector Auto Solve")):  # 开启自动解测谎才检测触发。
+            trigger_name = str(self.config.get("Lie Detector Trigger Feature") or '').strip()  # 读取触发标注名。
+            trigger_box, trigger_score = self._lookup_best(gm, frame, trigger_name)  # 取最高分触发框。
+        disconnect_box, disconnect_score = None, 0.0  # 默认无掉线命中。
+        if bool(self.config.get("Auto Login Enabled")):  # 开启自动登录才检测掉线。
+            disconnect_box, disconnect_score = self._lookup_best(gm, frame, DISCONNECT_TEMPLATE)  # 取最高分掉线框。
+        app.publish_detection(frame, trigger_box, trigger_score, disconnect_box, disconnect_score)  # 发布本帧检测结果。
 
     def gpu_lookup_one(self, gm, name, threshold, mirror_threshold=None):  # 在 GPU 帧句柄中找一个目标的最佳框，镜像未单独给阈值时沿用主阈值。
         try:  # GPU 计算异常时返回 None，由调用方回退 CPU。

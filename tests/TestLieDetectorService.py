@@ -1,7 +1,8 @@
 # 独立测谎监控服务回归测试：验证配置解析、鼠标追踪、报警守卫、画面标注、触发匹配、
-# 当前任务识别，以及“命中触发 -> 暂停脚本任务 -> 解测谎 -> 恢复任务”的协调逻辑
-# （服务与脚本任务解耦、无任务时也能独立求解，是本次改造的核心行为）。
-# 另覆盖触发防抖与冷却：瞬时丢失不能打断光流会话，一局结束后要初始化状态并进入冷却期。
+# 当前任务识别，以及“命中触发 -> 暂停脚本任务 -> 解测谎 -> 恢复任务”的协调逻辑。
+# 值守检测已改为消费脚本任务发布的检测结果（og.my_app.get_latest_detection），故另覆盖 _run 值守段：
+# 无发布时 park、seq 去重不重复计数、按看板阈值判定命中、连续帧防抖后触发解题/重登。
+# 还覆盖触发防抖与冷却：瞬时丢失不能打断光流会话，一局结束后要初始化状态并进入冷却期。
 # 还覆盖触发延迟：匹配到触发后先等配置的秒数才解题，延迟期弹窗已关则放弃本局，延迟结束后用新帧开题。
 import threading  # 用永不置位的退出事件构造服务，测试只直接调方法不启动线程。
 import time  # 验证冷却截止时间戳。
@@ -467,6 +468,83 @@ class TestLieDetectorService(unittest.TestCase):
         self.assertEqual(0, self.service._trigger_hits)  # 确认计数已清零。
         self.assertEqual(0.0, self.service._last_trigger_probe)  # 诊断限频已清零，下一局能立即打出分数。
         self.assertLessEqual(before + service_module.LIE_SOLVE_COOLDOWN, self.service._cooldown_until)  # 冷却截止时间已推到未来。
+
+    # ------------------------------------------------------------------ 值守段消费任务发布结果
+
+    @staticmethod
+    def _det(seq, frame, trigger_box=None, trigger_score=0.0, disconnect_box=None, disconnect_score=0.0):  # 构造一条与 Globals.publish_detection 结构一致的检测结果。
+        return {'seq': seq, 'frame': frame, 'trigger_box': trigger_box, 'trigger_score': trigger_score,
+                'disconnect_box': disconnect_box, 'disconnect_score': disconnect_score, 'time': time.time()}
+
+    def _drive_run(self, detections, auto_solve=True, auto_login=False, lie_threshold=0.7, disconnect_threshold=0.75):  # 用给定检测结果序列驱动 _run 值守段，耗尽后置退出事件结束主循环，返回 (_handle_trigger, _handle_disconnect) 两个 mock。
+        dets_list = list(detections)  # 固化检测序列，耗尽后回最后一帧以便观察跨帧计数状态。
+        cursor = {'i': 0}  # 用字典包一层便于闭包内自增读取位置。
+        svc = self.service  # 被测服务。
+
+        def fake_latest():  # 模拟 og.my_app.get_latest_detection：按序返回，耗尽后置退出事件并回最后一帧（seq 已处理过会 park，不重置计数）。
+            i = cursor['i']  # 当前读取位置。
+            if i < len(dets_list):  # 序列未耗尽。
+                cursor['i'] = i + 1  # 前进一帧。
+                return dets_list[i]  # 返回本帧检测结果。
+            svc._exit_event.set()  # 数据耗尽，主循环下一轮判定退出。
+            return dets_list[-1] if dets_list else None  # 回最后一帧保留计数状态；无数据时返回 None（触发 idle: no task）。
+
+        auto_login_cfg = {'enabled': auto_login, 'threshold': disconnect_threshold, 'server': '', 'channel': '', 'step_timeout': 30.0, 'raw': {}}
+        with patch.object(svc, "_read_config", return_value=(auto_solve, "测谎触发", "测谎坐标框", lie_threshold, 0.0, "")), \
+                patch.object(svc, "_read_auto_login_config", return_value=auto_login_cfg), \
+                patch.object(svc, "_latest_detection", side_effect=fake_latest), \
+                patch.object(svc, "_feature_ready", return_value=True), \
+                patch.object(svc, "_get_region_box", return_value=None), \
+                patch.object(svc, "draw_lie_annotations", return_value=None), \
+                patch.object(svc, "_update_vision"), \
+                patch.object(svc, "_idle_sleep"), \
+                patch.object(svc, "_probe_published_trigger_score"), \
+                patch.object(svc, "_handle_trigger") as ht, \
+                patch.object(svc, "_handle_disconnect") as hd, \
+                patch.object(service_module, "LIE_SOLVER_AVAILABLE", True):
+            svc._run()
+        return ht, hd
+
+    def test_run_consumes_published_trigger_after_confirm_frames(self):  # 连续 LIE_TRIGGER_CONFIRM_FRAMES 帧命中【测谎触发】（分数达阈值）后进入解题。
+        frame = np.full((300, 400, 3), 20, dtype=np.uint8)
+        trig = SimpleNamespace(x=10, y=10, width=50, height=20, confidence=0.9)
+        n = service_module.LIE_TRIGGER_CONFIRM_FRAMES
+        dets = [self._det(i + 1, frame, trigger_box=trig, trigger_score=0.9) for i in range(n)]
+        ht, hd = self._drive_run(dets, auto_solve=True, auto_login=False, lie_threshold=0.7)
+        ht.assert_called_once()  # 连续命中确认帧数后触发一次解题。
+        hd.assert_not_called()  # 未命中掉线不重登。
+
+    def test_run_parks_when_no_detection(self):  # 无任务发布（检测结果为空）时服务 park，不解题不重登，状态记为 idle: no task。
+        ht, hd = self._drive_run([], auto_solve=True, auto_login=True)
+        ht.assert_not_called()  # 无发布不解题。
+        hd.assert_not_called()  # 无发布不重登。
+        self.assertEqual("idle: no task", self.service._last_status)  # 状态为无任务空闲。
+
+    def test_run_seq_dedup_counts_frame_once(self):  # 同一发布序号重复读到（任务尚未发布新帧）只计一次，保证“连续帧”防抖语义正确。
+        frame = np.full((300, 400, 3), 20, dtype=np.uint8)
+        trig = SimpleNamespace(x=10, y=10, width=50, height=20, confidence=0.9)
+        same = self._det(7, frame, trigger_box=trig, trigger_score=0.9)
+        dets = [same] * (service_module.LIE_TRIGGER_CONFIRM_FRAMES + 3)  # 同一 seq 重复多帧。
+        ht, _ = self._drive_run(dets, auto_solve=True, auto_login=False, lie_threshold=0.7)
+        ht.assert_not_called()  # 只算 1 帧命中，未达确认帧数，不解题。
+        self.assertEqual(1, self.service._trigger_hits)  # 确认计数只累加了一次。
+
+    def test_run_trigger_below_threshold_not_matched(self):  # 发布分数低于看板阈值时按未命中处理：确认计数保持清零，不解题。
+        frame = np.full((300, 400, 3), 20, dtype=np.uint8)
+        trig = SimpleNamespace(x=10, y=10, width=50, height=20, confidence=0.5)
+        dets = [self._det(i + 1, frame, trigger_box=trig, trigger_score=0.5) for i in range(service_module.LIE_TRIGGER_CONFIRM_FRAMES + 1)]
+        ht, _ = self._drive_run(dets, auto_solve=True, auto_login=False, lie_threshold=0.7)
+        ht.assert_not_called()  # 分数低于阈值不算命中。
+        self.assertEqual(0, self.service._trigger_hits)  # 每帧未命中都清零。
+
+    def test_run_disconnect_confirm_triggers_relogin(self):  # 连续 DISCONNECT_CONFIRM_FRAMES 帧命中【掉线2】（分数达阈值）后触发重登。
+        frame = np.full((300, 400, 3), 20, dtype=np.uint8)
+        disc = SimpleNamespace(x=5, y=5, width=40, height=30, confidence=0.9)
+        n = service_module.DISCONNECT_CONFIRM_FRAMES
+        dets = [self._det(i + 1, frame, disconnect_box=disc, disconnect_score=0.9) for i in range(n)]
+        ht, hd = self._drive_run(dets, auto_solve=False, auto_login=True, disconnect_threshold=0.75)
+        hd.assert_called_once()  # 连续命中确认帧数后触发一次重登。
+        ht.assert_not_called()  # 自动解测谎关闭，不进解题。
 
 
 if __name__ == '__main__':

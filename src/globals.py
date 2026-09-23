@@ -1,30 +1,26 @@
-import os
 import threading
 import time
 
 from PySide6.QtCore import QObject
 
-from ok import Logger
-
-from src.liedetector.service import LieDetectorService  # 导入独立测谎监控服务，由 Globals 持有并随 app 启动。
-
-logger = Logger.get_logger(__name__)
+from src.liedetector.service import LieDetectorService  # 导入独立测谎监控服务，由 Globals 持有，随首个脚本任务启动（见任务 _ensure_lie_service）。
 
 
 class Globals(QObject):
 
     def __init__(self, exit_event):
         super().__init__()
-        self.yolo_model = None  # 存放懒加载的 YOLO 模型实例。
-        self.yolo_load_failed = False  # 记录模型是否加载失败，避免重复加载报错。
-        self.yolo_device = None  # YOLO 推理设备：优先 CUDA 显卡，缺失时回退 CPU。
         self._vision_lock = threading.Lock()  # 保护实时画面在任务线程与 UI 线程间的读写。
         self._vision_frame = None  # 最新一帧带标注的游戏画面（BGR 矩阵）。
         self._vision_time = 0.0  # 最新一帧的写入时间戳，用于判断画面是否过期。
+        # 检测发布通道：脚本任务用共享 GPU 匹配器每帧检测【测谎触发】【掉线2】，把命中框与分数发布到这里，
+        # 后台测谎服务不再自己截图/CPU 匹配，改为消费任务发布的结果（仿 update_vision/get_vision）。
+        self._detection_lock = threading.Lock()  # 保护检测结果在任务线程与服务线程间的读写。
+        self._detection = None  # 最新一次发布的检测结果 dict（frame/trigger_box/trigger_score/disconnect_box/disconnect_score/seq/time）。
+        self._detection_seq = 0  # 发布序号，每发布一帧自增，供服务判断结果是否为“新帧”去重。
         # 独立测谎监控服务：脱离脚本任务运行，值守看板【测谎触发】标注，命中即暂停当前任务并自动解测谎、结束后恢复。
-        # Globals(og.my_app) 在 og.executor/og.device_manager 之后创建，此处启动后台守护线程可安全引用二者。
+        # 服务只创建不常驻启动：改为随首个脚本任务启动（见任务 _ensure_lie_service），无任务时不空转截图。
         self.lie_service = LieDetectorService(exit_event)  # 创建服务，与 app 共用退出事件。
-        self.lie_service.start()  # 启动后台守护线程，随进程退出。
 
     def update_vision(self, frame):  # 任务线程写入最新一帧带标注画面，供 UI 实时展示。
         with self._vision_lock:  # 加锁避免 UI 线程读到写一半的数据。
@@ -37,53 +33,22 @@ class Globals(QObject):
                 return None  # 返回 None 由 UI 显示占位提示。
             return self._vision_frame  # 返回最新带标注画面。
 
-    def get_yolo(self, model_path='assets/yolo.pt'):  # 懒加载 YOLO 模型，首次调用时才导入 ultralytics。
-        if self.yolo_model is None and not self.yolo_load_failed:  # 模型尚未加载且未失败时才尝试加载。
-            if not os.path.exists(model_path):  # 模型文件不存在时不加载，由调用方给出提示。
-                logger.warning(f'yolo model file not found: {model_path}')
-                self.yolo_load_failed = True
-                return None
-            try:  # 尝试导入 ultralytics 并加载模型。
-                from ultralytics import YOLO  # 导入 YOLO 类。
-                self.yolo_model = YOLO(model_path)  # 加载用户训练的模型权重。
-                self.yolo_device = self._pick_yolo_device()  # 选择推理设备：优先 CUDA 显卡。
-                logger.info(f'yolo model loaded: {model_path} device: {self.yolo_device}')
-            except Exception as e:  # 未安装 ultralytics 或权重损坏时记录并标记失败。
-                logger.error(f'failed to load yolo model: {e}')
-                self.yolo_load_failed = True
-        return self.yolo_model  # 返回模型实例或 None。
+    def publish_detection(self, frame, trigger_box, trigger_score, disconnect_box, disconnect_score):  # 任务线程发布本帧测谎/掉线检测结果，供后台测谎服务消费。
+        with self._detection_lock:  # 加锁避免服务线程读到写一半的数据。
+            self._detection_seq += 1  # 递增发布序号，服务据此判断是否为新帧。
+            self._detection = {  # 记录本次发布的完整检测结果（框可能为 None，分数低于阈值也保留供诊断）。
+                'frame': frame,  # 本帧原始游戏画面（BGR 矩阵），求解阶段服务可复用。
+                'trigger_box': trigger_box,  # 【测谎触发】最高分命中框，未命中为 None。
+                'trigger_score': float(trigger_score or 0.0),  # 【测谎触发】最高分（无论是否达标）。
+                'disconnect_box': disconnect_box,  # 【掉线2】最高分命中框，未命中为 None。
+                'disconnect_score': float(disconnect_score or 0.0),  # 【掉线2】最高分（无论是否达标）。
+                'seq': self._detection_seq,  # 本次发布对应的序号。
+                'time': time.time(),  # 写入时间戳，用于判断检测结果是否过期。
+            }
 
-    @staticmethod
-    def _pick_yolo_device():  # 选择 YOLO 推理设备：有可用 CUDA 显卡返回 0，否则回退 'cpu'。
-        try:
-            import torch  # 导入 torch 探测 CUDA。
-            if torch.cuda.is_available():  # 显卡驱动与 CUDA 运行时可用。
-                return 0  # 使用第一块显卡做推理。
-        except Exception as e:  # torch 未安装或探测异常。
-            logger.warning(f'torch CUDA probe failed, fallback to cpu: {e}')
-        return 'cpu'  # 回退 CPU 推理。
-
-    def detect(self, frame, model_path='assets/yolo.pt'):  # 对一帧画面运行 YOLO，返回统一的检测结果。
-        model = self.get_yolo(model_path)  # 获取已加载的模型。
-        if model is None or frame is None:  # 模型或画面不可用时返回空结果。
-            return []
-        try:  # 运行推理，verbose=False 避免刷屏日志。
-            results = model.predict(frame, verbose=False, device=self.yolo_device)  # 在选定设备（优先 CUDA）上推理。
-        except Exception as e:  # 推理异常时记录并返回空结果，不让任务崩溃。
-            logger.error(f'yolo predict failed: {e}')
-            return []
-        detections = []  # 存放统一格式的检测结果。
-        for result in results:  # 逐张结果图解析。
-            if result.boxes is None:  # 没有任何检测框时跳过。
-                continue
-            names = result.names  # 类别索引到类别名的映射。
-            for box in result.boxes:  # 遍历每个检测框。
-                x1, y1, x2, y2 = box.xyxy[0].tolist()  # 取检测框左上和右下角坐标。
-                class_id = int(box.cls[0])  # 取预测的类别索引。
-                detections.append({  # 追加一条统一格式的检测记录。
-                    'name': names.get(class_id, str(class_id)),  # 类别名称。
-                    'box': [x1, y1, x2, y2],  # 检测框坐标。
-                    'conf': float(box.conf[0]),  # 置信度。
-                })
-        return detections  # 返回本帧全部检测结果。
+    def get_latest_detection(self, max_age=0.5):  # 服务线程读取最新检测结果，超过 max_age 秒未更新视为过期返回 None。
+        with self._detection_lock:  # 加锁保证读取一致性。
+            if self._detection is None or time.time() - self._detection['time'] > max_age:  # 无结果或结果已过期（无任务运行时）。
+                return None  # 返回 None 让服务 park，不再独立截图值守。
+            return self._detection  # 返回最新检测结果（同一时刻只有一个 maple 任务发布，最后写入者胜）。
 

@@ -1,7 +1,7 @@
-# MaplePatrolTask 回归测试：验证配置裁剪、校验、黄点检测与画面标注逻辑。
+# MaplePatrolTask 回归测试：验证配置裁剪、校验、黄点检测与画面标注逻辑，以及继承自 MapleIdleTask 的测谎/掉线共享检测。
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import cv2
@@ -9,8 +9,10 @@ import cv2
 from src.config import config
 from ok.test.TaskTestCase import TaskTestCase
 
+import src.tasks.MapleIdleTask as idle_module  # 继承方法定义在该模块，patch 其模块级 og 用它。
 from src.tasks.MaplePatrolTask import MaplePatrolTask  # 导入巡逻任务类。
 from src.dashboard_store import DASHBOARD_DEFAULTS  # 看板共享配置默认值，验证共享键已从任务页裁剪。
+from src.liedetector.service import DISCONNECT_TEMPLATE  # 掉线确认模板名常量。
 
 
 class TestMaplePatrolSmoke(TaskTestCase):
@@ -93,6 +95,37 @@ class TestMaplePatrolSmoke(TaskTestCase):
         self.assertEqual("测谎坐标框", DASHBOARD_DEFAULTS["Lie Detector Region Feature"])  # 坐标框标注默认名。
         self.assertEqual(0.75, DASHBOARD_DEFAULTS["Lie Detector Threshold"])  # 触发匹配阈值默认 0.75。
         self.assertEqual(5.0, DASHBOARD_DEFAULTS["Lie Detector Trigger Delay"])  # 触发延迟默认 5 秒。
+
+    # ------------------------------------------------------------------ 测谎/掉线共享检测（继承自 MapleIdleTask）
+
+    def test_ensure_lie_service_starts_service(self):
+        # run() 起始调用继承的 _ensure_lie_service：取 og.my_app.lie_service 并 start()，随首个脚本任务启动服务。
+        service = MagicMock()
+        with patch.object(idle_module, "og", SimpleNamespace(my_app=SimpleNamespace(lie_service=service))):
+            self.task._ensure_lie_service()
+        service.start.assert_called_once()  # 服务 start 被调用。
+
+    def test_watch_templates_and_publish_inherited(self):
+        # 巡逻任务继承 _lie_watch_templates 与 publish_lie_detection：按看板开关值守并发布检测结果到 Globals。
+        self.task.config.update({'Lie Detector Auto Solve': True, 'Lie Detector Trigger Feature': '测谎触发', 'Auto Login Enabled': True})
+        self.assertEqual(['测谎触发', DISCONNECT_TEMPLATE], self.task._lie_watch_templates())  # 值守触发+掉线。
+        captured = {}
+
+        class FakeApp:  # 记录发布调用的假 Globals。
+            def publish_detection(self, frame, tb, ts, db, ds):
+                captured['args'] = (frame, tb, ts, db, ds)
+
+        trig = SimpleNamespace(x=1, y=2, width=3, height=4, confidence=0.91, name='测谎触发')
+        disc = SimpleNamespace(x=5, y=6, width=7, height=8, confidence=0.82, name=DISCONNECT_TEMPLATE)
+        frame = np.full((10, 10, 3), 20, dtype=np.uint8)
+        with patch.object(idle_module, "og", SimpleNamespace(my_app=FakeApp())), \
+                patch.object(self.task, "find_one_raw", side_effect=[trig, disc]):  # 监视模式 gm=None，触发/掉线各走一次 CPU 匹配。
+            self.task.publish_lie_detection(None, frame)
+        _, tb, ts, db, ds = captured['args']
+        self.assertIs(trig, tb)  # 触发命中框原样发布。
+        self.assertAlmostEqual(0.91, ts)  # 触发分数取自置信度。
+        self.assertIs(db, disc)  # 掉线命中框原样发布。
+        self.assertAlmostEqual(0.82, ds)  # 掉线分数取自置信度。
 
 
 if __name__ == '__main__':

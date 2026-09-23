@@ -1,12 +1,17 @@
-# MapleIdleTask 回归测试：验证配置校验、解析、模板匹配与画面标注逻辑。
+# MapleIdleTask 回归测试：验证配置校验、解析、模板匹配与画面标注逻辑，以及测谎/掉线共享检测的模板注册与结果发布。
 import unittest
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import cv2
+import numpy as np
 
 from src.config import config
 from ok.test.TaskTestCase import TaskTestCase
 
+import src.tasks.MapleIdleTask as idle_module  # patch 模块级 og 用它。
 from src.tasks.MapleIdleTask import MapleIdleTask, MatchBatch
+from src.liedetector.service import DISCONNECT_TEMPLATE  # 掉线确认模板名常量。
 
 
 class TestMapleIdleSmoke(TaskTestCase):
@@ -126,6 +131,83 @@ class TestMapleIdleSmoke(TaskTestCase):
             self.assertLessEqual(abs(gx - cpu_box.x), 3)
             self.assertLessEqual(abs(gy - cpu_box.y), 3)
             self.assertLess(abs(gscore - cpu_box.confidence), 0.02)
+
+    # ------------------------------------------------------------------ 测谎/掉线共享检测（注册 + 发布）
+
+    def test_lie_watch_templates_follow_config(self):
+        # _lie_watch_templates 按看板开关返回需值守模板名：自动解测谎->触发名，自动登录->掉线2。
+        self.task.config.update({'Lie Detector Auto Solve': True, 'Lie Detector Trigger Feature': '测谎触发', 'Auto Login Enabled': True})
+        self.assertEqual(['测谎触发', DISCONNECT_TEMPLATE], self.task._lie_watch_templates())
+        self.task.config.update({'Lie Detector Auto Solve': False, 'Auto Login Enabled': False})
+        self.assertEqual([], self.task._lie_watch_templates())  # 两个开关都关时不值守任何模板。
+        self.task.config.update({'Lie Detector Auto Solve': True, 'Lie Detector Trigger Feature': '   ', 'Auto Login Enabled': True})
+        self.assertEqual([DISCONNECT_TEMPLATE], self.task._lie_watch_templates())  # 触发名空白时跳过，仅保留掉线。
+
+    def test_register_lie_templates_adds_unmasked_no_flip(self):
+        # _register_lie_templates 把已标注且无掩码的测谎/掉线模板注册进匹配器（仅原始朝向，不镜像），带掩码的跳过走 CPU。
+        matcher = MagicMock()  # 记录 add_template 调用。
+        trig_mat = object()  # 触发模板 mat 哨兵。
+        features = {'测谎触发': SimpleNamespace(mat=trig_mat, mask=None),  # 无掩码应注册。
+                    DISCONNECT_TEMPLATE: SimpleNamespace(mat=object(), mask=object())}  # 带掩码应跳过。
+        fs = MagicMock()
+        fs.feature_exists.side_effect = lambda name: name in features
+        fs.feature_dict = features
+        self.task.config.update({'Lie Detector Auto Solve': True, 'Lie Detector Trigger Feature': '测谎触发', 'Auto Login Enabled': True})
+        self.task._register_lie_templates(matcher, fs)
+        added_keys = [c[0][0] for c in matcher.add_template.call_args_list]  # 取每次调用的首个位置参数（模板名）。
+        self.assertIn('测谎触发', added_keys)  # 无掩码触发模板已注册。
+        self.assertNotIn(DISCONNECT_TEMPLATE, added_keys)  # 带掩码掉线模板跳过。
+        self.assertNotIn('测谎触发__flip', added_keys)  # 测谎模板不注册镜像。
+        matcher.add_template.assert_called_once_with('测谎触发', trig_mat)  # 仅注册原始朝向 mat。
+
+    def test_ensure_lie_service_starts_service(self):
+        # _ensure_lie_service 取 og.my_app.lie_service 并调用 start()（幂等），随首个脚本任务启动服务。
+        service = MagicMock()
+        with patch.object(idle_module, "og", SimpleNamespace(my_app=SimpleNamespace(lie_service=service))):
+            self.task._ensure_lie_service()
+        service.start.assert_called_once()  # 服务 start 被调用。
+        with patch.object(idle_module, "og", SimpleNamespace()):  # 无 my_app 时静默跳过。
+            self.task._ensure_lie_service()  # 不报错即可。
+
+    def test_publish_lie_detection_pushes_to_app(self):
+        # publish_lie_detection 每帧把检测结果发布到 Globals（og.my_app.publish_detection）；关闭开关时仍发布空结果。
+        captured = {}
+
+        class FakeApp:  # 记录发布调用的假 Globals。
+            def publish_detection(self, frame, tb, ts, db, ds):
+                captured['args'] = (frame, tb, ts, db, ds)
+
+        self.task.config.update({'Lie Detector Auto Solve': False, 'Auto Login Enabled': False})  # 两个开关都关：不检测但仍发布。
+        frame = np.full((10, 10, 3), 20, dtype=np.uint8)
+        with patch.object(idle_module, "og", SimpleNamespace(my_app=FakeApp())):
+            self.task.publish_lie_detection(None, frame)
+        self.assertIn('args', captured)  # 确实调用了发布通道。
+        published_frame, tb, ts, db, ds = captured['args']
+        self.assertIs(frame, published_frame)  # 原样透传本帧画面。
+        self.assertIsNone(tb)  # 关闭自动解测谎时无触发框。
+        self.assertIsNone(db)  # 关闭自动登录时无掉线框。
+        self.assertEqual(0.0, ts)
+        self.assertEqual(0.0, ds)
+
+    def test_publish_lie_detection_cpu_lookup_when_no_gpu(self):
+        # gm=None 时走 CPU 发布分支：用 find_one_raw 匹配触发模板并把命中框与分数发布出去。
+        captured = {}
+
+        class FakeApp:
+            def publish_detection(self, frame, tb, ts, db, ds):
+                captured['args'] = (frame, tb, ts, db, ds)
+
+        trig = SimpleNamespace(x=1, y=2, width=3, height=4, confidence=0.88, name='测谎触发')
+        self.task.config.update({'Lie Detector Auto Solve': True, 'Lie Detector Trigger Feature': '测谎触发', 'Auto Login Enabled': False})
+        frame = np.full((10, 10, 3), 20, dtype=np.uint8)
+        with patch.object(idle_module, "og", SimpleNamespace(my_app=FakeApp())), \
+                patch.object(self.task, "find_one_raw", return_value=trig) as fo:
+            self.task.publish_lie_detection(None, frame)
+        fo.assert_called_once()  # CPU 分支用 find_one_raw 匹配触发模板。
+        _, tb, ts, db, _ = captured['args']
+        self.assertIs(trig, tb)  # 命中框原样发布。
+        self.assertAlmostEqual(0.88, ts)  # 分数取自命中框置信度。
+        self.assertIsNone(db)  # 未开启自动登录，掉线框为空。
 
 
 if __name__ == '__main__':

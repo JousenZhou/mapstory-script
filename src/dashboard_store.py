@@ -21,6 +21,9 @@ SUPER_LIE_REGION = '测谎'  # 测谎区域标注的类别名（模板页标注�
 SUPER_LIE_TRIGGER = '测谎触发'  # 测谎触发标注的类别名（模板页标注的「类别」字段值）。
 SUPER_CHARACTER = '角色'  # 角色标注的类别名，供看板角色栏「角色特征/左朝向/右朝向」三个单选下拉取值。
 SUPER_MONSTER = '怪物'  # 怪物标注的类别名，供看板怪物栏「怪物特征」多选下拉取值。
+SUPER_SERVER = '服务区'  # 服务区标注的类别名，供自动登录栏「服务区」单选下拉取值（蓝蜗牛等）。
+SUPER_CHANNEL = '频道'  # 频道标注的类别名，供自动登录栏「频道」单选下拉取值（频道1等）。
+SUPER_DISCONNECT = '掉线'  # 掉线相关标注的类别名（掉线/掉线2/掉线确定/连接/开始游戏）。
 
 DASHBOARD_DEFAULTS = {  # 看板共享配置默认值：键名与任务原配置键一致，任务运行时无缝读取。
     # —— 测谎栏 ——
@@ -47,6 +50,12 @@ DASHBOARD_DEFAULTS = {  # 看板共享配置默认值：键名与任务原配置
     'Monster Features': '',  # 怪物标注分类名，英文逗号分隔支持多个。
     'Monster Threshold': 0.65,  # 怪物匹配阈值。
     'Monster Mirror Threshold': 0.65,  # 怪物镜像匹配阈值。
+    # —— 自动登录栏 ——
+    'Auto Login Enabled': True,  # 自动登录开关：开启后检测到掉线模板自动执行重登流程。
+    'Auto Login Server Feature': '',  # 服务区模板名（类别=服务区），对应启动器服务器选择按钮。
+    'Auto Login Channel Feature': '',  # 频道模板名（类别=频道），对应启动器频道选择按钮。
+    'Auto Login Threshold': 0.75,  # 全桌面模板匹配阈值。
+    'Auto Login Step Timeout': 30.0,  # 每步等待超时秒数，超时重试一次后中止。
 }
 
 

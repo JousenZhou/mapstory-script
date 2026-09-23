@@ -149,6 +149,42 @@
       "file_name": "23.png",
       "width": 1366,
       "height": 768
+    },
+    {
+      "id": 31,
+      "file_name": "24.png",
+      "width": 1366,
+      "height": 768
+    },
+    {
+      "id": 32,
+      "file_name": "26.png",
+      "width": 1366,
+      "height": 768
+    },
+    {
+      "id": 33,
+      "file_name": "27.png",
+      "width": 1366,
+      "height": 768
+    },
+    {
+      "id": 34,
+      "file_name": "28.png",
+      "width": 1366,
+      "height": 768
+    },
+    {
+      "id": 35,
+      "file_name": "29.png",
+      "width": 1366,
+      "height": 768
+    },
+    {
+      "id": 36,
+      "file_name": "30.png",
+      "width": 1368,
+      "height": 800
     }
   ],
   "annotations": [
@@ -489,6 +525,227 @@
       ],
       "area": 358192,
       "iscrowd": 0
+    },
+    {
+      "id": 27,
+      "image_id": 31,
+      "category_id": 28,
+      "bbox": [
+        5,
+        71,
+        245,
+        100
+      ],
+      "area": 24500,
+      "iscrowd": 0
+    },
+    {
+      "id": 28,
+      "image_id": 33,
+      "category_id": 27,
+      "bbox": [
+        4,
+        72,
+        135,
+        128
+      ],
+      "area": 17280,
+      "iscrowd": 0
+    },
+    {
+      "id": 29,
+      "image_id": 35,
+      "category_id": 29,
+      "bbox": [
+        705,
+        569,
+        43,
+        51
+      ],
+      "area": 2193,
+      "iscrowd": 0
+    },
+    {
+      "id": 30,
+      "image_id": 36,
+      "category_id": 30,
+      "bbox": [
+        813,
+        407,
+        104,
+        57
+      ],
+      "area": 5928,
+      "iscrowd": 0
+    },
+    {
+      "id": 31,
+      "image_id": 22,
+      "category_id": 31,
+      "bbox": [
+        522,
+        256,
+        268,
+        132
+      ],
+      "area": 35376,
+      "iscrowd": 0
+    },
+    {
+      "id": 32,
+      "image_id": 22,
+      "category_id": 32,
+      "bbox": [
+        659,
+        401,
+        87,
+        41
+      ],
+      "area": 3567,
+      "iscrowd": 0
+    },
+    {
+      "id": 33,
+      "image_id": 22,
+      "category_id": 33,
+      "bbox": [
+        208,
+        528,
+        124,
+        51
+      ],
+      "area": 6324,
+      "iscrowd": 0
+    },
+    {
+      "id": 34,
+      "image_id": 24,
+      "category_id": 34,
+      "bbox": [
+        442,
+        150,
+        108,
+        30
+      ],
+      "area": 3240,
+      "iscrowd": 0
+    },
+    {
+      "id": 35,
+      "image_id": 25,
+      "category_id": 35,
+      "bbox": [
+        520,
+        371,
+        34,
+        16
+      ],
+      "area": 544,
+      "iscrowd": 0
+    },
+    {
+      "id": 36,
+      "image_id": 25,
+      "category_id": 36,
+      "bbox": [
+        614,
+        371,
+        35,
+        15
+      ],
+      "area": 525,
+      "iscrowd": 0
+    },
+    {
+      "id": 37,
+      "image_id": 25,
+      "category_id": 37,
+      "bbox": [
+        705,
+        371,
+        34,
+        16
+      ],
+      "area": 544,
+      "iscrowd": 0
+    },
+    {
+      "id": 38,
+      "image_id": 25,
+      "category_id": 39,
+      "bbox": [
+        800,
+        370,
+        37,
+        18
+      ],
+      "area": 666,
+      "iscrowd": 0
+    },
+    {
+      "id": 39,
+      "image_id": 25,
+      "category_id": 38,
+      "bbox": [
+        523,
+        401,
+        31,
+        17
+      ],
+      "area": 527,
+      "iscrowd": 0
+    },
+    {
+      "id": 40,
+      "image_id": 25,
+      "category_id": 40,
+      "bbox": [
+        615,
+        401,
+        31,
+        17
+      ],
+      "area": 527,
+      "iscrowd": 0
+    },
+    {
+      "id": 41,
+      "image_id": 25,
+      "category_id": 41,
+      "bbox": [
+        708,
+        401,
+        34,
+        17
+      ],
+      "area": 578,
+      "iscrowd": 0
+    },
+    {
+      "id": 42,
+      "image_id": 25,
+      "category_id": 42,
+      "bbox": [
+        802,
+        402,
+        32,
+        16
+      ],
+      "area": 512,
+      "iscrowd": 0
+    },
+    {
+      "id": 43,
+      "image_id": 26,
+      "category_id": 43,
+      "bbox": [
+        962,
+        259,
+        115,
+        36
+      ],
+      "area": 4140,
+      "iscrowd": 0
     }
   ],
   "categories": [
@@ -515,17 +772,17 @@
     {
       "id": 5,
       "name": "鳄鱼3",
-      "supercategory": ""
+      "supercategory": "怪物"
     },
     {
       "id": 6,
       "name": "帽子左",
-      "supercategory": ""
+      "supercategory": "角色"
     },
     {
       "id": 7,
       "name": "帽子右",
-      "supercategory": ""
+      "supercategory": "角色"
     },
     {
       "id": 8,
@@ -545,7 +802,7 @@
     {
       "id": 11,
       "name": "鳄鱼名字",
-      "supercategory": ""
+      "supercategory": "怪物"
     },
     {
       "id": 12,
@@ -580,7 +837,7 @@
     {
       "id": 18,
       "name": "帽子",
-      "supercategory": ""
+      "supercategory": "角色"
     },
     {
       "id": 19,
@@ -621,6 +878,91 @@
       "id": 26,
       "name": "测谎窗口",
       "supercategory": "测谎"
+    },
+    {
+      "id": 27,
+      "name": "猴子沼泽3",
+      "supercategory": ""
+    },
+    {
+      "id": 28,
+      "name": "鳄鱼潭1",
+      "supercategory": ""
+    },
+    {
+      "id": 29,
+      "name": "猴子",
+      "supercategory": "怪物"
+    },
+    {
+      "id": 30,
+      "name": "连接",
+      "supercategory": ""
+    },
+    {
+      "id": 31,
+      "name": "掉线",
+      "supercategory": ""
+    },
+    {
+      "id": 32,
+      "name": "掉线确定",
+      "supercategory": ""
+    },
+    {
+      "id": 33,
+      "name": "掉线2",
+      "supercategory": ""
+    },
+    {
+      "id": 34,
+      "name": "蓝蜗牛",
+      "supercategory": "服务区"
+    },
+    {
+      "id": 35,
+      "name": "频道1",
+      "supercategory": "频道"
+    },
+    {
+      "id": 36,
+      "name": "频道2",
+      "supercategory": "频道"
+    },
+    {
+      "id": 37,
+      "name": "频道3",
+      "supercategory": "频道"
+    },
+    {
+      "id": 38,
+      "name": "频道5",
+      "supercategory": "频道"
+    },
+    {
+      "id": 39,
+      "name": "频道4",
+      "supercategory": "频道"
+    },
+    {
+      "id": 40,
+      "name": "频道6",
+      "supercategory": "频道"
+    },
+    {
+      "id": 41,
+      "name": "频道7",
+      "supercategory": "频道"
+    },
+    {
+      "id": 42,
+      "name": "频道8",
+      "supercategory": ""
+    },
+    {
+      "id": 43,
+      "name": "开始游戏",
+      "supercategory": ""
     }
   ]
 }

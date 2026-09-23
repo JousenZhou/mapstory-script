@@ -2,6 +2,9 @@
 # 命中触发即：暂停当前脚本任务 -> 自动解测谎（DIS 稠密光流+粒子滤波，与测谎检验页签同一套解法，无神经网络）-> 结束后恢复任务；
 # 无脚本任务运行时也能独立监控与求解。
 #
+# 扩展：掉线自动重登——复用同一监控循环与截图/模板匹配资源，检测【掉线2】模板命中后
+# 暂停任务、处理掉线弹窗、切换全桌面截图执行重登序列（连接→服务区→频道→开始游戏），完成后恢复任务。
+#
 # 设计要点：
 #   - 服务是 app 级后台守护线程，由 Globals(og.my_app) 创建并启动，生命周期与进程一致。
 #   - 截图与模板匹配复用框架 device_manager.capture_method 与 executor.feature_set
@@ -28,6 +31,7 @@ import numpy as np  # 导入 NumPy，用于光流轮廓点集的坐标偏移。
 from ok import Logger, TriggerTask, og  # 导入日志器、触发任务类型（暂停时需排除）与全局对象（executor/device_manager/my_app）。
 
 from src.dashboard_store import load_dashboard_config  # 导入看板共享配置读取函数，测谎参数以看板为单一数据源。
+from src.autologin.flow import AutoLoginFlow  # 导入自动重登流程状态机，掉线触发后执行全桌面重登序列。
 
 try:  # 解测谎依赖可选：DIS 稠密光流 + 粒子滤波在线编排，缺失时服务照常运行，仅禁用自动解测谎。
     from src.liedetector.shape_session import (  # 与测谎检验页签同一套光流解法（无神经网络）。
@@ -56,8 +60,17 @@ PAUSE_SETTLE_SECONDS = 0.2  # 暂停任务后等待其线程阻塞到 sleep 的�
 POST_SOLVE_SLEEP = 0.5  # 解测谎结束后等待弹窗关闭、画面稳定的秒数。
 TRIGGER_PROBE_INTERVAL = 2.0  # 未匹配到触发时探测实际最高匹配分数的限频间隔秒数（诊断用，帮助区分弹窗未出现/阈值偏高/模板不符）。
 
+# —— 掉线自动重登常量 ——
+DISCONNECT_TEMPLATE = "掉线2"  # 掉线确认标志模板：单独存在即触发重登流程。
+DISCONNECT_DIALOG_TEMPLATE = "掉线"  # 掉线弹窗主体模板：与掉线2同时存在时需先点掉线确定。
+DISCONNECT_OK_TEMPLATE = "掉线确定"  # 掉线弹窗确定按钮模板。
+DISCONNECT_CONFIRM_FRAMES = 3  # 连续命中【掉线2】多少帧才认定为真掉线（防抖）。
+DISCONNECT_OK_WAIT = 2.0  # 点击掉线确定后等待弹窗关闭的秒数。
+DISCONNECT_GAME_EXIT_TIMEOUT = 15.0  # 等待游戏窗口关闭的超时秒数。
+
 STATE_IDLE = "idle"  # 服务空闲监控态。
 STATE_SOLVING = "solving"  # 服务正在解测谎态。
+STATE_RELOGGING = "relogging"  # 服务正在执行掉线重登态。
 
 
 class LieDetectorService:  # 独立测谎监控服务：后台守护线程值守测谎触发，命中即暂停任务并自动解测谎。
@@ -72,6 +85,7 @@ class LieDetectorService:  # 独立测谎监控服务：后台守护线程值守
         self._last_trigger_probe = 0.0  # 上次探测触发匹配分数的时间戳，用于诊断限频。
         self._trigger_hits = 0  # 连续命中【测谎触发】的帧数，达到 LIE_TRIGGER_CONFIRM_FRAMES 才真正进入解题（防抖）。
         self._cooldown_until = 0.0  # 冷却截止时间戳：一局结束后这段时间内不响应新触发，避免弹窗残留画面重复触发。
+        self._disconnect_hits = 0  # 连续命中【掉线2】的帧数，达到 DISCONNECT_CONFIRM_FRAMES 才触发重登（防抖）。
 
     def start(self):  # 启动后台守护线程；重复调用只启动一次。
         if self._thread is not None:  # 已启动过。
@@ -110,10 +124,27 @@ class LieDetectorService:  # 独立测谎监控服务：后台守护线程值守
             self._config_time = now  # 记录本次刷新时间。
         return self._config  # 返回配置缓存。
 
-    def _run(self):  # 服务主循环：空闲监控测谎触发，命中则暂停任务并解测谎，直到进程退出。
+    def _run(self):  # 服务主循环：空闲监控掉线触发与测谎触发，命中则暂停任务并处理，直到进程退出。
         while not self._exit_event.is_set():  # 主循环，退出事件置位时结束。
             try:  # 单轮异常不能拖垮服务，捕获后记录并继续下一轮。
                 auto_solve, trigger_name, region_name, threshold, trigger_delay, alarm_sound = self._read_config()  # 读取测谎配置。
+                auto_login_cfg = self._read_auto_login_config()  # 读取自动登录配置。
+    
+                # —— 掉线检测（优先级高于测谎：游戏都掉了，测谎无意义）——
+                if auto_login_cfg['enabled'] and self._feature_ready(DISCONNECT_TEMPLATE):  # 自动登录开启且掉线模板已标注。
+                    frame = self._capture()  # 采集一帧游戏窗口画面。
+                    if frame is not None:  # 取到画面才做匹配。
+                        disconnect_box = self._find_trigger(frame, DISCONNECT_TEMPLATE, auto_login_cfg['threshold'])  # 全屏匹配【掉线2】。
+                        if disconnect_box is not None:  # 本帧命中掉线标志。
+                            self._disconnect_hits += 1  # 累计连续命中帧数。
+                            if self._disconnect_hits >= DISCONNECT_CONFIRM_FRAMES:  # 达到确认帧数，触发重登。
+                                self._disconnect_hits = 0  # 清零计数。
+                                self._handle_disconnect(frame, auto_login_cfg)  # 执行掉线重登流程（阻塞直到完成）。
+                                continue  # 重登完成后跳过本轮测谎检测。
+                        else:  # 本帧未命中。
+                            self._disconnect_hits = 0  # 命中中断，确认计数清零重新累计。
+    
+                # —— 测谎检测（原有逻辑不变）——
                 if not auto_solve:  # 自动解测谎关闭。
                     self._set_status("auto solve off")  # 记录状态。
                     self._idle_sleep(MONITOR_INTERVAL)  # 空闲等待。
@@ -177,6 +208,97 @@ class LieDetectorService:  # 独立测谎监控服务：后台守护线程值守
             self._reset_solve_state()  # 初始化跨帧状态并开启冷却，确保下一局从干净状态重新等触发。
             self._set_status("watching")  # 记录状态。
         self._idle_sleep(POST_SOLVE_SLEEP)  # 等弹窗关闭后画面稳定再继续监控（冷却期随后接管）。
+
+    # ------------------------------------------------------------------ 掉线自动重登
+
+    def _read_auto_login_config(self):  # 读取看板自动登录配置，返回 dict。
+        config = self._get_config()  # 取（必要时刷新）配置缓存。
+        enabled = bool(config.get("Auto Login Enabled"))  # 自动登录开关。
+        try:  # 阈值可能被写成非法值，兜底默认 0.75。
+            threshold = float(config.get("Auto Login Threshold") or 0.75)
+        except (TypeError, ValueError):
+            threshold = 0.75
+        return {  # 返回解析后的配置字典。
+            'enabled': enabled,
+            'threshold': threshold,
+            'server': str(config.get("Auto Login Server Feature") or '').strip(),
+            'channel': str(config.get("Auto Login Channel Feature") or '').strip(),
+            'step_timeout': float(config.get("Auto Login Step Timeout") or 30.0),
+            'raw': config,  # 保留原始配置供 AutoLoginFlow 直接读取。
+        }
+
+    def _handle_disconnect(self, frame, auto_login_cfg):  # 处理掉线触发：暂停任务 → 点击掉线确定 → 等待游戏退出 → 全桌面重登 → 恢复任务。
+        self.state = STATE_RELOGGING  # 切换到重登态，测谎检测自动挂起。
+        self._set_status("relogging")  # 记录状态。
+        logger.info("Disconnect detected, starting auto relogin. 检测到掉线，开始自动重登流程。")  # 记录触发。
+        paused_task = self._pause_current_task()  # 暂停当前脚本任务并释放持有键。
+        try:  # 无论重登成功与否，最终都要恢复被本服务暂停的任务。
+            # Phase1：游戏窗口内处理掉线弹窗——如果【掉线】+【掉线确定】还在，点击确定关闭弹窗。
+            self._click_disconnect_ok(frame, auto_login_cfg['threshold'])
+            # Phase2：等待游戏窗口关闭（掉线2消失或截图失败），超时后也继续执行重登。
+            self._wait_game_exit(auto_login_cfg['threshold'])
+            # Phase3：重登序列（连接→服务区→频道→开始游戏）。
+            # 采集/点击分两种后端：连接用全桌面采集+pynput绝对点击（启动器在桌面、游戏窗口可能已关闭）；
+            # 服务区/频道/开始游戏用游戏窗口当前选择框采集(self._capture)+窗口内相对坐标点击(self._click_in_window)，
+            # 模板即窗口客户区尺度，匹配坐标与点击坐标同处客户区空间，避免桌面绝对点击的向上偏移。
+            flow = AutoLoginFlow(self._coco_json_path(), auto_login_cfg['raw'], logger,
+                                 game_frame_fn=self._capture, window_click_fn=self._click_in_window)  # 构建重登流程：注入窗口后端采集/点击回调。
+            success = flow.run(self._exit_event)  # 执行重登序列（阻塞直到完成或失败）。
+            if success:  # 重登成功。
+                logger.info("Auto relogin completed successfully. 自动重登成功完成。")  # 记录成功。
+            else:  # 重登失败。
+                logger.warning("Auto relogin failed or aborted. 自动重登失败或被中止。")  # 记录失败。
+        except Exception as e:  # 重登流程异常不能拖垮服务。
+            logger.warning(f"Auto relogin error: {e}. 自动重登流程异常：{e}。")  # 记录异常。
+        finally:  # 重登结束（正常/异常/退出）都要恢复任务与状态。
+            if paused_task is not None:  # 本服务暂停了任务。
+                self._resume_task(paused_task)  # 恢复它。
+            self.state = STATE_IDLE  # 切回空闲监控态。
+            self._set_status("watching")  # 记录状态。
+        self._idle_sleep(POST_SOLVE_SLEEP)  # 重登完成后短暂等待画面稳定。
+
+    def _click_disconnect_ok(self, frame, threshold):  # Phase1：检测游戏窗口内是否还有【掉线】+【掉线确定】，有则点击确定关闭弹窗。
+        if not self._feature_ready(DISCONNECT_OK_TEMPLATE):  # 掉线确定模板未标注，跳过。
+            return  # 无法点击，直接进入下一阶段。
+        dialog_box = self._find_trigger(frame, DISCONNECT_DIALOG_TEMPLATE, threshold)  # 匹配【掉线】弹窗主体。
+        ok_box = self._find_trigger(frame, DISCONNECT_OK_TEMPLATE, threshold)  # 匹配【掉线确定】按钮。
+        if dialog_box is not None and ok_box is not None:  # 两者同时存在（场景1）：点击确定关闭弹窗。
+            cx = ok_box.x + ok_box.width // 2  # 计算确定按钮中心坐标。
+            cy = ok_box.y + ok_box.height // 2
+            logger.info(f"Clicking disconnect OK at ({cx},{cy}). 点击掉线确定按钮 ({cx},{cy})。")  # 记录点击。
+            self._click_in_window(cx, cy)  # 通过框架 interaction 点击游戏窗口内坐标。
+            self._idle_sleep(DISCONNECT_OK_WAIT)  # 等待弹窗关闭动画。
+        else:  # 场景2：只有掉线2，无需点击确定。
+            logger.info("Disconnect dialog not present (scenario 2), skip OK click. 掉线弹窗不存在（场景2），跳过确定点击。")
+
+    def _click_in_window(self, x, y):  # 通过框架输入设备接口点击游戏窗口内坐标（窗口相对坐标）。
+        self._ensure_in_front()  # 先把游戏/启动器窗口置前：interaction 的 clickable() 前台守卫在窗口非前台时会静默跳过点击（表现为“点击没反应”）。
+        time.sleep(0.05)  # 等待窗口真正切到前台，再发点击。
+        interaction = self._interaction()  # 取输入设备接口。
+        if interaction is None:  # 接口不可用。
+            logger.warning("Interaction unavailable, cannot click in window. 输入接口不可用，无法点击窗口内坐标。")
+            return
+        try:  # 点击异常不能中断重登流程。
+            interaction.move(x, y)  # 移动光标到目标坐标。
+            interaction.click(x, y)  # 执行点击。
+        except Exception as e:  # 点击失败。
+            logger.warning(f"Click in window failed at ({x},{y}): {e}. 窗口内点击失败。")
+
+    def _wait_game_exit(self, threshold):  # Phase2：等待游戏窗口关闭（掉线2消失或截图失败），超时后也继续执行重登。
+        logger.info(f"Waiting for game window to close (timeout {DISCONNECT_GAME_EXIT_TIMEOUT}s). 等待游戏窗口关闭（超时 {DISCONNECT_GAME_EXIT_TIMEOUT}s）。")
+        deadline = time.time() + DISCONNECT_GAME_EXIT_TIMEOUT  # 超时截止时间。
+        while not self._exit_event.is_set() and time.time() < deadline:  # 循环直到超时或进程退出。
+            frame = self._capture()  # 尝试采集游戏窗口画面。
+            if frame is None:  # 截图失败：游戏窗口已关闭。
+                logger.info("Game window closed (capture failed). 游戏窗口已关闭（截图失败）。")
+                return  # 立即进入重登阶段。
+            # 检查掉线2是否仍在游戏窗口内：消失说明窗口已关闭或场景已切换。
+            still_there = self._find_trigger(frame, DISCONNECT_TEMPLATE, threshold)
+            if still_there is None:  # 掉线2消失：游戏可能已退出。
+                logger.info("Disconnect template gone from game window. 掉线模板已从游戏窗口消失。")
+                return  # 进入重登阶段。
+            self._idle_sleep(0.5)  # 每 0.5 秒检查一次。
+        logger.warning("Game exit wait timeout, proceeding with relogin anyway. 等待游戏退出超时，仍然继续执行重登。")
 
     def _reset_solve_state(self):  # 一局测谎结束后初始化跨帧状态：清空触发确认计数与诊断限频时间戳，并开启冷却期。
         self._trigger_hits = 0  # 触发确认计数清零，下一局重新累计连续命中帧。
@@ -400,6 +522,13 @@ class LieDetectorService:  # 独立测谎监控服务：后台守护线程值守
     def _feature_set(self):  # 取执行器的特征集（模板标注），不可用时返回 None。
         executor = getattr(og, "executor", None)  # 取执行器。
         return getattr(executor, "feature_set", None) if executor is not None else None  # 返回特征集或 None。
+
+    def _coco_json_path(self):  # 取模板标注文件路径：优先用框架 feature_set 已解析的绝对路径，回退到项目默认路径。
+        feature_set = self._feature_set()  # 取特征集。
+        path = getattr(feature_set, "coco_json", None) if feature_set is not None else None  # 框架已解析为绝对路径。
+        if path:  # 拿到了直接用。
+            return path
+        return os.path.join(os.getcwd(), 'ok_templates', 'coco_annotations.json')  # 回退：项目根目录默认路径（与 config.template_matching 一致）。
 
     def _find_trigger(self, frame, feature_name, threshold):  # 全屏匹配【测谎触发】标注，返回置信度最高的框或 None。
         feature_set = self._feature_set()  # 取特征集。

@@ -17,8 +17,9 @@ from qfluentwidgets import (BodyLabel, CheckBox, DoubleSpinBox, EditableComboBox
 from ok import og  # 导入全局对象，用于读取任务线程推送的画面与截图设备。
 from ok.gui.widget.CustomTab import CustomTab  # 导入自定义页签基类。
 
-from src.dashboard_store import (DASHBOARD_DEFAULTS, SUPER_CHARACTER, SUPER_LIE_REGION, SUPER_LIE_TRIGGER,  # 看板共享配置存取层。
-                                 SUPER_MONSTER, load_annotations_by_supercategory, load_dashboard_config,
+from src.dashboard_store import (DASHBOARD_DEFAULTS, SUPER_CHANNEL, SUPER_CHARACTER, SUPER_LIE_REGION,  # 看板共享配置存取层。
+                                 SUPER_LIE_TRIGGER, SUPER_MONSTER, SUPER_SERVER,
+                                 load_annotations_by_supercategory, load_dashboard_config,
                                  save_dashboard_config, validate_key_name)
 from src.ui.DashboardTaskPanel import TaskControlPanel  # 任务控制栏：挂机/巡逻脚本手风琴卡 + 内嵌运行日志。
 
@@ -113,13 +114,20 @@ class MultiSelectComboBox(PushButton):  # 下拉多选控件：点击弹出带�
                 items.append(name)  # 追加，保证能取消勾选。
         return items  # 返回菜单项列表。
 
-    def _show_menu(self):  # 弹出带复选框的下拉菜单。
+    def _show_menu(self):  # 弹出带复选框的下拉菜单（Element-UI 紧凑风格）。
         menu = RoundMenu(parent=self)  # 每次弹出新建菜单，避免复用陈旧复选框。
+        # Element-UI 紧凑样式：减小菜单内边距与项目间距，参考 el-select-dropdown__item 高度 28px、padding 0 12px。
+        menu.setStyleSheet(
+            "QMenu { padding: 4px 0; }"
+            "QMenu::item { padding: 2px 12px; min-height: 28px; }"
+        )
         items = self._menu_items()  # 取菜单项。
         if not items:  # 无任何可选标注时给出提示。
             menu.addWidget(BodyLabel('无「怪物」类别标注，请先在模板页标注'), selectable=False)  # 不可选，仅展示。
         for name in items:  # 逐项加复选框。
             box = CheckBox(name)  # 复选框，文本即分类名。
+            box.setFixedHeight(28)  # 紧凑行高，对齐 Element-UI 下拉项高度。
+            box.setContentsMargins(8, 2, 8, 2)  # 减小内边距，消除项目间过大空白。
             box.setChecked(name in self._selected)  # 已选项默认勾选。
             box.toggled.connect(lambda checked, n=name: self._on_toggle(n, checked))  # 勾选变化即更新已选集合。
             menu.addWidget(box, selectable=False)  # selectable=False 让点击落在复选框上、菜单不自动关闭，可连续多选。
@@ -192,6 +200,18 @@ class DashboardTab(CustomTab):  # 定义看板页签：视图区 + 测谎栏 + �
         lie_layout.addWidget(self.region_preview, 1)  # 预览占左半。
         lie_layout.addLayout(lie_form, 1)  # 表单占右半。
         self.add_card("Lie Detector 测谎", lie_widget)
+
+        # —— 第 3.5 栏：自动登录栏 ——
+        login_widget = QWidget()  # 自动登录栏容器。
+        login_form = QFormLayout(login_widget)  # 表单布局。
+        login_form.setContentsMargins(0, 0, 0, 0)
+        self.auto_login_switch = SwitchButton()  # 自动登录开关：开启后检测到掉线模板自动执行重登流程。
+        self.server_combo = EditableComboBox()  # 服务区标注选择（类别为「服务区」的标注单选，如蓝蜗牛）。
+        self.channel_combo = EditableComboBox()  # 频道标注选择（类别为「频道」的标注单选，如频道1）。
+        login_form.addRow("Auto Login 自动登录", self.auto_login_switch)
+        login_form.addRow("Server 服务区", self.server_combo)
+        login_form.addRow("Channel 频道", self.channel_combo)
+        self.add_card("Auto Login 自动登录", login_widget)
 
         # —— 第 4 栏：角色栏 ——
         char_widget = QWidget()  # 角色栏容器。
@@ -319,6 +339,9 @@ class DashboardTab(CustomTab):  # 定义看板页签：视图区 + 测谎栏 + �
         self.monster_multi.set_value(parse_feature_list(data.get('Monster Features')))
         self.monster_threshold_spin.setValue(float(data.get('Monster Threshold') or 0.65))
         self.monster_mirror_spin.setValue(float(data.get('Monster Mirror Threshold') or 0.65))
+        self.auto_login_switch.setChecked(bool(data.get('Auto Login Enabled')))
+        self._set_combo_value(self.server_combo, str(data.get('Auto Login Server Feature') or ''))
+        self._set_combo_value(self.channel_combo, str(data.get('Auto Login Channel Feature') or ''))
 
     def _set_combo_value(self, combo, value):  # 把配置值设到下拉框，选项不存在时补充进去保证不丢用户配置。
         value = str(value or '')  # 统一转字符串。
@@ -336,7 +359,9 @@ class DashboardTab(CustomTab):  # 定义看板页签：视图区 + 测谎栏 + �
                                   (self.lie_trigger_combo, SUPER_LIE_TRIGGER),  # 触发框按「测谎触发」类别过滤。
                                   (self.char_feature_combo, SUPER_CHARACTER),  # 角色特征按「角色」类别过滤。
                                   (self.char_facing_left_combo, SUPER_CHARACTER),  # 左朝向按「角色」类别过滤。
-                                  (self.char_facing_right_combo, SUPER_CHARACTER)):  # 右朝向按「角色」类别过滤。
+                                  (self.char_facing_right_combo, SUPER_CHARACTER),  # 右朝向按「角色」类别过滤。
+                                  (self.server_combo, SUPER_SERVER),  # 服务区按「服务区」类别过滤。
+                                  (self.channel_combo, SUPER_CHANNEL)):  # 频道按「频道」类别过滤。
             current = self._combo_value(combo)  # 记录当前选择，刷新后尽量保持。
             combo.blockSignals(True)  # 填充期间不触发信号。
             combo.clear()  # 清空旧选项。
@@ -375,6 +400,11 @@ class DashboardTab(CustomTab):  # 定义看板页签：视图区 + 测谎栏 + �
             'Monster Features': self.monster_multi.value_text(),
             'Monster Threshold': round(float(self.monster_threshold_spin.value()), 2),
             'Monster Mirror Threshold': round(float(self.monster_mirror_spin.value()), 2),
+            'Auto Login Enabled': bool(self.auto_login_switch.isChecked()),
+            'Auto Login Server Feature': self._combo_value(self.server_combo),
+            'Auto Login Channel Feature': self._combo_value(self.channel_combo),
+            'Auto Login Threshold': float(DASHBOARD_DEFAULTS.get('Auto Login Threshold', 0.75)),
+            'Auto Login Step Timeout': float(DASHBOARD_DEFAULTS.get('Auto Login Step Timeout', 30.0)),
         }
         save_dashboard_config(data)  # 落盘，任务下次启动时采集生效。
         lie_service = getattr(og.my_app, 'lie_service', None) if og.my_app is not None else None  # 取独立测谎监控服务（由 Globals 持有）。

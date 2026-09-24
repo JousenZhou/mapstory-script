@@ -32,7 +32,7 @@ import numpy as np  # 导入 NumPy，用于光流轮廓点集的坐标偏移。
 from ok import Logger, TriggerTask, og  # 导入日志器、触发任务类型（暂停时需排除）与全局对象（executor/device_manager/my_app）。
 
 from src.dashboard_store import load_dashboard_config  # 导入看板共享配置读取函数，测谎参数以看板为单一数据源。
-from src.autologin.flow import AutoLoginFlow  # 导入自动重登流程状态机，掉线触发后执行全桌面重登序列。
+from src.autologin.flow import AutoLoginFlow, DOUBLE_CLICK_GAP  # 导入自动重登流程状态机与双击间隔常量，掉线触发后执行全桌面重登序列。
 
 try:  # 解测谎依赖可选：DIS 稠密光流 + 粒子滤波在线编排，缺失时服务照常运行，仅禁用自动解测谎。
     from src.liedetector.shape_session import (  # 与测谎检验页签同一套光流解法（无神经网络）。
@@ -239,7 +239,7 @@ class LieDetectorService:  # 独立测谎监控服务：后台守护线程值守
     def _handle_disconnect(self, frame, auto_login_cfg):  # 处理掉线触发：暂停任务 → 点击掉线确定 → 等待游戏退出 → 全桌面重登 → 恢复任务。
         self.state = STATE_RELOGGING  # 切换到重登态，测谎检测自动挂起。
         self._set_status("relogging")  # 记录状态。
-        logger.info("Disconnect detected, starting auto relogin. 检测到掉线，开始自动重登流程。")  # 记录触发。
+        logger.info("[login] Disconnect detected, starting auto relogin. 检测到掉线，开始自动重登流程。")  # 记录触发。
         paused_task = self._pause_current_task()  # 暂停当前脚本任务并释放持有键。
         try:  # 无论重登成功与否，最终都要恢复被本服务暂停的任务。
             # Phase1：游戏窗口内处理掉线弹窗——如果【掉线】+【掉线确定】还在，点击确定关闭弹窗。
@@ -254,11 +254,11 @@ class LieDetectorService:  # 独立测谎监控服务：后台守护线程值守
                                  game_frame_fn=self._capture, window_click_fn=self._click_in_window)  # 构建重登流程：注入窗口后端采集/点击回调。
             success = flow.run(self._exit_event)  # 执行重登序列（阻塞直到完成或失败）。
             if success:  # 重登成功。
-                logger.info("Auto relogin completed successfully. 自动重登成功完成。")  # 记录成功。
+                logger.info("[login] Auto relogin completed successfully. 自动重登成功完成。")  # 记录成功。
             else:  # 重登失败。
-                logger.warning("Auto relogin failed or aborted. 自动重登失败或被中止。")  # 记录失败。
+                logger.warning("[login] Auto relogin failed or aborted. 自动重登失败或被中止。")  # 记录失败。
         except Exception as e:  # 重登流程异常不能拖垮服务。
-            logger.warning(f"Auto relogin error: {e}. 自动重登流程异常：{e}。")  # 记录异常。
+            logger.warning(f"[login] Auto relogin error: {e}. 自动重登流程异常：{e}。")  # 记录异常。
         finally:  # 重登结束（正常/异常/退出）都要恢复任务与状态。
             if paused_task is not None:  # 本服务暂停了任务。
                 self._resume_task(paused_task)  # 恢复它。
@@ -274,40 +274,44 @@ class LieDetectorService:  # 独立测谎监控服务：后台守护线程值守
         if dialog_box is not None and ok_box is not None:  # 两者同时存在（场景1）：点击确定关闭弹窗。
             cx = ok_box.x + ok_box.width // 2  # 计算确定按钮中心坐标。
             cy = ok_box.y + ok_box.height // 2
-            logger.info(f"Clicking disconnect OK at ({cx},{cy}). 点击掉线确定按钮 ({cx},{cy})。")  # 记录点击。
+            logger.info(f"[login] Clicking disconnect OK at ({cx},{cy}). 点击掉线确定按钮 ({cx},{cy})。")  # 记录点击。
             self._click_in_window(cx, cy)  # 通过框架 interaction 点击游戏窗口内坐标。
             self._idle_sleep(DISCONNECT_OK_WAIT)  # 等待弹窗关闭动画。
         else:  # 场景2：只有掉线2，无需点击确定。
-            logger.info("Disconnect dialog not present (scenario 2), skip OK click. 掉线弹窗不存在（场景2），跳过确定点击。")
+            logger.info("[login] Disconnect dialog not present (scenario 2), skip OK click. 掉线弹窗不存在（场景2），跳过确定点击。")
 
-    def _click_in_window(self, x, y):  # 通过框架输入设备接口点击游戏窗口内坐标（窗口相对坐标）。
+    def _click_in_window(self, x, y, clicks=1):  # 通过框架输入设备接口点击游戏窗口内坐标（窗口相对坐标）；clicks>1 时在同一位置快速连点（双击）。
         self._ensure_in_front()  # 先把游戏/启动器窗口置前：interaction 的 clickable() 前台守卫在窗口非前台时会静默跳过点击（表现为“点击没反应”）。
-        time.sleep(0.05)  # 等待窗口真正切到前台，再发点击。
+        time.sleep(0.1)  # 等窗口真正切到前台再发点击；置前只在连点前做一次，避免两次点击之间被 bring_to_front 拉大间隔导致双击失效或首击被前台守卫吞掉。
         interaction = self._interaction()  # 取输入设备接口。
         if interaction is None:  # 接口不可用。
-            logger.warning("Interaction unavailable, cannot click in window. 输入接口不可用，无法点击窗口内坐标。")
+            logger.warning("[login] Interaction unavailable, cannot click in window. 输入接口不可用，无法点击窗口内坐标。")
             return
+        clicks = max(1, clicks)  # 连点次数兜底为至少 1 次。
         try:  # 点击异常不能中断重登流程。
-            interaction.move(x, y)  # 移动光标到目标坐标。
-            interaction.click(x, y)  # 执行点击。
+            interaction.move(x, y)  # 移动光标到目标坐标（连点前只移动一次）。
+            for i in range(clicks):  # 在同一位置快速连点 clicks 次（频道/开始游戏需双击才生效）。
+                interaction.click(x, y)  # 执行点击（内部会再定位到同一绝对坐标并 press/release）。
+                if i + 1 < clicks:  # 两次点击之间只留极小间隔，确保落在系统双击判定窗口内。
+                    time.sleep(DOUBLE_CLICK_GAP)
         except Exception as e:  # 点击失败。
-            logger.warning(f"Click in window failed at ({x},{y}): {e}. 窗口内点击失败。")
+            logger.warning(f"[login] Click in window failed at ({x},{y}): {e}. 窗口内点击失败。")
 
     def _wait_game_exit(self, threshold):  # Phase2：等待游戏窗口关闭（掉线2消失或截图失败），超时后也继续执行重登。
-        logger.info(f"Waiting for game window to close (timeout {DISCONNECT_GAME_EXIT_TIMEOUT}s). 等待游戏窗口关闭（超时 {DISCONNECT_GAME_EXIT_TIMEOUT}s）。")
+        logger.info(f"[login] Waiting for game window to close (timeout {DISCONNECT_GAME_EXIT_TIMEOUT}s). 等待游戏窗口关闭（超时 {DISCONNECT_GAME_EXIT_TIMEOUT}s）。")
         deadline = time.time() + DISCONNECT_GAME_EXIT_TIMEOUT  # 超时截止时间。
         while not self._exit_event.is_set() and time.time() < deadline:  # 循环直到超时或进程退出。
             frame = self._capture()  # 尝试采集游戏窗口画面。
             if frame is None:  # 截图失败：游戏窗口已关闭。
-                logger.info("Game window closed (capture failed). 游戏窗口已关闭（截图失败）。")
+                logger.info("[login] Game window closed (capture failed). 游戏窗口已关闭（截图失败）。")
                 return  # 立即进入重登阶段。
             # 检查掉线2是否仍在游戏窗口内：消失说明窗口已关闭或场景已切换。
             still_there = self._find_trigger(frame, DISCONNECT_TEMPLATE, threshold)
             if still_there is None:  # 掉线2消失：游戏可能已退出。
-                logger.info("Disconnect template gone from game window. 掉线模板已从游戏窗口消失。")
+                logger.info("[login] Disconnect template gone from game window. 掉线模板已从游戏窗口消失。")
                 return  # 进入重登阶段。
             self._idle_sleep(0.5)  # 每 0.5 秒检查一次。
-        logger.warning("Game exit wait timeout, proceeding with relogin anyway. 等待游戏退出超时，仍然继续执行重登。")
+        logger.warning("[login] Game exit wait timeout, proceeding with relogin anyway. 等待游戏退出超时，仍然继续执行重登。")
 
     def _reset_solve_state(self):  # 一局测谎结束后初始化跨帧状态：清空触发确认计数与诊断限频时间戳，并开启冷却期。
         self._trigger_hits = 0  # 触发确认计数清零，下一局重新累计连续命中帧。

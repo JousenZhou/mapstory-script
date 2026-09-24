@@ -129,6 +129,7 @@ class MaplePatrolTask(MapleIdleTask):  # 定义冒险岛小地图巡逻打怪任
             return  # 直接结束任务。
         if not patrol_enabled:  # 监视模式不巡逻不打怪，画面与小地图相关状态不再参与判定。
             self.log_info("Patrol disabled, watch-only mode: vision only, lie detector watch kept. 巡逻打怪已关闭，仅监视画面并值守测谎。")  # 记录当前运行模式供排查。
+            self.info_set("Status", "Watch only")  # 进入监视模式时只设置一次状态；面板每 600ms 轮询读取，无需每帧重写（每帧调用会刷屏 info_set 日志）。
         if patrol_enabled and not monster_names:  # 巡逻模式下未配置任何怪物分类时无法运行。
             self.log_warning("No monster feature configured. 未配置怪物分类名，任务退出。")  # 提示配置缺失。
             return  # 直接结束任务。
@@ -195,8 +196,7 @@ class MaplePatrolTask(MapleIdleTask):  # 定义冒险岛小地图巡逻打怪任
                 if not patrol_enabled:  # 监视模式：不巡逻不打怪，直接推送原始帧，并用 CPU 检测【测谎触发】【掉线2】发布给后台测谎服务。
                     og.my_app.update_vision(frame)  # 推送原始画面供 UI 展示。
                     self.publish_lie_detection(None, frame)  # 监视模式 gpu=None，走 CPU 发布分支检测测谎/掉线并发布（方法继承自 MapleIdleTask）。
-                    self.info_set("Status", "Watch only")  # 在 GUI 显示监视状态。
-                    continue  # 跳过后续全部巡逻与攻击逻辑，循环顶部按 30FPS 节拍等待。
+                    continue  # 跳过后续全部巡逻与攻击逻辑，循环顶部按 30FPS 节拍等待（Status 已在进入监视模式时设置一次，不再每帧重写刷屏）。
                 facing_due = facing_check and time.time() - last_facing_check >= FACING_CHECK_INTERVAL  # 本轮是否需要用图像校准朝向，提前算好以便把朝向匹配一并提交并发。
                 batch = MatchBatch()  # 本帧并发匹配批次：朝向与小地图匹配始终走 CPU，角色/怪物匹配仅在 GPU 不可用时一并提交。
                 if facing_due:  # 朝向校准到期才提交，未到期不白烧两个核心。

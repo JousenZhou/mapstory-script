@@ -53,14 +53,14 @@ class AutoLoginFlow:
         self._window_click_fn = window_click_fn  # 窗口内相对坐标点击回调（窗口后端）。
 
     def _log(self, message):
-        """输出日志（有日志器时）。"""
+        """输出日志（有日志器时），统一加 [login] 前缀方便按登录/重登流程筛选日志。"""
         if self._logger is not None:
-            self._logger.info(message)
+            self._logger.info(f"[login] {message}")
 
     def _warn(self, message):
-        """输出警告日志。"""
+        """输出警告日志，统一加 [login] 前缀方便按登录/重登流程筛选日志。"""
         if self._logger is not None:
-            self._logger.warning(message)
+            self._logger.warning(f"[login] {message}")
 
     def _log_diagnostics(self, steps):  # 记录桌面帧/游戏窗口帧尺寸与各步模板原生尺寸，确认“原生尺度匹配、后端坐标空间一致”。
         sizes = []  # 各步模板原生尺寸文本。
@@ -150,24 +150,19 @@ class AutoLoginFlow:
                 self._warn(f"Step {index}/{total} [{description}]: failed after {1 + MAX_RETRY} attempts, aborting flow. "
                            f"步骤 {index}/{total} [{description}]：重试耗尽，流程中止。")
                 return False
-            # 命中：点击并监控推进；卡住超过 STUCK_RETRY_SECONDS 自动重试点击。
+            # 命中：锁定首次匹配到的中心坐标，之后所有重试都点同一位置。
+            # 选中后按钮外观会变化（如频道被高亮），重新匹配会飘到相邻的未选中项（如 2 频道），故重试必须复用原始坐标。
+            x, y, w, h, confidence = box
+            cx = x + w // 2
+            cy = y + h // 2
             for click_no in range(1 + MAX_RECLICK):
-                x, y, w, h, confidence = box
-                cx = x + w // 2
-                cy = y + h // 2
                 self._log(f"Step {index}/{total} [{description}]: matched at ({cx},{cy}) conf={confidence:.3f}, clicking (#{click_no + 1}, {clicks}x). "
                           f"步骤 {index}/{total} [{description}]：匹配到 ({cx},{cy}) 置信度={confidence:.3f}，点击（第{click_no + 1}轮，连点{clicks}次）。")
-                for _click_i in range(max(1, clicks)):  # 连点：同一位置快速点击 clicks 次（频道/开始游戏需双击才生效）。
-                    self._click_for(backend, cx, cy)
-                    time.sleep(DOUBLE_CLICK_GAP)
+                self._click_for(backend, cx, cy, clicks)  # 连点 clicks 次（频道/开始游戏需双击）由后端一次性紧凑完成，保证双击时序。
                 if self._advanced(backend, template_name, next_backend, next_template, threshold, exit_event, STUCK_RETRY_SECONDS):
                     return True
-                self._warn(f"Step {index}/{total} [{description}]: stuck >{STUCK_RETRY_SECONDS}s after click, retry click. "
-                           f"步骤 {index}/{total} [{description}]：点击后 {STUCK_RETRY_SECONDS}s 画面未推进，重试点击。")
-                frame = self._capture_for(backend)
-                box, confidence = self._match(frame, template_name) if frame is not None else (None, 0.0)
-                if box is None or confidence < threshold:
-                    break  # 当前按钮已消失/不可见，无法再点，交给重锚或下一轮。
+                self._warn(f"Step {index}/{total} [{description}]: stuck >{STUCK_RETRY_SECONDS}s after click, retry click at same spot. "
+                           f"步骤 {index}/{total} [{description}]：点击后 {STUCK_RETRY_SECONDS}s 画面未推进，在原坐标重试点击。")
             if attempt < MAX_RETRY:
                 self._warn(f"Step {index}/{total} [{description}]: not advanced after clicks, retrying. "
                            f"步骤 {index}/{total} [{description}]：多次点击仍未推进，重试。")
@@ -257,16 +252,21 @@ class AutoLoginFlow:
                 return None
         return capture_desktop(all_screens=True)  # 截全部显示器：启动器可能在任一屏幕；坐标为虚拟屏图像坐标，点击时加原点偏移。
 
-    def _click_for(self, backend, cx, cy):
-        """按后端点击，与 _capture_for 严格配对：窗口后端用窗口内相对坐标点击，桌面后端用 pynput 绝对坐标点击。"""
+    def _click_for(self, backend, cx, cy, clicks=1):
+        """按后端点击，与 _capture_for 严格配对：窗口后端把连点次数交给回调一次性紧凑完成（置前只做一次，保证双击时序），
+        桌面后端在同一绝对坐标快速连点。clicks=2 即双击（频道/开始游戏需双击才生效）。"""
+        clicks = max(1, clicks)
         if self._window_backend_active(backend):
             try:
-                self._window_click_fn(cx, cy)
-                self._log(f"Window click sent at ({cx},{cy}). 已在游戏窗口内 ({cx},{cy}) 发出点击。")
+                self._window_click_fn(cx, cy, clicks)  # 连点次数下传给窗口点击回调，由它一次置前后紧凑连点。
+                self._log(f"Window click sent at ({cx},{cy}) x{clicks}. 已在游戏窗口内 ({cx},{cy}) 发出点击（连点 {clicks} 次）。")
             except Exception as e:
                 self._warn(f"Window click failed at ({cx},{cy}): {e}. 窗口内点击失败。")
             return
-        self._click_screen(cx, cy)
+        for i in range(clicks):  # 桌面后端：同一绝对坐标快速连点。
+            self._click_screen(cx, cy)
+            if i + 1 < clicks:
+                time.sleep(DOUBLE_CLICK_GAP)
 
     def _match(self, frame, template_name):
         """在给定帧（桌面或窗口客户区）上原生尺度匹配模板，返回 ((x,y,w,h,conf) 或 None, 最高分)。"""

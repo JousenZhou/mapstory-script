@@ -20,6 +20,10 @@
 #   - 触发延迟：确认命中后不立即解题，先等看板配置的「触发延迟」秒数（默认 5 秒），给弹窗完全展开、
 #     图形动画起势留出时间，避免光流会话在弹窗还在淡入/图形尚未移动时建模板。延迟期持续推送框选画面并倒计时，
 #     若期间【测谎触发】连续丢失超过容忍帧数（弹窗已关）则放弃本局；延迟结束后重新取帧，不用陈旧画面开题。
+#   - 显卡加速：【测谎触发】【掉线】【掉线2】【掉线确定】的全屏模板匹配可走 CuPy FFT（src/gpu_feature_match.py），
+#     结果与框架 CPU 匹配（TM_CCOEFF_NORMED + 灰度 + limit=1）等价，但一帧只上传一次显存、只做一次帧变换即可
+#     覆盖全部模板，空闲监控 15FPS 的匹配耗时从数十毫秒降到几毫秒。由看板「GPU Match 显卡加速」开关控制，
+#     无 CuPy/无显卡/标注带 mask/运行期异常时自动回退 CPU 路径，行为保持一致。
 import math  # 导入标准库 math，用于解测谎鼠标追踪的步长计算。
 import os  # 导入标准库 os，用于测谎报警音频的路径解析与存在性检查。
 import threading  # 导入标准库 threading，用于后台守护线程。
@@ -31,7 +35,7 @@ import numpy as np  # 导入 NumPy，用于光流轮廓点集的坐标偏移。
 from ok import Logger, TriggerTask, og  # 导入日志器、触发任务类型（暂停时需排除）与全局对象（executor/device_manager/my_app）。
 
 from src.dashboard_store import load_dashboard_config  # 导入看板共享配置读取函数，测谎参数以看板为单一数据源。
-from src.autologin.flow import AutoLoginFlow  # 导入自动重登流程状态机，掉线触发后执行全桌面重登序列。
+from src.autologin.flow import DOUBLE_CLICK_GAP, AutoLoginFlow  # 导入自动重登流程状态机与双击间隔常量（掉线触发后执行全桌面重登序列）。
 
 try:  # 解测谎依赖可选：DIS 稠密光流 + 粒子滤波在线编排，缺失时服务照常运行，仅禁用自动解测谎。
     from src.liedetector.shape_session import (  # 与测谎检验页签同一套光流解法（无神经网络）。
@@ -66,7 +70,9 @@ DISCONNECT_DIALOG_TEMPLATE = "掉线"  # 掉线弹窗主体模板：与掉线2�
 DISCONNECT_OK_TEMPLATE = "掉线确定"  # 掉线弹窗确定按钮模板。
 DISCONNECT_CONFIRM_FRAMES = 3  # 连续命中【掉线2】多少帧才认定为真掉线（防抖）。
 DISCONNECT_OK_WAIT = 2.0  # 点击掉线确定后等待弹窗关闭的秒数。
-DISCONNECT_GAME_EXIT_TIMEOUT = 15.0  # 等待游戏窗口关闭的超时秒数。
+DISCONNECT_GAME_EXIT_TIMEOUT = 15.0  # 点了【掉线确定】后等待游戏窗口关闭的超时秒数（弹窗关闭到窗口退出确实需要几秒）。
+DISCONNECT_GAME_EXIT_TIMEOUT_NO_DIALOG = 3.0  # 跳过【掉线】弹窗（场景2）时的短等待秒数：没有确定可点，游戏窗口不会因此关闭，
+# 实测这种情况掉线2 会一直挂在画面上，等满 15 秒纯属浪费，只需短等几秒确认窗口状态就进重登。
 
 STATE_IDLE = "idle"  # 服务空闲监控态。
 STATE_SOLVING = "solving"  # 服务正在解测谎态。
@@ -86,6 +92,9 @@ class LieDetectorService:  # 独立测谎监控服务：后台守护线程值守
         self._trigger_hits = 0  # 连续命中【测谎触发】的帧数，达到 LIE_TRIGGER_CONFIRM_FRAMES 才真正进入解题（防抖）。
         self._cooldown_until = 0.0  # 冷却截止时间戳：一局结束后这段时间内不响应新触发，避免弹窗残留画面重复触发。
         self._disconnect_hits = 0  # 连续命中【掉线2】的帧数，达到 DISCONNECT_CONFIRM_FRAMES 才触发重登（防抖）。
+        self._gpu = None  # 显卡匹配器（GpuFeatureMatcher），首次需要时创建，看板开关关闭或显卡异常时为 None。
+        self._gpu_off = False  # 显卡加速是否已被运行期异常永久关闭：置位后本进程内不再重试，避免每帧失败刷日志。
+        self._watch_names = None  # 本轮值守要在同一帧上匹配的全部分类名，单点调用匹配时沿用同一组模板避免反复重建。
 
     def start(self):  # 启动后台守护线程；重复调用只启动一次。
         if self._thread is not None:  # 已启动过。
@@ -129,17 +138,24 @@ class LieDetectorService:  # 独立测谎监控服务：后台守护线程值守
             try:  # 单轮异常不能拖垮服务，捕获后记录并继续下一轮。
                 auto_solve, trigger_name, region_name, threshold, trigger_delay, alarm_sound = self._read_config()  # 读取测谎配置。
                 auto_login_cfg = self._read_auto_login_config()  # 读取自动登录配置。
+                watch_names = [DISCONNECT_TEMPLATE, DISCONNECT_DIALOG_TEMPLATE, DISCONNECT_OK_TEMPLATE]  # 本轮要在同一帧上匹配的全部分类名，一次帧变换全部复用。
+                if trigger_name:  # 测谎触发标注已配置。
+                    watch_names.append(trigger_name)  # 一并注册，掉线检测采集的这一帧也能直接用来检测测谎。
+                self._watch_names = watch_names  # 记录下来：解题/延迟等待/等窗口关闭等单点匹配也注册同一组模板，避免反复重建显卡匹配器。
+                frame = None  # 本轮已采集的画面，掉线检测与测谎检测共用同一帧，省掉一次截图。
+                handle = None  # 本轮的显卡匹配句柄，None 表示走框架 CPU 匹配。
     
                 # —— 掉线检测（优先级高于测谎：游戏都掉了，测谎无意义）——
                 if auto_login_cfg['enabled'] and self._feature_ready(DISCONNECT_TEMPLATE):  # 自动登录开启且掉线模板已标注。
                     frame = self._capture()  # 采集一帧游戏窗口画面。
                     if frame is not None:  # 取到画面才做匹配。
-                        disconnect_box = self._find_trigger(frame, DISCONNECT_TEMPLATE, auto_login_cfg['threshold'])  # 全屏匹配【掉线2】。
+                        handle = self._gpu_handle(frame, watch_names) if self._gpu_match_enabled() else None  # 开关开启时准备显卡句柄：一帧只上传一次显存、只做一次帧变换。
+                        disconnect_box = self._find_trigger(frame, DISCONNECT_TEMPLATE, auto_login_cfg['threshold'], handle)  # 全屏匹配【掉线2】。
                         if disconnect_box is not None:  # 本帧命中掉线标志。
                             self._disconnect_hits += 1  # 累计连续命中帧数。
                             if self._disconnect_hits >= DISCONNECT_CONFIRM_FRAMES:  # 达到确认帧数，触发重登。
                                 self._disconnect_hits = 0  # 清零计数。
-                                self._handle_disconnect(frame, auto_login_cfg)  # 执行掉线重登流程（阻塞直到完成）。
+                                self._handle_disconnect(frame, auto_login_cfg, handle)  # 执行掉线重登流程（阻塞直到完成），复用本帧显卡句柄匹配掉线弹窗。
                                 continue  # 重登完成后跳过本轮测谎检测。
                         else:  # 本帧未命中。
                             self._disconnect_hits = 0  # 命中中断，确认计数清零重新累计。
@@ -162,11 +178,14 @@ class LieDetectorService:  # 独立测谎监控服务：后台守护线程值守
                     self._idle_sleep(MONITOR_INTERVAL)  # 空闲等待到冷却结束。
                     continue  # 下一轮。
                 self._set_status("watching")  # 标注就绪且不在冷却期，进入值守状态。
-                frame = self._capture()  # 采集一帧画面。
+                if frame is None:  # 掉线检测未开启或没采到画面时才另行采集，本轮已采过就直接复用同一帧。
+                    frame = self._capture()  # 采集一帧画面。
+                    if frame is not None and self._gpu_match_enabled():  # 取到画面且显卡加速开启。
+                        handle = self._gpu_handle(frame, watch_names)  # 准备本帧的显卡匹配句柄。
                 if frame is None:  # 取不到画面（窗口未就绪等）。
                     self._idle_sleep(MONITOR_INTERVAL)  # 空闲等待后重试。
                     continue  # 下一轮。
-                trigger_box = self._find_trigger(frame, trigger_name, threshold)  # 全屏匹配【测谎触发】标注。
+                trigger_box = self._find_trigger(frame, trigger_name, threshold, handle)  # 全屏匹配【测谎触发】标注。
                 if trigger_box is None:  # 未触发测谎。
                     self._trigger_hits = 0  # 命中中断，确认计数清零重新累计。
                     if self._current_task() is None:  # 无脚本任务运行时，服务独立推送监视画面（框选坐标框）。
@@ -227,16 +246,19 @@ class LieDetectorService:  # 独立测谎监控服务：后台守护线程值守
             'raw': config,  # 保留原始配置供 AutoLoginFlow 直接读取。
         }
 
-    def _handle_disconnect(self, frame, auto_login_cfg):  # 处理掉线触发：暂停任务 → 点击掉线确定 → 等待游戏退出 → 全桌面重登 → 恢复任务。
+    def _handle_disconnect(self, frame, auto_login_cfg, handle=None):  # 处理掉线触发：暂停任务 → 点击掉线确定 → 等待游戏退出 → 全桌面重登 → 恢复任务。handle 为触发帧的显卡匹配句柄。
         self.state = STATE_RELOGGING  # 切换到重登态，测谎检测自动挂起。
         self._set_status("relogging")  # 记录状态。
         logger.info("Disconnect detected, starting auto relogin. 检测到掉线，开始自动重登流程。")  # 记录触发。
         paused_task = self._pause_current_task()  # 暂停当前脚本任务并释放持有键。
         try:  # 无论重登成功与否，最终都要恢复被本服务暂停的任务。
             # Phase1：游戏窗口内处理掉线弹窗——如果【掉线】+【掉线确定】还在，点击确定关闭弹窗。
-            self._click_disconnect_ok(frame, auto_login_cfg['threshold'])
+            clicked_ok = self._click_disconnect_ok(frame, auto_login_cfg['threshold'], handle)  # 复用触发帧与其显卡句柄，同一帧上连查【掉线】【掉线确定】；返回是否真的点了确定。
             # Phase2：等待游戏窗口关闭（掉线2消失或截图失败），超时后也继续执行重登。
-            self._wait_game_exit(auto_login_cfg['threshold'])
+            # 超时长短看上一阶段是否点了确定：点了确定才需要给弹窗关闭+窗口退出留足 15 秒；
+            # 跳过【掉线】弹窗时根本没有可点的确定，窗口不会自己关，只短等 3 秒就进重登。
+            exit_timeout = DISCONNECT_GAME_EXIT_TIMEOUT if clicked_ok else DISCONNECT_GAME_EXIT_TIMEOUT_NO_DIALOG
+            self._wait_game_exit(auto_login_cfg['threshold'], exit_timeout)
             # Phase3：重登序列（连接→服务区→频道→开始游戏）。
             # 采集/点击分两种后端：连接用全桌面采集+pynput绝对点击（启动器在桌面、游戏窗口可能已关闭）；
             # 服务区/频道/开始游戏用游戏窗口当前选择框采集(self._capture)+窗口内相对坐标点击(self._click_in_window)，
@@ -257,36 +279,45 @@ class LieDetectorService:  # 独立测谎监控服务：后台守护线程值守
             self._set_status("watching")  # 记录状态。
         self._idle_sleep(POST_SOLVE_SLEEP)  # 重登完成后短暂等待画面稳定。
 
-    def _click_disconnect_ok(self, frame, threshold):  # Phase1：检测游戏窗口内是否还有【掉线】+【掉线确定】，有则点击确定关闭弹窗。
+    def _click_disconnect_ok(self, frame, threshold, handle=None):  # Phase1：检测游戏窗口内是否还有【掉线】+【掉线确定】，有则点击确定关闭弹窗。返回是否点击了确定（供调用方决定等多久）。
         if not self._feature_ready(DISCONNECT_OK_TEMPLATE):  # 掉线确定模板未标注，跳过。
-            return  # 无法点击，直接进入下一阶段。
-        dialog_box = self._find_trigger(frame, DISCONNECT_DIALOG_TEMPLATE, threshold)  # 匹配【掉线】弹窗主体。
-        ok_box = self._find_trigger(frame, DISCONNECT_OK_TEMPLATE, threshold)  # 匹配【掉线确定】按钮。
+            return False  # 无法点击，直接进入下一阶段。
+        dialog_box = self._find_trigger(frame, DISCONNECT_DIALOG_TEMPLATE, threshold, handle)  # 匹配【掉线】弹窗主体。
+        ok_box = self._find_trigger(frame, DISCONNECT_OK_TEMPLATE, threshold, handle)  # 匹配【掉线确定】按钮。
         if dialog_box is not None and ok_box is not None:  # 两者同时存在（场景1）：点击确定关闭弹窗。
             cx = ok_box.x + ok_box.width // 2  # 计算确定按钮中心坐标。
             cy = ok_box.y + ok_box.height // 2
             logger.info(f"Clicking disconnect OK at ({cx},{cy}). 点击掉线确定按钮 ({cx},{cy})。")  # 记录点击。
-            self._click_in_window(cx, cy)  # 通过框架 interaction 点击游戏窗口内坐标。
+            self._click_in_window(cx, cy)  # 通过框架 interaction 点击游戏窗口内坐标（确定按钮单击即可）。
             self._idle_sleep(DISCONNECT_OK_WAIT)  # 等待弹窗关闭动画。
-        else:  # 场景2：只有掉线2，无需点击确定。
-            logger.info("Disconnect dialog not present (scenario 2), skip OK click. 掉线弹窗不存在（场景2），跳过确定点击。")
+            return True  # 已点击确定，调用方需给窗口退出留足超时。
+        # 场景2：只有掉线2、没有掉线弹窗，无需也没有确定可点。
+        logger.info("Disconnect dialog not present (scenario 2), skip OK click. 掉线弹窗不存在（场景2），跳过确定点击。")
+        return False  # 未点击，调用方只短等即可。
 
-    def _click_in_window(self, x, y):  # 通过框架输入设备接口点击游戏窗口内坐标（窗口相对坐标）。
+    def _click_in_window(self, x, y, clicks=1):  # 通过框架输入设备接口点击游戏窗口内坐标（窗口相对坐标）；clicks>1 时在同一位置紧凑连点（双击）。
         self._ensure_in_front()  # 先把游戏/启动器窗口置前：interaction 的 clickable() 前台守卫在窗口非前台时会静默跳过点击（表现为“点击没反应”）。
         time.sleep(0.05)  # 等待窗口真正切到前台，再发点击。
         interaction = self._interaction()  # 取输入设备接口。
         if interaction is None:  # 接口不可用。
             logger.warning("Interaction unavailable, cannot click in window. 输入接口不可用，无法点击窗口内坐标。")
             return
+        total = max(1, int(clicks))  # 连点次数，非法值按单击处理。
         try:  # 点击异常不能中断重登流程。
-            interaction.move(x, y)  # 移动光标到目标坐标。
-            interaction.click(x, y)  # 执行点击。
+            for index in range(total):
+                if index:  # 连点的第 2 次起：不再置前、不再重新移光标，只留极短间隔。
+                    # 置前本身就要上百毫秒（bring_to_front 可能重新枚举窗口），每次点击都置前实测会把
+                    # 两次按下拉开到 251ms，启动器的频道列表只当成两次单击：频道选中高亮了但不进入。
+                    time.sleep(DOUBLE_CLICK_GAP)
+                else:  # 首次点击前把光标移到目标位置。
+                    interaction.move(x, y)
+                interaction.click(x, y)  # 执行点击（框架内部会再定位一次并按下/释放）。
         except Exception as e:  # 点击失败。
             logger.warning(f"Click in window failed at ({x},{y}): {e}. 窗口内点击失败。")
 
-    def _wait_game_exit(self, threshold):  # Phase2：等待游戏窗口关闭（掉线2消失或截图失败），超时后也继续执行重登。
-        logger.info(f"Waiting for game window to close (timeout {DISCONNECT_GAME_EXIT_TIMEOUT}s). 等待游戏窗口关闭（超时 {DISCONNECT_GAME_EXIT_TIMEOUT}s）。")
-        deadline = time.time() + DISCONNECT_GAME_EXIT_TIMEOUT  # 超时截止时间。
+    def _wait_game_exit(self, threshold, timeout=DISCONNECT_GAME_EXIT_TIMEOUT):  # Phase2：等待游戏窗口关闭（掉线2消失或截图失败），超时后也继续执行重登。
+        logger.info(f"Waiting for game window to close (timeout {timeout}s). 等待游戏窗口关闭（超时 {timeout}s）。")
+        deadline = time.time() + timeout  # 超时截止时间。
         while not self._exit_event.is_set() and time.time() < deadline:  # 循环直到超时或进程退出。
             frame = self._capture()  # 尝试采集游戏窗口画面。
             if frame is None:  # 截图失败：游戏窗口已关闭。
@@ -298,7 +329,7 @@ class LieDetectorService:  # 独立测谎监控服务：后台守护线程值守
                 logger.info("Disconnect template gone from game window. 掉线模板已从游戏窗口消失。")
                 return  # 进入重登阶段。
             self._idle_sleep(0.5)  # 每 0.5 秒检查一次。
-        logger.warning("Game exit wait timeout, proceeding with relogin anyway. 等待游戏退出超时，仍然继续执行重登。")
+        logger.warning(f"Game exit wait timeout ({timeout}s), proceeding with relogin anyway. 等待游戏退出超时（{timeout}s），仍然继续执行重登。")
 
     def _reset_solve_state(self):  # 一局测谎结束后初始化跨帧状态：清空触发确认计数与诊断限频时间戳，并开启冷却期。
         self._trigger_hits = 0  # 触发确认计数清零，下一局重新累计连续命中帧。
@@ -530,7 +561,18 @@ class LieDetectorService:  # 独立测谎监控服务：后台守护线程值守
             return path
         return os.path.join(os.getcwd(), 'ok_templates', 'coco_annotations.json')  # 回退：项目根目录默认路径（与 config.template_matching 一致）。
 
-    def _find_trigger(self, frame, feature_name, threshold):  # 全屏匹配【测谎触发】标注，返回置信度最高的框或 None。
+    def _find_trigger(self, frame, feature_name, threshold, handle=None):  # 全屏匹配指定标注，返回置信度最高的框或 None；看板开关开启时优先走显卡匹配。
+        if handle is None and self._gpu_match_enabled():  # 调用方未备句柄（解题/延迟等待/等窗口关闭等单点调用），此处自建。
+            handle = self._gpu_handle(frame, self._watch_names or [feature_name])  # 沿用本轮值守的同一组模板，避免反复重建。
+        if handle is not None and self._gpu is not None and self._gpu.has(feature_name):  # 该分类已注册到显卡匹配器，走显卡路径。
+            try:  # 显卡异常（显存不足/驱动重置等）不能中断值守。
+                box = self._gpu.best_box(handle, feature_name, threshold)  # 显卡上取最高分框，低于阈值返回 None。
+                if box is None and self._probe_due():  # 未达阈值且到了探测间隔：报一次实际最高分供排查。
+                    self._log_probe_score(feature_name, threshold, self._gpu.best_score(handle, feature_name))
+            except Exception as e:  # 显卡匹配失败。
+                self._disable_gpu(e)  # 关闭加速并落到下面的 CPU 路径，本帧仍能得出正确结果。
+            else:  # 显卡路径正常完成（命中或未命中）。
+                return box  # 直接返回，不再跑 CPU 匹配。
         feature_set = self._feature_set()  # 取特征集。
         if feature_set is None:  # 特征集不可用。
             return None  # 按未匹配处理。
@@ -546,17 +588,61 @@ class LieDetectorService:  # 独立测谎监控服务：后台守护线程值守
             return None  # 未触发。
         return max(boxes, key=lambda b: getattr(b, "confidence", 0))  # 取置信度最高的框，与 find_one 语义一致。
 
-    def _probe_trigger_score(self, feature_set, frame, feature_name, threshold):  # 诊断：限频用极低阈值探测【测谎触发】实际最高匹配分数并记日志，区分弹窗未出现/阈值偏高/模板不符。
-        now = time.time()  # 当前时间。
-        if now - self._last_trigger_probe < TRIGGER_PROBE_INTERVAL:  # 限频，避免每帧多一次匹配拖慢监控。
-            return  # 未到探测间隔。
-        self._last_trigger_probe = now  # 记录本次探测时间。
+    def _probe_trigger_score(self, feature_set, frame, feature_name, threshold):  # 诊断（CPU 路径）：限频用极低阈值探测实际最高匹配分数并记日志。
+        if not self._probe_due():  # 未到探测间隔。
+            return  # 跳过，避免每帧多一次匹配拖慢监控。
         try:  # 探测异常不能影响主流程。
             probe = feature_set.find_feature(frame, feature_name, 1, 1, 0.01, True, limit=1)  # 阈值 0.01（非 0，避免框架回退默认 0.95）拿最高分框。
             score = max((getattr(b, "confidence", 0.0) for b in (probe or [])), default=0.0)  # 取实际最高匹配分数。
         except Exception:  # 探测失败静默跳过。
             return  # 不记录。
+        self._log_probe_score(feature_name, threshold, score)  # 与显卡路径共用同一条诊断日志文案。
+
+    def _probe_due(self):  # 诊断探测限频判定：到达间隔才返回 True 并刷新时间戳（CPU/GPU 两条路径共用）。
+        now = time.time()  # 当前时间。
+        if now - self._last_trigger_probe < TRIGGER_PROBE_INTERVAL:  # 限频，避免每帧多一次匹配拖慢监控。
+            return False  # 未到探测间隔。
+        self._last_trigger_probe = now  # 记录本次探测时间。
+        return True  # 本轮应当探测。
+
+    def _log_probe_score(self, feature_name, threshold, score):  # 输出未达阈值的诊断日志：区分弹窗未出现/阈值偏高/模板不符。
         logger.info(f"Lie trigger not matched: {feature_name} best score={score:.3f} < threshold={threshold}. 测谎触发未达阈值：最高分={score:.3f}，阈值={threshold}。分数接近阈值=弹窗在画面但相似度不足；分数很低=弹窗未出现或模板不符。")
+
+    # ------------------------------------------------------------------ 显卡模板匹配加速
+
+    def _gpu_match_enabled(self):  # 看板「GPU Match 显卡加速」开关：默认开启，运行期显卡异常后本进程内不再重试。
+        if self._gpu_off:  # 已被异常关闭。
+            return False  # 直接走 CPU，不再反复初始化显卡。
+        try:  # 配置读取异常不能影响值守。
+            return bool(self._get_config().get('Lie Detector GPU Match', True))  # 看板未配该键（旧配置文件）时默认开启。
+        except Exception:  # 配置读取失败。
+            return False  # 保守回退 CPU。
+
+    def _gpu_handle(self, frame, names):  # 取本帧的显卡匹配句柄：首次创建匹配器、模板或画面尺寸变化时自动重建，不可用时返回 None。
+        if frame is None or not names:  # 无画面或无待匹配分类。
+            return None  # 走 CPU。
+        try:  # 显卡初始化/上传异常不能拖垮服务。
+            from src.gpu_feature_match import GpuFeatureMatcher, gpu_match_available  # 延迟导入：CuPy 初始化较重，且无显卡环境不应影响模块导入。
+            if not gpu_match_available():  # 未装 CuPy 或无可用显卡。
+                return None  # 走 CPU，不记日志（无显卡是常见环境）。
+            feature_set = self._feature_set()  # 取框架特征集。
+            if feature_set is None:  # 特征集不可用。
+                return None  # 走 CPU（CPU 路径也会因同样原因返回未匹配）。
+            if self._gpu is None or self._gpu.feature_set is not feature_set:  # 首次使用或框架重建了特征集（标注重载）。
+                self._gpu = GpuFeatureMatcher(feature_set, gray=True, logger=logger)  # 新建匹配器，灰度匹配与 CPU 路径一致。
+                logger.info("Lie service GPU template match enabled. 测谎服务已启用显卡模板匹配加速（测谎触发/掉线检测）。")  # 记录启用，便于核对实际走的是哪条路径。
+            if not self._gpu.prepare(names, frame):  # 没有可用模板（全未标注或全带 mask）。
+                return None  # 整体回退 CPU，由 _find_trigger 按 has() 逐个判定。
+            return self._gpu.frame(frame)  # 上传本帧并做帧变换，返回可被多个模板复用的句柄。
+        except Exception as e:  # 显卡异常。
+            self._disable_gpu(e)  # 关闭加速并回退 CPU。
+            return None  # 本帧走 CPU。
+
+    def _disable_gpu(self, error):  # 运行期显卡异常：本进程内关闭加速并回退 CPU，避免每帧重复失败刷日志。
+        if not self._gpu_off:  # 首次失败才记日志。
+            logger.warning(f"Lie service GPU match failed, fallback to CPU: {error}. 测谎服务显卡匹配失败，已回退 CPU 模板匹配（可关闭看板「GPU Match」开关消除本提示）。")
+        self._gpu_off = True  # 置位关闭标志。
+        self._gpu = None  # 释放匹配器持有的显存。
 
     def _get_region_box(self, frame, region_name):  # 直接采集【测谎坐标框】标注记录的坐标框信息作为解测谎输入区域，不做模板匹配；未标注返回 None。
         feature_set = self._feature_set()  # 取特征集。

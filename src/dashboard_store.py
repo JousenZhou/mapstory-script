@@ -33,6 +33,7 @@ DASHBOARD_DEFAULTS = {  # 看板共享配置默认值：键名与任务原配置
     'Lie Detector Threshold': 0.75,  # 测谎触发匹配阈值，越高越严格。
     'Lie Detector Trigger Delay': 5.0,  # 匹配到测谎触发后延迟多少秒才开始解测谎（等弹窗完全展开、图形动画起势），0 表示立即解题。
     'Lie Alarm Sound': 'alarm.mp3',  # 测谎报警音频（支持 wav/mp3，相对路径相对项目根目录），留空不报警。
+    'Lie Detector GPU Match': True,  # 测谎显卡加速开关：【测谎触发】【掉线/掉线2/掉线确定】模板匹配走显卡（CuPy FFT），关闭或无显卡时回退 CPU。
     # —— 角色栏 ——
     'Character Feature': '角色名',  # 角色标注分类名。
     'Character Threshold': 0.8,  # 角色匹配阈值。
@@ -56,6 +57,7 @@ DASHBOARD_DEFAULTS = {  # 看板共享配置默认值：键名与任务原配置
     'Auto Login Channel Feature': '',  # 频道模板名（类别=频道），对应启动器频道选择按钮。
     'Auto Login Threshold': 0.75,  # 全桌面模板匹配阈值。
     'Auto Login Step Timeout': 30.0,  # 每步等待超时秒数，超时重试一次后中止。
+    'Auto Login GPU Match': True,  # 自动登录显卡加速开关：重登流程的全桌面/窗口原生尺度模板匹配走显卡（CuPy FFT），关闭或无显卡时回退 CPU。
 }
 
 

@@ -191,11 +191,13 @@ class DashboardTab(CustomTab):  # 定义看板页签：视图区 + 测谎栏 + �
         self.lie_delay_spin.setSuffix(" s")  # 单位后缀，一眼看出是秒数。
         self.lie_alarm_edit = LineEdit()  # 报警音频路径输入框。
         self.lie_alarm_edit.setPlaceholderText("alarm.mp3")  # 占位提示。
+        self.lie_gpu_switch = SwitchButton()  # 测谎显卡加速开关：开启后【测谎触发】【掉线/掉线2/掉线确定】模板匹配走显卡，无显卡时自动回退 CPU。
         lie_form.addRow("Auto Solve 自动解测谎", self.lie_auto_switch)
         lie_form.addRow("Region 测谎区域标注", self.lie_region_combo)
         lie_form.addRow("Trigger 测谎触发标注", self.lie_trigger_combo)
         lie_form.addRow("Threshold 匹配阈值", self.lie_threshold_spin)
         lie_form.addRow("Trigger Delay 触发延迟", self.lie_delay_spin)
+        lie_form.addRow("GPU Match 显卡加速", self.lie_gpu_switch)
         lie_form.addRow("Alarm Sound 报警音频", self.lie_alarm_edit)
         lie_layout.addWidget(self.region_preview, 1)  # 预览占左半。
         lie_layout.addLayout(lie_form, 1)  # 表单占右半。
@@ -208,9 +210,11 @@ class DashboardTab(CustomTab):  # 定义看板页签：视图区 + 测谎栏 + �
         self.auto_login_switch = SwitchButton()  # 自动登录开关：开启后检测到掉线模板自动执行重登流程。
         self.server_combo = EditableComboBox()  # 服务区标注选择（类别为「服务区」的标注单选，如蓝蜗牛）。
         self.channel_combo = EditableComboBox()  # 频道标注选择（类别为「频道」的标注单选，如频道1）。
+        self.auto_login_gpu_switch = SwitchButton()  # 自动登录显卡加速开关：开启后重登流程的原生尺度模板匹配走显卡，无显卡时自动回退 CPU。
         login_form.addRow("Auto Login 自动登录", self.auto_login_switch)
         login_form.addRow("Server 服务区", self.server_combo)
         login_form.addRow("Channel 频道", self.channel_combo)
+        login_form.addRow("GPU Match 显卡加速", self.auto_login_gpu_switch)
         self.add_card("Auto Login 自动登录", login_widget)
 
         # —— 第 4 栏：角色栏 ——
@@ -324,6 +328,7 @@ class DashboardTab(CustomTab):  # 定义看板页签：视图区 + 测谎栏 + �
         self.lie_threshold_spin.setValue(float(data.get('Lie Detector Threshold') or 0.75))
         self.lie_delay_spin.setValue(float(data.get('Lie Detector Trigger Delay', DASHBOARD_DEFAULTS['Lie Detector Trigger Delay'])))
         self.lie_alarm_edit.setText(str(data.get('Lie Alarm Sound') or ''))
+        self.lie_gpu_switch.setChecked(bool(data.get('Lie Detector GPU Match', DASHBOARD_DEFAULTS['Lie Detector GPU Match'])))
         self._set_combo_value(self.char_feature_combo, str(data.get('Character Feature') or ''))
         self.char_threshold_spin.setValue(float(data.get('Character Threshold') or 0.8))
         self._set_combo_value(self.char_facing_left_combo, str(data.get('Character Facing Left Feature') or ''))
@@ -342,6 +347,7 @@ class DashboardTab(CustomTab):  # 定义看板页签：视图区 + 测谎栏 + �
         self.auto_login_switch.setChecked(bool(data.get('Auto Login Enabled')))
         self._set_combo_value(self.server_combo, str(data.get('Auto Login Server Feature') or ''))
         self._set_combo_value(self.channel_combo, str(data.get('Auto Login Channel Feature') or ''))
+        self.auto_login_gpu_switch.setChecked(bool(data.get('Auto Login GPU Match', DASHBOARD_DEFAULTS['Auto Login GPU Match'])))
 
     def _set_combo_value(self, combo, value):  # 把配置值设到下拉框，选项不存在时补充进去保证不丢用户配置。
         value = str(value or '')  # 统一转字符串。
@@ -385,6 +391,7 @@ class DashboardTab(CustomTab):  # 定义看板页签：视图区 + 测谎栏 + �
             'Lie Detector Threshold': round(float(self.lie_threshold_spin.value()), 2),
             'Lie Detector Trigger Delay': round(float(self.lie_delay_spin.value()), 1),
             'Lie Alarm Sound': self.lie_alarm_edit.text().strip(),
+            'Lie Detector GPU Match': bool(self.lie_gpu_switch.isChecked()),
             'Character Feature': self._combo_value(self.char_feature_combo),
             'Character Threshold': round(float(self.char_threshold_spin.value()), 2),
             'Character Facing Left Feature': self._combo_value(self.char_facing_left_combo),
@@ -405,6 +412,7 @@ class DashboardTab(CustomTab):  # 定义看板页签：视图区 + 测谎栏 + �
             'Auto Login Channel Feature': self._combo_value(self.channel_combo),
             'Auto Login Threshold': float(DASHBOARD_DEFAULTS.get('Auto Login Threshold', 0.75)),
             'Auto Login Step Timeout': float(DASHBOARD_DEFAULTS.get('Auto Login Step Timeout', 30.0)),
+            'Auto Login GPU Match': bool(self.auto_login_gpu_switch.isChecked()),
         }
         save_dashboard_config(data)  # 落盘，任务下次启动时采集生效。
         lie_service = getattr(og.my_app, 'lie_service', None) if og.my_app is not None else None  # 取独立测谎监控服务（由 Globals 持有）。

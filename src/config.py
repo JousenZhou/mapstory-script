@@ -136,5 +136,6 @@ config = {
     'onetime_tasks': [  # 用户点击触发的任务
         ["src.tasks.MapleIdleTask", "MapleIdleTask"],
         ["src.tasks.MaplePatrolTask", "MaplePatrolTask"],
+        ["src.tasks.MapleSingleSpotTask", "MapleSingleSpotTask"],
     ],
 }

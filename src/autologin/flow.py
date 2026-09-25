@@ -5,7 +5,8 @@
 #   - 采集/点击分两种后端：【连接】用全桌面采集 + pynput 绝对点击（启动器在桌面、游戏窗口可能已关闭）；
 #     【服务区/频道/开始游戏】用游戏窗口当前选择框采集 + 窗口内相对坐标点击（模板即窗口客户区尺度，
 #     避免把客户区模板匹配到全桌面再点绝对坐标所产生的向上偏移）。
-#   - 模板匹配用原生尺度匹配器（DesktopTemplateMatcher），绕开框架按帧宽缩放。
+#   - 模板匹配用原生尺度匹配器（DesktopTemplateMatcher），绕开框架按帧宽缩放；全桌面帧很大，
+#     匹配可走显卡（CuPy FFT），由看板「GPU Match 显卡加速」开关控制，异常时自动回退 CPU。
 #   - 每步点击后监控画面推进，卡住超过 STUCK_RETRY_SECONDS 秒自动重试点击；仍不推进才判失败。
 #   - 频道/开始游戏等启动器按钮需双击才生效：步骤带连点次数，命中后在同一位置快速连点（默认双击）。
 import time  # 导入 time，用于超时计时与步骤间等待。
@@ -40,12 +41,15 @@ class AutoLoginFlow:
 
         Args:
             coco_json: 模板标注文件路径（ok_templates/coco_annotations.json），用于原生尺度匹配。
-            config: 看板配置 dict，包含 Auto Login Server Feature / Channel Feature / Threshold / Step Timeout。
+            config: 看板配置 dict，包含 Auto Login Server Feature / Channel Feature / Threshold / Step Timeout / GPU Match。
             logger: 日志器，None 时静默。
             game_frame_fn: 游戏窗口当前选择框采集回调（返回客户区 BGR 帧），窗口后端使用；None 时退回桌面采集。
-            window_click_fn: 窗口内相对坐标点击回调 (x, y)；None 时退回桌面绝对点击。
+            window_click_fn: 窗口内相对坐标点击回调 (x, y, clicks)；clicks 为需要在同一位置连点的次数。
+                连点必须由回调一次完成（窗口置前只做一次），否则每次点击都重新置前会把两次按下拉开到
+                250ms 以上，启动器只当成两次单击。None 时退回桌面绝对点击。
         """
-        self._matcher = DesktopTemplateMatcher(coco_json, logger)  # 原生尺度匹配器：绕开框架按帧宽缩放。
+        gpu_enabled = bool((config or {}).get("Auto Login GPU Match", True))  # 看板显卡加速开关，旧配置无该键时默认开启。
+        self._matcher = DesktopTemplateMatcher(coco_json, logger, gpu_enabled=gpu_enabled)  # 原生尺度匹配器：绕开框架按帧宽缩放，可选显卡加速。
         self._config = config
         self._logger = logger
         self._mouse = MouseController()  # pynput 鼠标控制器，复用实例避免反复创建。
@@ -150,24 +154,22 @@ class AutoLoginFlow:
                 self._warn(f"Step {index}/{total} [{description}]: failed after {1 + MAX_RETRY} attempts, aborting flow. "
                            f"步骤 {index}/{total} [{description}]：重试耗尽，流程中止。")
                 return False
-            # 命中：点击并监控推进；卡住超过 STUCK_RETRY_SECONDS 自动重试点击。
+            # 命中：连点（双击）并监控推进；卡住超过 STUCK_RETRY_SECONDS 自动重试点击。
             for click_no in range(1 + MAX_RECLICK):
-                x, y, w, h, confidence = box
+                x, y, w, h, confidence = box  # 整轮重试都用首次命中的这个框，坐标锁定不再刷新（原因见下）。
                 cx = x + w // 2
                 cy = y + h // 2
                 self._log(f"Step {index}/{total} [{description}]: matched at ({cx},{cy}) conf={confidence:.3f}, clicking (#{click_no + 1}, {clicks}x). "
                           f"步骤 {index}/{total} [{description}]：匹配到 ({cx},{cy}) 置信度={confidence:.3f}，点击（第{click_no + 1}轮，连点{clicks}次）。")
-                for _click_i in range(max(1, clicks)):  # 连点：同一位置快速点击 clicks 次（频道/开始游戏需双击才生效）。
-                    self._click_for(backend, cx, cy)
-                    time.sleep(DOUBLE_CLICK_GAP)
+                self._click_for(backend, cx, cy, clicks)  # 一次调用完成整串连点：窗口置前只做一次，两次按下紧凑相连。
                 if self._advanced(backend, template_name, next_backend, next_template, threshold, exit_event, STUCK_RETRY_SECONDS):
                     return True
-                self._warn(f"Step {index}/{total} [{description}]: stuck >{STUCK_RETRY_SECONDS}s after click, retry click. "
-                           f"步骤 {index}/{total} [{description}]：点击后 {STUCK_RETRY_SECONDS}s 画面未推进，重试点击。")
-                frame = self._capture_for(backend)
-                box, confidence = self._match(frame, template_name) if frame is not None else (None, 0.0)
-                if box is None or confidence < threshold:
-                    break  # 当前按钮已消失/不可见，无法再点，交给重锚或下一轮。
+                self._warn(f"Step {index}/{total} [{description}]: stuck >{STUCK_RETRY_SECONDS}s after click, retry click (locked at ({cx},{cy})). "
+                           f"步骤 {index}/{total} [{description}]：点击后 {STUCK_RETRY_SECONDS}s 画面未推进，在锁定坐标 ({cx},{cy}) 重试点击。")
+                # 卡住后不重新匹配：频道被单击选中后会高亮、外观改变，重新匹配的最高分会漂到相邻频道上
+                # （实测同一【频道3】模板先在 (722,379) 满分命中，点击后再匹配却落到 (815,410) 的另一个频道），
+                # 后续点击就打在别的频道上永远进不去。_advanced 返回 False 已说明当前模板仍在画面上，
+                # 所以直接在原坐标重试即可；真正的位置变化交给下一轮重锚 + 重新轮询处理。
             if attempt < MAX_RETRY:
                 self._warn(f"Step {index}/{total} [{description}]: not advanced after clicks, retrying. "
                            f"步骤 {index}/{total} [{description}]：多次点击仍未推进，重试。")
@@ -257,16 +259,22 @@ class AutoLoginFlow:
                 return None
         return capture_desktop(all_screens=True)  # 截全部显示器：启动器可能在任一屏幕；坐标为虚拟屏图像坐标，点击时加原点偏移。
 
-    def _click_for(self, backend, cx, cy):
-        """按后端点击，与 _capture_for 严格配对：窗口后端用窗口内相对坐标点击，桌面后端用 pynput 绝对坐标点击。"""
+    def _click_for(self, backend, cx, cy, clicks=1):
+        """按后端点击，与 _capture_for 严格配对：窗口后端用窗口内相对坐标点击，桌面后端用 pynput 绝对坐标点击。
+        clicks>1 表示要在同一位置连点（双击）。窗口后端把整串连点交给回调一次完成，因为置前必须在连点前只做一次：
+        每次点击都重新置前 + 等待，实测会把两次按下拉开到 251ms，启动器只当成两次单击（频道选中了却不进入）。"""
+        total = max(1, int(clicks))  # 连点次数，非法值按单击处理。
         if self._window_backend_active(backend):
             try:
-                self._window_click_fn(cx, cy)
-                self._log(f"Window click sent at ({cx},{cy}). 已在游戏窗口内 ({cx},{cy}) 发出点击。")
+                self._window_click_fn(cx, cy, total)
+                self._log(f"Window click sent at ({cx},{cy}), {total}x. 已在游戏窗口内 ({cx},{cy}) 发出点击（连点 {total} 次）。")
             except Exception as e:
                 self._warn(f"Window click failed at ({cx},{cy}): {e}. 窗口内点击失败。")
             return
-        self._click_screen(cx, cy)
+        for click_index in range(total):  # 桌面后端：pynput 绝对坐标连点，两次点击之间只留双击间隔。
+            if click_index:
+                time.sleep(DOUBLE_CLICK_GAP)
+            self._click_screen(cx, cy)
 
     def _match(self, frame, template_name):
         """在给定帧（桌面或窗口客户区）上原生尺度匹配模板，返回 ((x,y,w,h,conf) 或 None, 最高分)。"""

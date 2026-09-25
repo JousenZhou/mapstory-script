@@ -185,6 +185,12 @@
       "file_name": "30.png",
       "width": 1368,
       "height": 800
+    },
+    {
+      "id": 37,
+      "file_name": "31.png",
+      "width": 1366,
+      "height": 768
     }
   ],
   "annotations": [
@@ -746,6 +752,19 @@
       ],
       "area": 4140,
       "iscrowd": 0
+    },
+    {
+      "id": 44,
+      "image_id": 37,
+      "category_id": 44,
+      "bbox": [
+        5,
+        73,
+        239,
+        78
+      ],
+      "area": 18642,
+      "iscrowd": 0
     }
   ],
   "categories": [
@@ -962,6 +981,11 @@
     {
       "id": 43,
       "name": "开始游戏",
+      "supercategory": ""
+    },
+    {
+      "id": 44,
+      "name": "沼泽地2",
       "supercategory": ""
     }
   ]

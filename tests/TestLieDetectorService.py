@@ -3,6 +3,7 @@
 # （服务与脚本任务解耦、无任务时也能独立求解，是本次改造的核心行为）。
 # 另覆盖触发防抖与冷却：瞬时丢失不能打断光流会话，一局结束后要初始化状态并进入冷却期。
 # 还覆盖触发延迟：匹配到触发后先等配置的秒数才解题，延迟期弹窗已关则放弃本局，延迟结束后用新帧开题。
+# 以及显卡模板匹配加速：看板开关控制走显卡还是 CPU，显卡未注册的分类与显卡异常都要自动回退 CPU 路径。
 import threading  # 用永不置位的退出事件构造服务，测试只直接调方法不启动线程。
 import time  # 验证冷却截止时间戳。
 import unittest
@@ -467,6 +468,300 @@ class TestLieDetectorService(unittest.TestCase):
         self.assertEqual(0, self.service._trigger_hits)  # 确认计数已清零。
         self.assertEqual(0.0, self.service._last_trigger_probe)  # 诊断限频已清零，下一局能立即打出分数。
         self.assertLessEqual(before + service_module.LIE_SOLVE_COOLDOWN, self.service._cooldown_until)  # 冷却截止时间已推到未来。
+
+    # ------------------------------------------------------------------ 显卡模板匹配加速
+
+    def test_gpu_match_enabled_reads_dashboard_switch(self):
+        # 看板开关控制是否走显卡：未配该键（旧配置文件）默认开启，显式关闭则走 CPU。
+        with patch.object(self.service, "_get_config", return_value={}):
+            self.assertTrue(self.service._gpu_match_enabled())  # 缺键时默认开启。
+        with patch.object(self.service, "_get_config", return_value={'Lie Detector GPU Match': True}):
+            self.assertTrue(self.service._gpu_match_enabled())
+        with patch.object(self.service, "_get_config", return_value={'Lie Detector GPU Match': False}):
+            self.assertFalse(self.service._gpu_match_enabled())  # 用户关掉开关即回退 CPU。
+        self.service._gpu_off = True  # 模拟运行期显卡异常已关闭加速。
+        with patch.object(self.service, "_get_config", return_value={'Lie Detector GPU Match': True}):
+            self.assertFalse(self.service._gpu_match_enabled())  # 本进程内不再重试显卡。
+        self.service._gpu_off = False
+        with patch.object(self.service, "_get_config", side_effect=RuntimeError("boom")):
+            self.assertFalse(self.service._gpu_match_enabled())  # 配置读取异常时保守回退 CPU。
+
+    def test_gpu_handle_guards(self):
+        # 无画面或无待匹配分类时直接返回 None，不去碰显卡。
+        frame = np.full((30, 40, 3), 20, dtype=np.uint8)
+        with patch.object(self.service, "_feature_set") as fs:
+            self.assertIsNone(self.service._gpu_handle(None, ["测谎触发"]))
+            self.assertIsNone(self.service._gpu_handle(frame, []))
+        fs.assert_not_called()  # 两个前置守卫都在取特征集之前。
+
+    def test_gpu_handle_returns_none_when_gpu_unavailable(self):
+        # 未装 CuPy 或无显卡时返回 None，不创建匹配器也不记错。
+        frame = np.full((30, 40, 3), 20, dtype=np.uint8)
+        import src.gpu_feature_match as gpu_module
+        with patch.object(gpu_module, "gpu_match_available", return_value=False), \
+                patch.object(self.service, "_feature_set", return_value=MagicMock()):
+            self.assertIsNone(self.service._gpu_handle(frame, ["测谎触发"]))
+        self.assertIsNone(self.service._gpu)  # 没有可用显卡就不持有匹配器。
+        self.assertFalse(self.service._gpu_off)  # 无显卡是常见环境，不当作故障关闭。
+
+    def test_gpu_handle_creates_matcher_once_and_reuses_it(self):
+        # 首次调用创建匹配器并准备本帧句柄；特征集未变时后续帧复用同一个匹配器。
+        frame = np.full((30, 40, 3), 20, dtype=np.uint8)
+        feature_set = MagicMock()
+        handle = object()  # 假帧句柄，只需能被原样返回。
+        import src.gpu_feature_match as gpu_module
+        gpu = MagicMock()
+        gpu.feature_set = feature_set  # 真实匹配器会把特征集存在同名属性上，供服务判定是否需要重建。
+        gpu.prepare.return_value = True
+        gpu.frame.return_value = handle
+        with patch.object(gpu_module, "gpu_match_available", return_value=True), \
+                patch.object(gpu_module, "GpuFeatureMatcher", return_value=gpu) as ctor, \
+                patch.object(self.service, "_feature_set", return_value=feature_set):
+            self.assertIs(handle, self.service._gpu_handle(frame, ["测谎触发"]))
+            self.assertIs(handle, self.service._gpu_handle(frame, ["测谎触发"]))
+        self.assertEqual(1, ctor.call_count)  # 特征集没变就不重建匹配器，核 FFT 缓存得以保留。
+        self.assertIs(gpu, self.service._gpu)
+        self.assertEqual(2, gpu.prepare.call_count)  # 每帧仍需 prepare（内部按键判定是否真要重建模板）。
+        gpu.frame.assert_any_call(frame)
+
+    def test_gpu_handle_returns_none_when_no_template(self):
+        # 全部标注都带 mask 或未标注时 prepare 失败，整体回退 CPU。
+        frame = np.full((30, 40, 3), 20, dtype=np.uint8)
+        import src.gpu_feature_match as gpu_module
+        gpu = MagicMock()
+        gpu.prepare.return_value = False
+        with patch.object(gpu_module, "gpu_match_available", return_value=True), \
+                patch.object(gpu_module, "GpuFeatureMatcher", return_value=gpu), \
+                patch.object(self.service, "_feature_set", return_value=MagicMock()):
+            self.assertIsNone(self.service._gpu_handle(frame, ["测谎触发"]))
+        gpu.frame.assert_not_called()  # 没模板就不必上传画面。
+
+    def test_gpu_handle_disables_gpu_on_exception(self):
+        # 显卡初始化/上传抛异常时关闭加速并返回 None，不能把服务线程带崩。
+        frame = np.full((30, 40, 3), 20, dtype=np.uint8)
+        import src.gpu_feature_match as gpu_module
+        gpu = MagicMock()
+        gpu.prepare.side_effect = RuntimeError("cuda out of memory")
+        with patch.object(gpu_module, "gpu_match_available", return_value=True), \
+                patch.object(gpu_module, "GpuFeatureMatcher", return_value=gpu), \
+                patch.object(self.service, "_feature_set", return_value=MagicMock()):
+            self.assertIsNone(self.service._gpu_handle(frame, ["测谎触发"]))
+        self.assertTrue(self.service._gpu_off)  # 已关闭加速。
+        self.assertIsNone(self.service._gpu)  # 匹配器已释放。
+
+    def test_find_trigger_uses_gpu_box_and_skips_cpu(self):
+        # 显卡已注册该分类时直接用显卡结果，不再跑一次 CPU 匹配（这正是提速的关键）。
+        gpu_box = SimpleNamespace(confidence=0.9)
+        gpu = MagicMock()
+        gpu.has.return_value = True
+        gpu.best_box.return_value = gpu_box
+        self.service._gpu = gpu
+        handle = object()
+        fs = MagicMock()
+        with patch.object(self.service, "_feature_set", return_value=fs):
+            self.assertIs(gpu_box, self.service._find_trigger(None, "测谎触发", 0.7, handle))
+        gpu.best_box.assert_called_once_with(handle, "测谎触发", 0.7)
+        fs.find_feature.assert_not_called()  # CPU 匹配未被调用。
+
+    def test_find_trigger_falls_back_to_cpu_for_unregistered_feature(self):
+        # 显卡未注册的分类（未标注/带 mask）仍走框架 CPU 匹配，行为与开关关闭时一致。
+        cpu_box = SimpleNamespace(confidence=0.8)
+        gpu = MagicMock()
+        gpu.has.return_value = False
+        self.service._gpu = gpu
+        fs = MagicMock()
+        fs.find_feature.return_value = [cpu_box]
+        with patch.object(self.service, "_feature_set", return_value=fs):
+            self.assertIs(cpu_box, self.service._find_trigger(None, "测谎触发", 0.7, object()))
+        fs.find_feature.assert_called_once()  # 已回退 CPU。
+        gpu.best_box.assert_not_called()
+
+    def test_find_trigger_falls_back_to_cpu_on_gpu_error(self):
+        # 显卡匹配抛异常：关闭加速并用 CPU 兼底，本帧仍能得到正确结果。
+        cpu_box = SimpleNamespace(confidence=0.8)
+        gpu = MagicMock()
+        gpu.has.return_value = True
+        gpu.best_box.side_effect = RuntimeError("device lost")
+        self.service._gpu = gpu
+        fs = MagicMock()
+        fs.find_feature.return_value = [cpu_box]
+        with patch.object(self.service, "_feature_set", return_value=fs):
+            self.assertIs(cpu_box, self.service._find_trigger(None, "测谎触发", 0.7, object()))
+        self.assertTrue(self.service._gpu_off)  # 已关闭加速。
+        self.assertIsNone(self.service._gpu)  # 匹配器已释放。
+        fs.find_feature.assert_called_once()  # 同一帧内已回退到 CPU 并拿到结果。
+
+    def test_find_trigger_builds_handle_when_not_given(self):
+        # 单点调用（解题/延迟等待/等窗口关闭）未传句柄时自建，并沿用本轮值守的模板名单。
+        gpu = MagicMock()
+        gpu.has.return_value = True
+        gpu.best_box.return_value = SimpleNamespace(confidence=0.9)
+        handle = object()
+        self.service._gpu = gpu
+        self.service._watch_names = ["掉线2", "测谎触发"]
+        with patch.object(self.service, "_gpu_match_enabled", return_value=True), \
+                patch.object(self.service, "_gpu_handle", return_value=handle) as build:
+            self.service._find_trigger("frame", "测谎触发", 0.7)
+        build.assert_called_once_with("frame", ["掉线2", "测谎触发"])  # 模板名单与值守轮一致，不会反复重建。
+
+    def test_find_trigger_skips_gpu_when_switch_off(self):
+        # 看板开关关闭时完全不碰显卡，路径与改造前一致（只调一次 CPU 匹配）。
+        cpu_box = SimpleNamespace(confidence=0.8)
+        fs = MagicMock()
+        fs.find_feature.return_value = [cpu_box]
+        with patch.object(self.service, "_gpu_match_enabled", return_value=False), \
+                patch.object(self.service, "_gpu_handle") as build, \
+                patch.object(self.service, "_feature_set", return_value=fs):
+            self.assertIs(cpu_box, self.service._find_trigger(None, "测谎触发", 0.7))
+        build.assert_not_called()  # 未尝试创建显卡句柄。
+        self.assertEqual(1, fs.find_feature.call_count)  # 没有额外的诊断匹配。
+
+    def test_find_trigger_gpu_miss_probes_score(self):
+        # 显卡路径未命中时限频报一次实际最高分，诊断能力与 CPU 路径保持一致。
+        gpu = MagicMock()
+        gpu.has.return_value = True
+        gpu.best_box.return_value = None  # 未达阈值。
+        gpu.best_score.return_value = 0.42
+        self.service._gpu = gpu
+        self.service._last_trigger_probe = 0.0  # 本轮应当探测。
+        with patch.object(self.service, "_log_probe_score") as log, \
+                patch.object(self.service, "_feature_set", return_value=MagicMock()):
+            self.assertIsNone(self.service._find_trigger(None, "测谎触发", 0.75, object()))
+        log.assert_called_once_with("测谎触发", 0.75, 0.42)  # 分数与阈值都进了日志。
+        self.service._last_trigger_probe = time.time()  # 刚刚探测过。
+        with patch.object(self.service, "_log_probe_score") as log2:
+            self.assertIsNone(self.service._find_trigger(None, "测谎触发", 0.75, object()))
+        log2.assert_not_called()  # 限频生效，不会每帧都多算一次分数。
+
+    def test_probe_due_rate_limits(self):
+        # 探测限频判定：首次到达返回 True 并刷新时间戳，间隔内返回 False。
+        self.service._last_trigger_probe = 0.0
+        self.assertTrue(self.service._probe_due())
+        self.assertFalse(self.service._probe_due())  # 刚刷新过，间隔未到。
+        self.service._last_trigger_probe = time.time() - service_module.TRIGGER_PROBE_INTERVAL - 1
+        self.assertTrue(self.service._probe_due())  # 超过间隔后再次探测。
+
+    def test_click_disconnect_ok_reuses_handle(self):
+        # 处理掉线弹窗时【掉线】与【掉线确定】复用同一个显卡句柄（同一帧只变换一次）。
+        frame = np.full((30, 40, 3), 20, dtype=np.uint8)
+        dialog = SimpleNamespace(x=0, y=0, width=10, height=10)
+        ok_box = SimpleNamespace(x=20, y=10, width=10, height=10)  # 中心 (25, 15)。
+        handle = object()
+        calls = []
+
+        def fake_find(f, name, threshold, h=None):
+            calls.append((name, h))
+            return dialog if name == service_module.DISCONNECT_DIALOG_TEMPLATE else ok_box
+
+        with patch.object(self.service, "_feature_ready", return_value=True), \
+                patch.object(self.service, "_find_trigger", side_effect=fake_find), \
+                patch.object(self.service, "_click_in_window") as click, \
+                patch.object(self.service, "_idle_sleep"):
+            self.service._click_disconnect_ok(frame, 0.75, handle)
+        self.assertEqual([(service_module.DISCONNECT_DIALOG_TEMPLATE, handle),
+                          (service_module.DISCONNECT_OK_TEMPLATE, handle)], calls)  # 两次匹配都带着同一句柄。
+        click.assert_called_once_with(25, 15)  # 点击确定按钮中心（确定按钮单击即可，不连点）。
+
+    def test_click_in_window_double_click_fronts_once(self):
+        # 双击必须「只置前一次 + 紧凑连点」：旧实现每次点击都重新置前（bring_to_front 实测上百毫秒），
+        # 两次按下被拉开到 251ms，启动器的频道列表只当成两次单击（频道选中高亮了却不进入）。
+        order = []  # 按发生顺序记录置前/等待/移光标/点击，用来卡住“第二次点击前不再置前”。
+        interaction = MagicMock()
+        interaction.move.side_effect = lambda *a: order.append("move")
+        interaction.click.side_effect = lambda *a: order.append("click")
+        with patch.object(self.service, "_ensure_in_front", side_effect=lambda: order.append("front")), \
+                patch.object(self.service, "_interaction", return_value=interaction), \
+                patch("time.sleep", side_effect=lambda seconds: order.append("sleep")):  # 不真等，只卡顺序。
+            self.service._click_in_window(722, 379, 2)
+        self.assertEqual(["front", "sleep", "move", "click", "sleep", "click"], order)  # 置前只在首次点击前做一次。
+        self.assertEqual(2, interaction.click.call_count)  # 两次点击都发出去了。
+        self.assertEqual(1, interaction.move.call_count)  # 光标只在首次点击前移动一次，不重复定位。
+        interaction.click.assert_called_with(722, 379)  # 两次点击坐标完全相同，才会被系统判成双击。
+
+    def test_click_in_window_single_click_by_default(self):
+        # 不传 clicks 时仍是单击（掉线确定按钮走这条路径）。
+        interaction = MagicMock()
+        with patch.object(self.service, "_ensure_in_front"), \
+                patch.object(self.service, "_interaction", return_value=interaction), \
+                patch("time.sleep"):
+            self.service._click_in_window(25, 15)
+        self.assertEqual(1, interaction.click.call_count)
+        self.assertEqual(1, interaction.move.call_count)
+
+    def test_click_disconnect_ok_returns_whether_clicked(self):
+        # 返回值决定下一阶段等多久：点了确定为 True，场景2（只有掉线2）与未标注都为 False。
+        frame = np.full((30, 40, 3), 20, dtype=np.uint8)
+        box = SimpleNamespace(x=0, y=0, width=10, height=10)
+        with patch.object(self.service, "_feature_ready", return_value=True), \
+                patch.object(self.service, "_find_trigger", return_value=box), \
+                patch.object(self.service, "_click_in_window"), \
+                patch.object(self.service, "_idle_sleep"):
+            self.assertTrue(self.service._click_disconnect_ok(frame, 0.75))  # 弹窗与确定都在：点了确定。
+        with patch.object(self.service, "_feature_ready", return_value=True), \
+                patch.object(self.service, "_find_trigger", return_value=None), \
+                patch.object(self.service, "_click_in_window") as click:
+            self.assertFalse(self.service._click_disconnect_ok(frame, 0.75))  # 场景2：没弹窗，跳过点击。
+        click.assert_not_called()
+        with patch.object(self.service, "_feature_ready", return_value=False), \
+                patch.object(self.service, "_find_trigger") as find:
+            self.assertFalse(self.service._click_disconnect_ok(frame, 0.75))  # 掉线确定未标注：连匹配都不做。
+        find.assert_not_called()
+
+    def test_handle_disconnect_waits_short_when_dialog_skipped(self):
+        # 跳过【掉线】弹窗时没有确定可点、窗口也不会自己关，等窗口关闭只给 3 秒（原来白等 15 秒）。
+        self.assertEqual(3.0, service_module.DISCONNECT_GAME_EXIT_TIMEOUT_NO_DIALOG)  # 钉住用户要求的短等待秒数。
+        self.assert_exit_timeout(clicked_ok=False, expected=service_module.DISCONNECT_GAME_EXIT_TIMEOUT_NO_DIALOG)
+
+    def test_handle_disconnect_waits_long_when_ok_clicked(self):
+        # 点了【掉线确定】后要留给弹窗关闭与窗口退出足够时间，仍是 15 秒。
+        self.assert_exit_timeout(clicked_ok=True, expected=service_module.DISCONNECT_GAME_EXIT_TIMEOUT)
+
+    def assert_exit_timeout(self, clicked_ok, expected):  # 跑一次 _handle_disconnect，校对传给 _wait_game_exit 的超时。
+        cfg = {'enabled': True, 'threshold': 0.75, 'server': '', 'channel': '', 'step_timeout': 30.0, 'raw': {}}
+        with patch.object(self.service, "_pause_current_task", return_value=None), \
+                patch.object(self.service, "_click_disconnect_ok", return_value=clicked_ok), \
+                patch.object(self.service, "_wait_game_exit") as wait, \
+                patch.object(self.service, "_coco_json_path", return_value="coco.json"), \
+                patch.object(service_module, "AutoLoginFlow") as flow_cls, \
+                patch.object(self.service, "_idle_sleep"):
+            flow_cls.return_value.run.return_value = True  # 重登序列直接成功，不跑真实流程。
+            self.service._handle_disconnect(np.full((30, 40, 3), 20, dtype=np.uint8), cfg)
+        wait.assert_called_once_with(0.75, expected)  # 阈值与超时都按上一阶段的结果传下去了。
+
+    def test_run_shares_one_frame_and_handle_between_disconnect_and_lie_check(self):
+        # 主循环一轮内只截图一次、只准备一次显卡句柄，掉线检测与测谎检测共用。
+        frame = np.full((30, 40, 3), 20, dtype=np.uint8)
+        handle = object()
+        watch = [service_module.DISCONNECT_TEMPLATE, service_module.DISCONNECT_DIALOG_TEMPLATE,
+                 service_module.DISCONNECT_OK_TEMPLATE, "测谎触发"]  # 预期的值守模板名单。
+        exit_event = MagicMock()
+        exit_event.is_set.side_effect = [False, True]  # 第一轮进入循环，轮末退出。
+        service = LieDetectorService(exit_event)
+        find_calls = []
+
+        def fake_find(f, name, threshold, h=None):
+            find_calls.append((name, h))
+            return None  # 两个检测都未命中，本轮只做值守。
+
+        with patch.object(service_module, "LIE_SOLVER_AVAILABLE", True), \
+                patch.object(service, "_read_config", return_value=(True, "测谎触发", "测谎坐标框", 0.75, 0.0, "")), \
+                patch.object(service, "_read_auto_login_config", return_value={'enabled': True, 'threshold': 0.75,
+                                                                              'server': '', 'channel': '',
+                                                                              'step_timeout': 30.0, 'raw': {}}), \
+                patch.object(service, "_feature_ready", return_value=True), \
+                patch.object(service, "_capture", return_value=frame) as capture, \
+                patch.object(service, "_gpu_match_enabled", return_value=True), \
+                patch.object(service, "_gpu_handle", return_value=handle) as build, \
+                patch.object(service, "_find_trigger", side_effect=fake_find), \
+                patch.object(service, "_current_task", return_value=MagicMock()), \
+                patch.object(service, "_get_region_box", return_value=None), \
+                patch.object(service, "_update_vision"), \
+                patch.object(service, "_idle_sleep"):
+            service._run()
+        self.assertEqual(1, capture.call_count)  # 一轮只截图一次，不再为两个检测各截一次。
+        build.assert_called_once_with(frame, watch)  # 显卡句柄只建一次，且一次注册全部待匹配分类。
+        self.assertEqual([(service_module.DISCONNECT_TEMPLATE, handle), ("测谎触发", handle)], find_calls)  # 两次匹配共用同一句柄。
+        self.assertEqual(watch, service._watch_names)  # 名单已记录，供单点匹配沿用。
 
 
 if __name__ == '__main__':

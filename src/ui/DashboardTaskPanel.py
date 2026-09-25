@@ -27,6 +27,7 @@ from ok.core.events import communicate  # 应用事件总线：订阅任务状�
 
 from src.tasks.MapleIdleTask import MapleIdleTask  # 挂机任务类，用于按类取实例。
 from src.tasks.MaplePatrolTask import MaplePatrolTask  # 巡逻任务类，用于按类取实例。
+from src.tasks.MapleSingleSpotTask import MapleSingleSpotTask  # 单点挂机任务类，用于按类取实例。
 
 logger = Logger.get_logger(__name__)  # 本模块日志器。
 
@@ -56,6 +57,7 @@ _FLOAT_SPEC = {
     "Minimap Threshold": (2, 0.01, 1.0, 0.05),
     "Patrol Left Percent": (1, 0.0, 100.0, 1.0),
     "Patrol Right Percent": (1, 0.0, 100.0, 1.0),
+    "Return Offset Max Percent": (1, 0.0, 100.0, 0.5),
     "Stuck Seconds": (1, 0.0, 999.0, 0.5),
     "Resume Wait Seconds": (1, 0.0, 999.0, 0.5),
 }
@@ -97,6 +99,8 @@ _CONFIG_LABEL_ZH = {
     "Dot Min Pixels": "黄点最小面积",
     "Stuck Seconds": "卡住判定(秒)",
     "Resume Wait Seconds": "恢复等待(秒)",
+    # —— 单点挂机任务（MapleSingleSpotTask）——
+    "Return Offset Max Percent": "碰撞偏移归位max(%)",
 }
 
 
@@ -534,7 +538,7 @@ class TaskControlPanel(QWidget):  # 看板任务控制栏容器：两张任务�
         if executor is None:  # 执行器不可用（异常场景）。
             return []  # 返回空，面板只剩日志。
         tasks = []  # 收集结果。
-        for cls in (MapleIdleTask, MaplePatrolTask):  # 目标两个任务类，按挂机、巡逻顺序。
+        for cls in (MapleIdleTask, MaplePatrolTask, MapleSingleSpotTask):  # 目标三个任务类，按挂机、巡逻、单点挂机顺序。
             for candidate in executor.onetime_tasks:  # 遍历已注册的一次性任务。
                 if type(candidate) is cls:  # 精确匹配类，避免 MaplePatrolTask 因继承被 MapleIdleTask 命中。
                     tasks.append(candidate)  # 命中。

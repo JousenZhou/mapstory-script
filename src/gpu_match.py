@@ -9,6 +9,8 @@ try:  # CuPy 为可选依赖，未安装或无 NVIDIA 显卡时整个模块自�
 except Exception:  # 导入失败（未安装）。
     cp = None  # 标记 CuPy 不可用。
 
+TIE_EPS = 1e-4  # 同分容差：得分差不超过此值视为平局，取最靠前的位置，与 OpenCV minMaxLoc 的首个最大值规则对齐。
+
 
 def gpu_available():  # 探测 GPU 匹配是否可用：CuPy 已安装且至少存在一块可用显卡。
     if cp is None:  # CuPy 未安装。
@@ -105,9 +107,15 @@ class _GpuFrameMatch:  # 单帧匹配句柄：持有本帧的显存数据，对�
 
     def best(self, key):  # 取指定模板的最高分与位置，返回 (x, y, score)。
         score = self._score_map(key)  # 计算得分图。
-        pos = int(cp.argmax(score))  # 展平后的最大值下标。
+        flat = score.ravel()  # 展平：下标按行优先，等价于「先上后下、同行先左后右」的遍历顺序。
+        pos = int(cp.argmax(flat))  # 最高分下标。
+        peak = float(flat[pos])  # 最高分。
+        # 同一模板在画面里出现多份像素相同的副本时，数学上各处得分完全相等，但显卡的 float32 舍入
+        # 会让靠后的副本成为严格最大值（实测四份相同副本下 CPU 选第一份、显卡选第二份，位置相差 280 像素）。
+        # OpenCV 的 minMaxLoc 取第一个最大值，这里同样在容差内取最靠前的位置，使平局判定与 CPU 一致。
+        tied = int(cp.argmax(flat >= peak - TIE_EPS))  # 容差内最靠前的下标；无平局时就是 pos 本身。
         width = score.shape[1]  # 得分图宽。
-        return pos % width, pos // width, float(score.ravel()[pos])  # 返回 (x, y, 得分)。
+        return tied % width, tied // width, peak  # 位置取平局判定的结果，得分仍报真实最高分（两者差不超 TIE_EPS）。
 
     def above(self, key, threshold):  # 取指定模板全部不低于阈值的位置，返回 (N, 3) 数组 [x, y, score]。
         score = self._score_map(key).astype(cp.float32)  # 计算得分图。

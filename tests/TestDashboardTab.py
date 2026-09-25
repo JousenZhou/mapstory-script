@@ -107,6 +107,79 @@ class TestDashboardTabWiring(unittest.TestCase):
         finally:
             tab.timer.stop()  # 同样停掉定时器。
 
+    def test_lie_gpu_switch_wired(self):
+        # 测谎栏应有「GPU Match 显卡加速」开关：默认开启，且能从看板配置填值。
+        from qfluentwidgets import SwitchButton
+        from src.dashboard_store import DASHBOARD_DEFAULTS, load_dashboard_config
+        from src.ui.DashboardTab import DashboardTab
+        self.assertTrue(DASHBOARD_DEFAULTS['Lie Detector GPU Match'])  # 看板默认开启显卡加速。
+        tab = DashboardTab()
+        try:
+            self.assertIsInstance(tab.lie_gpu_switch, SwitchButton)  # 与「自动解测谎」同类型的开关控件。
+            tab.load_config()  # 读 configs/Dashboard.json，缺失键由 load_dashboard_config 补默认值。
+            expected = bool(load_dashboard_config().get('Lie Detector GPU Match',
+                                                        DASHBOARD_DEFAULTS['Lie Detector GPU Match']))
+            self.assertEqual(expected, tab.lie_gpu_switch.isChecked())  # 控件状态与配置一致（旧配置文件无该键时为 True）。
+        finally:
+            tab.timer.stop()  # 同样停掉定时器。
+
+    def test_save_persists_lie_gpu_switch(self):
+        # 保存时开关状态要写入共享配置，测谎服务才能热读到（此处不真写盘，只校验组装出的字典）。
+        from unittest.mock import MagicMock, patch
+        from src.ui.DashboardTab import DashboardTab
+        tab = DashboardTab()
+        try:
+            tab.load_config()
+            tab.lie_gpu_switch.setChecked(False)  # 用户关掉显卡加速。
+            with patch('src.ui.DashboardTab.save_dashboard_config', MagicMock()) as save:
+                tab.save()
+            save.assert_called_once()  # 确实落盘一次。
+            self.assertIn('Lie Detector GPU Match', save.call_args[0][0])  # 新键已写入共享配置。
+            self.assertFalse(save.call_args[0][0]['Lie Detector GPU Match'])  # 值与控件状态一致。
+            tab.lie_gpu_switch.setChecked(True)  # 再打开。
+            with patch('src.ui.DashboardTab.save_dashboard_config', MagicMock()) as save2:
+                tab.save()
+            self.assertTrue(save2.call_args[0][0]['Lie Detector GPU Match'])
+        finally:
+            tab.timer.stop()  # 同样停掉定时器。
+
+    def test_auto_login_gpu_switch_wired(self):
+        # 自动登录栏应有「GPU Match 显卡加速」开关：默认开启，且能从看板配置填值。
+        from qfluentwidgets import SwitchButton
+        from src.dashboard_store import DASHBOARD_DEFAULTS, load_dashboard_config
+        from src.ui.DashboardTab import DashboardTab
+        self.assertTrue(DASHBOARD_DEFAULTS['Auto Login GPU Match'])  # 看板默认开启显卡加速。
+        tab = DashboardTab()
+        try:
+            self.assertIsInstance(tab.auto_login_gpu_switch, SwitchButton)  # 与「自动登录」同类型的开关控件。
+            tab.load_config()  # 读 configs/Dashboard.json，缺失键由 load_dashboard_config 补默认值。
+            expected = bool(load_dashboard_config().get('Auto Login GPU Match',
+                                                        DASHBOARD_DEFAULTS['Auto Login GPU Match']))
+            self.assertEqual(expected, tab.auto_login_gpu_switch.isChecked())  # 控件状态与配置一致（旧配置文件无该键时为 True）。
+        finally:
+            tab.timer.stop()  # 同样停掉定时器。
+
+    def test_save_persists_auto_login_gpu_switch(self):
+        # 保存时开关状态要写入共享配置，AutoLoginFlow 构造时才能读到（此处不真写盘，只校验组装出的字典）。
+        from unittest.mock import MagicMock, patch
+        from src.ui.DashboardTab import DashboardTab
+        tab = DashboardTab()
+        try:
+            tab.load_config()
+            tab.auto_login_gpu_switch.setChecked(False)  # 用户关掉显卡加速。
+            with patch('src.ui.DashboardTab.save_dashboard_config', MagicMock()) as save:
+                tab.save()
+            save.assert_called_once()  # 确实落盘一次。
+            self.assertIn('Auto Login GPU Match', save.call_args[0][0])  # 新键已写入共享配置。
+            self.assertFalse(save.call_args[0][0]['Auto Login GPU Match'])  # 值与控件状态一致。
+            self.assertIn('Lie Detector GPU Match', save.call_args[0][0])  # 测谎栏的开关不受影响，两个开关各自独立。
+            tab.auto_login_gpu_switch.setChecked(True)  # 再打开。
+            with patch('src.ui.DashboardTab.save_dashboard_config', MagicMock()) as save2:
+                tab.save()
+            self.assertTrue(save2.call_args[0][0]['Auto Login GPU Match'])
+        finally:
+            tab.timer.stop()  # 同样停掉定时器。
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -3,8 +3,14 @@
 # exe/进程名用无特征名称, 避免被游戏扫描进程识别。
 # 用法: python -m PyInstaller build_exe.spec --clean --noconfirm
 import os
+import sys
 
 from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs, collect_submodules
+
+# 让 spec 解析期能 import 到命名空间包 src (SPECPATH = spec 所在目录 = 仓库根)。
+if SPECPATH not in sys.path:
+    sys.path.insert(0, SPECPATH)
+import src.config as _app_cfg  # 读取注册表, 用于自动派生 importlib 动态加载模块的 hiddenimports。
 
 # 项目资源目录 (i18n/ok_templates/icons/assets) 按 exe 同级相对路径读取,
 # 由 build_exe.ps1 / CI 构建后复制到 exe 同级, 不放进 _internal。
@@ -15,17 +21,24 @@ datas += collect_data_files('onnxocr')
 datas += collect_data_files('qfluentwidgets')
 
 # 任务/页签/全局单例模块仅以字符串出现在 src/config.py, 由 importlib 动态加载,
-# 静态分析扫不到, 必须显式声明; ok 内部采集/交互方式同样按名字实例化, 收集全部子模块。
-hiddenimports = [
+# 静态分析扫不到; 直接从 config.py 注册表派生, config 改了打包自动跟随, 杜绝手维护清单漂移。
+# ok 内部采集/交互方式同样按名字实例化, 收集全部子模块。
+_hidden = [
     'src',
     'src.config',
     'src.globals',
-    'src.tasks.MapleIdleTask',
-    'src.tasks.MaplePatrolTask',
-    'src.ui.DashboardTab',
     'src.dashboard_store',
     'src.gpu_match',
-] + collect_submodules('ok') + collect_submodules('openvino')
+]
+if _app_cfg.config.get('my_app'):  # 全局单例对象模块 (og.my_app)。
+    _hidden.append(_app_cfg.config['my_app'][0])
+for _entry in _app_cfg.config.get('custom_tabs', []):  # 自定义 GUI 页签。
+    _hidden.append(_entry[0])
+for _entry in _app_cfg.config.get('onetime_tasks', []):  # 用户点击触发的一次性任务。
+    _hidden.append(_entry[0])
+for _entry in _app_cfg.config.get('trigger_tasks', []):  # 后台触发任务 (将来新增也不漏)。
+    _hidden.append(_entry[0])
+hiddenimports = _hidden + collect_submodules('ok') + collect_submodules('openvino')
 
 # cupy/ultralytics 为可选加速依赖 (体积大), 运行时自动降级, 不打入包内。
 excludes = [

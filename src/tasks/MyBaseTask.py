@@ -27,6 +27,10 @@ _original_double_spinbox_init = _double_spinbox_module.LabelAndDoubleSpinBox.__i
 
 def _patched_double_spinbox_init(self, config_desc, config, key):  # 包装浮点控件构造函数，按键名调整小数位数。
     _original_double_spinbox_init(self, config_desc, config, key)  # 先走原逻辑创建控件。
+    from src.ui.spin_wheel_guard import disable_wheel_until_focused  # 延迟导入，避免基类模块与 UI 层的导入顺序耦合。
+    spin = getattr(self, "spin_box", None)  # 框架浮点控件内部真正的数字框。
+    if spin is not None:  # 存在才打补丁。
+        disable_wheel_until_focused(spin)  # 框架浮点框也统一：需点击聚焦后滚轮才生效，避免滚动页面误改数值。
     if key in _THREE_DECIMAL_KEYS:  # 位移时长需要 3 位小数。
         self.spin_box.setDecimals(3)  # 显示与输入精度提升到毫秒级。
         self.spin_box.setSingleStep(0.05)  # 步进缩小，方便微调小数。

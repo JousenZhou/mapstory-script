@@ -59,7 +59,7 @@ class MapleIdleTask(MyBaseTask):  # 定义冒险岛挂机任务，继承项目�
 
     def __init__(self, *args, **kwargs):  # 构造函数，先初始化父类再设置任务元数据。
         super().__init__(*args, **kwargs)  # 必须先调用父类构造。
-        self.name = "Maple Idle"  # 任务显示名称。
+        self.name = "单点单方向挂机(原地攻击不停)"  # 任务显示名称。
         self.description = "Single-spot camping: stay in place, single-tap direction key only to turn, keep attacking the nearest monster within attack range until it dies; supports optional periodic reposition moves and turn-around attacks; also shows live vision.  # 任务描述：单点挂机，不持续移动，仅单击换方向，攻击范围内最近怪直到消失，支持定时位移与定时转身攻击；实时推送带标注画面。测谎由独立服务值守，与本任务解耦。"
         self.icon = FluentIcon.FLAG  # 任务图标。
         self._held_key = None  # 当前持续按住的攻击键（近战或常规）；改为实例属性，独立测谎服务暂停任务时可读取并通过 pop_held_keys 释放它。
@@ -74,7 +74,6 @@ class MapleIdleTask(MyBaseTask):  # 定义冒险岛挂机任务，继承项目�
             "Move Back Seconds": 1.0,  # 位移第二段：攻击后停顿 1 秒再反方向（即朝向方向）按住方向键移动的秒数，支持 3 位小数（毫秒级）。
             "Turn Interval": 0.0,  # 每隔 x 秒做一次转身攻击：停止攻击等 1 秒→单击方向键转身→攻击一下→等 0.5 秒→再单击反方向键转身归位，设为 0 表示禁用。
             "Use Gray Scale": True,  # 是否转灰度匹配，对颜色差异更稳定。
-            "GPU Match": True,  # 是否用 NVIDIA 显卡做模板匹配，需安装 cupy，不可用时自动回退 CPU。
             "Frame Interval": 0.05,  # 每帧处理之间的最小间隔秒数，控制检测节奏。
         })
         self.config_description.update({  # 各配置项的帮助文本。
@@ -83,7 +82,6 @@ class MapleIdleTask(MyBaseTask):  # 定义冒险岛挂机任务，继承项目�
             "Move Back Seconds": "Hold seconds for the second leg after attacking once and waiting 1s, moving in the opposite direction of the first leg, supports 3 decimals. 位移第二段：攻击一下停顿 1 秒后再反方向移动的秒数，支持 3 位小数。",
             "Turn Interval": "Every x seconds do a turn-around attack: stop attacking and wait 1s, tap direction key to turn, attack once, wait 0.5s, tap the opposite direction key to turn back; 0 disables it. 每隔 x 秒做一次转身攻击：停止攻击等 1 秒→单击方向键转身→攻击一下→等 0.5 秒→再单击反方向键转身归位，0 禁用。",
             "Use Gray Scale": "Match in grayscale, more robust to color differences. 是否转灰度匹配，对颜色差异更稳定。",
-            "GPU Match": "Run template matching on NVIDIA GPU via CuPy for speed; falls back to CPU automatically when unavailable. 是否用 NVIDIA 显卡加速模板匹配，需安装 cupy，不可用时自动回退 CPU。",
             "Frame Interval": "Minimum seconds between processed frames. 每帧处理之间的最小间隔秒数。",
         })
 
@@ -132,7 +130,7 @@ class MapleIdleTask(MyBaseTask):  # 定义冒险岛挂机任务，继承项目�
                     if self._held_key is not None:  # 先松开持续按住的攻击键，位移期间不攻击。
                         self.send_key_up(self._held_key)  # 松开当前攻击键。
                         self._held_key = None  # 清空按住状态。
-                    self.info_set("Status", "Moving")  # 在 GUI 显示位移状态。
+                    self.info_set("Status", "位移中")  # 在 GUI 显示位移状态。
                     self.sleep(1.0)  # 停止攻击后等待 1 秒再做位移，等攻击后摇结束避免位移被吞。
                     facing_assumed = False  # 本次位移的朝向是否来自假定，假定值不可信需在结束后清空。
                     if facing is None:  # 从未转身过导致朝向未知，先用角色模板匹配探测，失败才假定朝右。
@@ -156,7 +154,7 @@ class MapleIdleTask(MyBaseTask):  # 定义冒险岛挂机任务，继承项目�
                     if self._held_key is not None:  # 先松开持续按住的攻击键，转身期间不攻击。
                         self.send_key_up(self._held_key)  # 松开当前按住的攻击键。
                         self._held_key = None  # 清空按住状态。
-                    self.info_set("Status", "Turning")  # 在 GUI 显示转身状态。
+                    self.info_set("Status", "转身中")  # 在 GUI 显示转身状态。
                     self.sleep(1.0)  # 停止攻击后等待 1 秒再转身，等攻击后摇结束避免转身被吞。
                     facing_assumed = False  # 本次转身的朝向是否来自假定，假定值不可信需在结束后清空。
                     if facing is None:  # 从未转身过导致朝向未知，先用角色模板匹配探测，失败才假定朝右。
@@ -246,13 +244,13 @@ class MapleIdleTask(MyBaseTask):  # 定义冒险岛挂机任务，继承项目�
                     if self._held_key is None:  # 当前没有按住攻击键时才按下，已按住则保持不重复发送。
                         self.send_key_down(want_key)  # 持续按住近战或常规攻击键不放。
                         self._held_key = want_key  # 记录当前按住的键。
-                    self.info_set("Status", "Attacking")  # 在 GUI 显示攻击状态。
+                    self.info_set("Status", "攻击中")  # 在 GUI 显示攻击状态。
                     self.sleep(0.1)  # 按住期间每 0.1 秒重新识别一次校准目标。
                     continue  # 目标消失时自动停止攻击重新扫描。
                 if self._held_key is not None:  # 目标消失时松开持续按住的攻击键。
                     self.send_key_up(self._held_key)  # 松开攻击键。
                     self._held_key = None  # 清空按住状态。
-                self.info_set("Status", "Camping" if character is not None else "Character not found")  # 无目标时原地待命，显示当前状态。
+                self.info_set("Status", "原地待命" if character is not None else "未找到角色")  # 无目标时原地待命，显示当前状态。
                 self.sleep(self.config.get("Frame Interval"))  # 等待一个帧间隔后处理下一帧。
         finally:  # 用户停止任务或异常退出时兜底松键，防止按键卡住。
             if self._held_key is not None:  # 有按住未松的攻击键。
@@ -334,8 +332,7 @@ class MapleIdleTask(MyBaseTask):  # 定义冒险岛挂机任务，继承项目�
         return -1 if getattr(box, "flipped", False) else 1  # 镜像命中=朝左，原始命中=朝右。
 
     def build_gpu_matcher(self, char_name, monster_names):  # 构建 GPU 匹配器并为角色与全部怪物注册原始/镜像模板，不可用时返回 None。
-        if not self.config.get("GPU Match"):  # 配置关闭 GPU 匹配。
-            return None  # 直接用 CPU。
+        # 显卡加速隐藏式启用（不设配置开关）：统一优先 GPU，无显卡/异常时自动降级 CPU。
         try:  # 延迟导入，未安装 cupy 时不影响任务加载。
             from src.gpu_match import GpuTemplateMatcher, gpu_available  # 导入项目 GPU 匹配模块。
             if not gpu_available():  # 无可用 NVIDIA 显卡或 CuPy 未装好。

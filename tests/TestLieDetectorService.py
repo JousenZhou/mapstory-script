@@ -471,20 +471,12 @@ class TestLieDetectorService(unittest.TestCase):
 
     # ------------------------------------------------------------------ 显卡模板匹配加速
 
-    def test_gpu_match_enabled_reads_dashboard_switch(self):
-        # 看板开关控制是否走显卡：未配该键（旧配置文件）默认开启，显式关闭则走 CPU。
-        with patch.object(self.service, "_get_config", return_value={}):
-            self.assertTrue(self.service._gpu_match_enabled())  # 缺键时默认开启。
-        with patch.object(self.service, "_get_config", return_value={'Lie Detector GPU Match': True}):
-            self.assertTrue(self.service._gpu_match_enabled())
-        with patch.object(self.service, "_get_config", return_value={'Lie Detector GPU Match': False}):
-            self.assertFalse(self.service._gpu_match_enabled())  # 用户关掉开关即回退 CPU。
-        self.service._gpu_off = True  # 模拟运行期显卡异常已关闭加速。
-        with patch.object(self.service, "_get_config", return_value={'Lie Detector GPU Match': True}):
-            self.assertFalse(self.service._gpu_match_enabled())  # 本进程内不再重试显卡。
-        self.service._gpu_off = False
-        with patch.object(self.service, "_get_config", side_effect=RuntimeError("boom")):
-            self.assertFalse(self.service._gpu_match_enabled())  # 配置读取异常时保守回退 CPU。
+    def test_gpu_match_enabled_hidden_no_switch(self):
+        # 显卡加速隐藏式启用（不设看板开关）：默认开启，仅运行期异常降级后才关闭。
+        self.assertTrue(self.service._gpu_match_enabled())  # 默认优先走显卡。
+        self.service._gpu_off = True  # 模拟运行期显卡异常已降级。
+        self.assertFalse(self.service._gpu_match_enabled())  # 本进程内不再重试显卡。
+        self.service._gpu_off = False  # 复位供后续用例使用。
 
     def test_gpu_handle_guards(self):
         # 无画面或无待匹配分类时直接返回 None，不去碰显卡。

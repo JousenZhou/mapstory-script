@@ -16,7 +16,9 @@ import threading  # 导入 threading，resize 需等待窗口尺寸稳定，放�
 
 from PySide6.QtCore import QObject, Qt, QStringListModel, Signal
 from PySide6.QtWidgets import QAbstractItemView, QComboBox, QCompleter, QHBoxLayout, QWidget
-from qfluentwidgets import BodyLabel, PushButton, SpinBox  # Fluent 控件：窗口大小输入框与应用按钮。
+from qfluentwidgets import BodyLabel, PushButton  # Fluent 控件：标签与应用按钮。
+
+from src.ui.spin_wheel_guard import SpinBox  # 窗口大小数字框改用滚轮守卫子类：需点击聚焦后滚轮才生效，避免滚动页面误改。
 
 import ok.ui.qt.start.StartTab as _start_tab_module
 from ok.util.logger import Logger  # 框架日志器，记录 resize 结果。

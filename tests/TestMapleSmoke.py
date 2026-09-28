@@ -23,7 +23,7 @@ class TestMapleIdleSmoke(TaskTestCase):
         from src.dashboard_store import DASHBOARD_DEFAULTS  # 看板共享配置默认值。
         for shared_key in DASHBOARD_DEFAULTS:  # 看板共享键不再出现在任务页。
             self.assertNotIn(shared_key, self.task.default_config)
-        for kept in ("Move Interval", "Move Away Seconds", "Move Back Seconds", "Turn Interval", "Use Gray Scale", "GPU Match", "Frame Interval"):
+        for kept in ("Move Interval", "Move Away Seconds", "Move Back Seconds", "Turn Interval", "Use Gray Scale", "Frame Interval"):
             self.assertIn(kept, self.task.default_config)  # 动作节奏类配置保留。
 
     def test_validate_key_name(self):

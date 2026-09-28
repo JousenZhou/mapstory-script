@@ -157,7 +157,7 @@ class TestDashboardTaskPanel(unittest.TestCase):
             self.assertTrue(card.pause_button.isVisibleTo(card))
             self.assertTrue(card.stop_button.isVisibleTo(card))
             text, _color = card._status_text()
-            self.assertIn("Running", text)  # 状态文本含 Running。
+            self.assertIn("运行中", text)  # 状态文本含「运行中」（实时状态拼接在后）。
             card.setExpand(True)  # 展开/收起不报错。
             card.setExpand(False)
         finally:

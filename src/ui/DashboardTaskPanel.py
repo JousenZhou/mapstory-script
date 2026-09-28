@@ -19,10 +19,11 @@ from pathlib import Path  # 日志文件路径对象。
 from PySide6.QtCore import Qt, QTimer  # 定时器与对齐常量。
 from PySide6.QtGui import QFont, QTextCursor  # 日志等宽字体与文本光标移动枚举。
 from PySide6.QtWidgets import (QGridLayout, QHBoxLayout, QTextEdit, QVBoxLayout, QWidget)  # 布局与日志视图控件。
-from qfluentwidgets import (BodyLabel, ComboBox, DoubleSpinBox, ExpandSettingCard, FluentIcon,  # Fluent 控件。
-                            LineEdit, PrimaryPushButton, PushButton, SpinBox, SwitchButton, isDarkTheme)
+from qfluentwidgets import (BodyLabel, ComboBox, ExpandSettingCard, FluentIcon,  # Fluent 控件。
+                            LineEdit, PrimaryPushButton, PushButton, SwitchButton, isDarkTheme)
 
 from ok import Logger, og  # 全局对象与日志器。
+from src.ui.spin_wheel_guard import DoubleSpinBox, SpinBox  # 数字框改用滚轮守卫子类：需点击聚焦后滚轮才生效，避免滚动页面误改数值。
 from ok.core.events import communicate  # 应用事件总线：订阅任务状态与配置校验事件。
 
 from src.tasks.MapleIdleTask import MapleIdleTask  # 挂机任务类，用于按类取实例。
@@ -84,7 +85,6 @@ _CONFIG_LABEL_ZH = {
     "Move Back Seconds": "返回移动(秒)",
     "Turn Interval": "转身间隔(秒)",
     "Use Gray Scale": "灰度匹配",
-    "GPU Match": "显卡加速",
     "Frame Interval": "帧间隔(秒)",
     # —— 巡逻任务（MaplePatrolTask）——
     "Patrol Enabled": "启用巡逻",
@@ -176,11 +176,11 @@ class TaskAccordionCard(ExpandSettingCard):  # 单个任务的手风琴卡片：
         layout.setContentsMargins(0, 0, 0, 0)  # 去边距。
         layout.setSpacing(8)  # 控件间距。
         self.status_label = BodyLabel("")  # 实时状态文本。
-        self.pause_button = PushButton(FluentIcon.PAUSE, self.tr("Pause"))  # 暂停按钮。
+        self.pause_button = PushButton(FluentIcon.PAUSE, "暂停")  # 暂停按钮。
         self.pause_button.clicked.connect(self.pause_clicked)  # 绑定暂停。
-        self.stop_button = PushButton(FluentIcon.CANCEL, self.tr("Stop"))  # 停止按钮。
+        self.stop_button = PushButton(FluentIcon.CANCEL, "停止")  # 停止按钮。
         self.stop_button.clicked.connect(self.stop_clicked)  # 绑定停止。
-        self.start_button = PrimaryPushButton(FluentIcon.PLAY, self.tr("Start"))  # 启动/恢复按钮（主色）。
+        self.start_button = PrimaryPushButton(FluentIcon.PLAY, "启动")  # 启动/恢复按钮（主色）。
         self.start_button.clicked.connect(self.start_clicked)  # 绑定启动。
         layout.addWidget(self.status_label)  # 状态在最左。
         layout.addWidget(self.pause_button)  # 暂停。
@@ -225,8 +225,8 @@ class TaskAccordionCard(ExpandSettingCard):  # 单个任务的手风琴卡片：
         if first_run_alert and not self.task.config.get('_first_run_alert'):  # 需要确认且尚未确认过。
             from qfluentwidgets import Dialog  # 延迟导入对话框。
             dialog = Dialog(_tr('Alert'), _tr(first_run_alert), self.window())  # 构造确认框。
-            dialog.yesButton.setText(_tr('Confirm'))  # 确认按钮文案。
-            dialog.cancelButton.setText(_tr('Cancel'))  # 取消按钮文案。
+            dialog.yesButton.setText("确认")  # 确认按钮文案。
+            dialog.cancelButton.setText("取消")  # 取消按钮文案。
             dialog.setContentCopyable(True)  # 允许复制内容。
             if dialog.exec():  # 用户确认。
                 self.task.config['_first_run_alert'] = first_run_alert  # 记录已确认，下次不再弹。
@@ -254,7 +254,7 @@ class TaskAccordionCard(ExpandSettingCard):  # 单个任务的手风琴卡片：
     def _refresh_buttons(self):  # 按钮可见性规则与框架 TaskCard.update_buttons 一致。
         if self.task.enabled:  # 任务已启用。
             if self.task.paused:  # 暂停中：显示「恢复 + 停止」。
-                self.start_button.setText(self.tr("Resume"))  # 启动按钮变恢复。
+                self.start_button.setText("恢复")  # 启动按钮变恢复。
                 self.start_button.setVisible(True)  # 显示。
                 self.pause_button.setVisible(False)  # 隐藏暂停。
                 self.stop_button.setVisible(True)  # 显示停止。
@@ -267,7 +267,7 @@ class TaskAccordionCard(ExpandSettingCard):  # 单个任务的手风琴卡片：
                 self.pause_button.setVisible(False)  # 隐藏暂停。
                 self.stop_button.setVisible(True)  # 显示停止。
         else:  # 未启用：只显示「启动」。
-            self.start_button.setText(self.tr("Start"))  # 按钮文案复位为启动。
+            self.start_button.setText("启动")  # 按钮文案复位为启动。
             self.start_button.setVisible(True)  # 显示启动。
             self.pause_button.setVisible(False)  # 隐藏暂停。
             self.stop_button.setVisible(False)  # 隐藏停止。
@@ -275,13 +275,13 @@ class TaskAccordionCard(ExpandSettingCard):  # 单个任务的手风琴卡片：
     def _status_text(self):  # 依据任务状态与实时 info 计算状态文本（含运行中任务用 info_set 写入的 Status）。
         if self.task.enabled:  # 已启用。
             if self.task.paused:  # 暂停。
-                return self.tr("Paused"), "#e6a23c"  # 文案 + 琥珀色。
+                return "已暂停", "#e6a23c"  # 文案 + 琥珀色。
             if self.task.running:  # 运行中：附带任务实时状态（如 Attacking / Patrolling right）。
                 live = self.task.info.get("Status") if isinstance(self.task.info, dict) else None  # 读实时状态。
-                text = self.tr("Running") + (f" · {live}" if live else "")  # 拼接实时状态。
+                text = "运行中" + (f" · {live}" if live else "")  # 拼接实时状态。
                 return text, "#67c23a"  # 绿色。
-            return self.tr("Queued"), "#409eff"  # 排队中，蓝色。
-        return self.tr("Stopped"), "#909399"  # 未启动，灰色。
+            return "排队中", "#409eff"  # 排队中，蓝色。
+        return "已停止", "#909399"  # 未启动，灰色。
 
     def _refresh_status(self):  # 状态文本变化时才更新标签与颜色，避免每次轮询都触发重排。
         text, color = self._status_text()  # 计算最新状态。
@@ -320,17 +320,17 @@ class RunLogPanel(QWidget):  # 内嵌运行日志面板：增量读取日志尾�
         bar_layout = QHBoxLayout(toolbar)  # 横向排列。
         bar_layout.setContentsMargins(0, 0, 0, 0)  # 去边距。
         bar_layout.setSpacing(8)  # 间距。
-        bar_layout.addWidget(BodyLabel(self.tr("Run Log")))  # 标题。
+        bar_layout.addWidget(BodyLabel("运行日志"))  # 标题。
         self.show_switch = SwitchButton()  # 日志列表显示开关，默认关闭（列表隐藏）。
-        self.show_switch.setOffText(self.tr("Show Log"))  # 关闭态文案。
-        self.show_switch.setOnText(self.tr("Show Log"))  # 开启态文案，状态由滑块位置区分。
+        self.show_switch.setOffText("显示日志")  # 关闭态文案。
+        self.show_switch.setOnText("显示日志")  # 开启态文案，状态由滑块位置区分。
         self.show_switch.setChecked(False)  # 默认不显示日志列表。
         self.show_switch.checkedChanged.connect(self._toggle_log)  # 切换显示/隐藏。
         bar_layout.addWidget(self.show_switch)  # 开关紧跟标题。
         self.level_combo = ComboBox()  # 级别筛选下拉。
-        self.level_combo.addItems([self.tr("All"), "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])  # 全部 + 各级别。
+        self.level_combo.addItems(["全部", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])  # 全部 + 各级别。
         self.level_combo.currentIndexChanged.connect(self._level_changed)  # 切换级别即重渲染。
-        self.clear_button = PushButton(FluentIcon.DELETE, self.tr("Clear"))  # 清空按钮。
+        self.clear_button = PushButton(FluentIcon.DELETE, "清空")  # 清空按钮。
         self.clear_button.clicked.connect(self._clear)  # 绑定清空。
         bar_layout.addWidget(self.level_combo)  # 下拉。
         bar_layout.addStretch(1)  # 弹性空隙把清空按钮推到右侧。

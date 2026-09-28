@@ -26,7 +26,7 @@ class MaplePatrolTask(MapleIdleTask):  # 定义冒险岛小地图巡逻打怪任
 
     def __init__(self, *args, **kwargs):  # 构造函数，先复用父类全部配置再按巡逻场景裁剪。
         super().__init__(*args, **kwargs)  # 父类构造已填好角色/怪物/攻击等全部配置项与帮助文本。
-        self.name = "Maple Patrol"  # 任务显示名称。
+        self.name = "大平台左右巡逻挂机"  # 任务显示名称。
         self.description = "Minimap patrol with combat: locate the minimap by template and track the character with the yellow dot color, hold the direction key to walk back and forth between the left/right percent boundaries; when a monster enters the attack range, stop and attack the nearest one until it disappears; red vertical lines mark the boundaries in the live vision; character/monster parameters come from the dashboard config; patrol itself can be disabled to keep a watch-only mode that only pushes the live vision. The lie detector is handled by an independent service, decoupled from this task.  # 任务描述：小地图巡逻+打怪，黄点跟踪往返边界，攻击范围内有怪就停下打最近一只，边界用红色竖线标出；角色/怪物参数统一从看板采集，可用开关关闭巡逻只保留监视画面推送。测谎由独立服务值守，与本任务解耦。"
         self.icon = FluentIcon.PLAY  # 任务图标。
         self._held_move_key = None  # 当前持续按住的移动方向键；改为实例属性，独立测谎服务暂停任务时可读取并通过 pop_held_keys 释放它。
@@ -193,7 +193,7 @@ class MaplePatrolTask(MapleIdleTask):  # 定义冒险岛小地图巡逻打怪任
                     continue  # 进入下一帧处理。
                 if not patrol_enabled:  # 监视模式：不巡逻不打怪，直接推送原始帧（测谎标注由独立服务负责绘制，任务不再介入）。
                     og.my_app.update_vision(frame)  # 推送原始画面供 UI 展示。
-                    self.info_set("Status", "Watch only")  # 在 GUI 显示监视状态。
+                    self.info_set("Status", "仅监视")  # 在 GUI 显示监视状态。
                     continue  # 跳过后续全部巡逻与攻击逻辑，循环顶部按 30FPS 节拍等待。
                 facing_due = facing_check and time.time() - last_facing_check >= FACING_CHECK_INTERVAL  # 本轮是否需要用图像校准朝向，提前算好以便把朝向匹配一并提交并发。
                 batch = MatchBatch()  # 本帧并发匹配批次：朝向与小地图匹配始终走 CPU，角色/怪物匹配仅在 GPU 不可用时一并提交。
@@ -311,7 +311,7 @@ class MaplePatrolTask(MapleIdleTask):  # 定义冒险岛小地图巡逻打怪任
                     if self._held_attack_key is None:  # 当前没有按住攻击键时才按下，已按住则保持不重复发送。
                         self.send_key_down(want_key)  # 持续按住近战或常规攻击键不放。
                         self._held_attack_key = want_key  # 记录当前按住的键。
-                    self.info_set("Status", "Attacking")  # 在 GUI 显示攻击状态。
+                    self.info_set("Status", "攻击中")  # 在 GUI 显示攻击状态。
                     self.sleep(0.1)  # 按住期间每 0.1 秒重新识别一次校准目标。
                     continue  # 目标消失时自动停止攻击重新扫描。
                 if self._held_attack_key is not None:  # 目标消失时松开持续按住的攻击键并准备恢复巡逻。
@@ -319,7 +319,7 @@ class MaplePatrolTask(MapleIdleTask):  # 定义冒险岛小地图巡逻打怪任
                     self._held_attack_key = None  # 清空按住状态。
                     patrol_resume_at = time.time() + ATTACK_TO_MOVE_WAIT  # 攻击后摇会吞方向键输入，短暂等待后再恢复移动。
                 if time.time() < patrol_resume_at:  # 攻击刚结束的等待期内只识图不移动。
-                    self.info_set("Status", "Resuming patrol")  # 在 GUI 显示恢复巡逻等待状态。
+                    self.info_set("Status", "恢复巡逻中")  # 在 GUI 显示恢复巡逻等待状态。
                     self.sleep(loop_interval)  # 按固定 30FPS 节拍等待。
                     continue  # 等待期结束后自动恢复巡逻。
                 if minimap is not None:  # 小地图可用时按巡逻方向持续移动。
@@ -329,9 +329,9 @@ class MaplePatrolTask(MapleIdleTask):  # 定义冒险岛小地图巡逻打怪任
                             self.send_key_up(self._held_move_key)  # 松开旧方向键。
                         self.send_key_down(want_key)  # 持续按住新方向键保持移动。
                         self._held_move_key = want_key  # 记录当前按住的键。
-                    self.info_set("Status", "Patrolling right" if direction == 1 else "Patrolling left")  # 在 GUI 显示当前巡逻方向。
+                    self.info_set("Status", "向右巡逻" if direction == 1 else "向左巡逻")  # 在 GUI 显示当前巡逻方向。
                 else:  # 小地图不可用时保持静止等待。
-                    self.info_set("Status", "Minimap not found")  # 在 GUI 显示未找到小地图。
+                    self.info_set("Status", "未找到小地图")  # 在 GUI 显示未找到小地图。
                 self.sleep(loop_interval)  # 按固定 30FPS 节拍等待后处理下一帧。
         finally:  # 用户停止任务或异常退出时兜底松键，防止按键卡住。
             if self._held_attack_key is not None:  # 有按住未松的攻击键。
@@ -409,7 +409,7 @@ class MaplePatrolTask(MapleIdleTask):  # 定义冒险岛小地图巡逻打怪任
         return anchor_x, anchor_time  # 未移动，保留原锚点继续累计卡住时长。
 
     def recover_stuck(self, held_key, direction, resume_wait):  # 卡住恢复：松开当前键，反向短移脱困，等待后翻转巡逻方向。
-        self.info_set("Status", "Stuck, recovering")  # 在 GUI 显示卡住恢复状态。
+        self.info_set("Status", "卡住脱困中")  # 在 GUI 显示卡住恢复状态。
         self.log_warning("Position stuck while holding direction key, reverse escape. 按住方向键但位置停滞，反向脱困。")  # 记录卡住事件供排查。
         self.send_key_up(held_key)  # 松开当前方向键。
         back_key = MOVE_LEFT_KEY if direction == 1 else MOVE_RIGHT_KEY  # 脱困键：卡住方向的反方向。

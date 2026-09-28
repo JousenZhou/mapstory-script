@@ -13,8 +13,8 @@
 # 而重登流程每 0.5 秒轮询一次、还要在【卡住监控】里同帧连查当前与下一步两个模板。
 # 故匹配可改走 CuPy FFT（src/gpu_feature_match.py 的 GpuFeatureMatcher 显式模板路径），
 # 一帧只上传一次显存、只做一次帧变换即可覆盖该分类的全部模板，结果与 CPU 路径等价
-# （同为灰度 TM_CCOEFF_NORMED + minMaxLoc 取最高分）。由看板「GPU Match 显卡加速」开关控制，
-# 无 CuPy/无显卡/运行期异常时自动回退下面的 CPU 路径，行为保持一致。
+# （同为灰度 TM_CCOEFF_NORMED + minMaxLoc 取最高分）。显卡加速隐藏式启用（不设看板开关），
+# 无 CuPy/无显卡/运行期异常时自动降级下面的 CPU 路径，行为保持一致。
 import json  # 解析 COCO 标注文件。
 import os  # 路径拼接与标注文件 mtime 检查。
 import time  # mtime 检查限频，避免每帧 stat。
@@ -32,7 +32,7 @@ class DesktopTemplateMatcher:  # 在原生像素尺度下对全桌面截图做�
         Args:
             coco_json: coco_annotations.json 路径（与框架 template_matching.coco_feature_json 一致）。
             logger: 日志器，None 时静默。
-            gpu_enabled: 看板「GPU Match 显卡加速」开关，True 时匹配优先走显卡（CuPy FFT），否则全程 CPU。
+            gpu_enabled: 是否优先走显卡（CuPy FFT），默认 True；显卡加速已改为隐藏式启用，该参数仅供测试构造纯 CPU 参考实现。
         """
         self._coco_json = coco_json  # 标注文件路径。
         self._logger = logger  # 日志器。
@@ -40,7 +40,7 @@ class DesktopTemplateMatcher:  # 在原生像素尺度下对全桌面截图做�
         self._templates = {}  # 分类名 -> [原生尺寸 BGR 模板, ...]，按需裁剪缓存。
         self._mtime = None  # 上次加载时标注文件的 mtime，变化则失效缓存重新解析。
         self._last_check = 0.0  # 上次 mtime 检查时间戳，用于限频。
-        self._gpu_enabled = bool(gpu_enabled)  # 看板显卡加速开关：关闭时全走 CPU 原生匹配。
+        self._gpu_enabled = bool(gpu_enabled)  # 显卡加速开关（内部）：默认开启，仅测试可显式关闭构造纯 CPU 参考实现。
         self._gpu = None  # 显卡匹配器（GpuFeatureMatcher），首次需要时创建。
         self._gpu_off = False  # 显卡运行期异常后的永久关闭标志，本次运行内不再重试，避免每帧失败刷日志。
 
@@ -118,8 +118,8 @@ class DesktopTemplateMatcher:  # 在原生像素尺度下对全桌面截图做�
         self._ensure_index()  # 确保已解析过标注（首次调用才真正 stat 与读盘）。
         return self._mtime  # 返回上次加载时的标注文件 mtime，None 表示标注不可读。
 
-    def _gpu_ready(self):  # 显卡加速是否可用：看板开关开启、未因异常关闭、且本机有可用显卡。
-        if not self._gpu_enabled or self._gpu_off:  # 开关关闭，或已被运行期异常永久关闭。
+    def _gpu_ready(self):  # 显卡加速是否可用：未被运行期异常降级、且本机有可用显卡。
+        if not self._gpu_enabled or self._gpu_off:  # 被显式关闭（仅测试），或已被运行期异常永久降级。
             return False  # 走 CPU。
         try:  # 显卡探测与匹配器创建都可能因驱动/显存异常失败。
             from src.gpu_feature_match import GpuFeatureMatcher, gpu_match_available  # 延迟导入：没装 CuPy 时不影响 CPU 路径。

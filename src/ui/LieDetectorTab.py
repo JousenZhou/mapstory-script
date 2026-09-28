@@ -343,36 +343,36 @@ class LieDetectorTab(CustomTab):  # 测谎检验页签：上传录像验证谎�
         control = QWidget()
         layout = QHBoxLayout(control)
         layout.setContentsMargins(0, 0, 0, 0)
-        self.pick_button = PushButton(FluentIcon.FOLDER, "Select Video 选择视频")
+        self.pick_button = PushButton(FluentIcon.FOLDER, "选择视频")
         self.pick_button.clicked.connect(self.pick_video)
-        self.path_label = BodyLabel("No video selected 未选择视频")
+        self.path_label = BodyLabel("未选择视频")
         self.path_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        self.start_button = PushButton(FluentIcon.PLAY, "Start 开始")
+        self.start_button = PushButton(FluentIcon.PLAY, "开始")
         self.start_button.clicked.connect(self.start)
-        self.stop_button = PushButton(FluentIcon.PAUSE, "Stop 停止")
+        self.stop_button = PushButton(FluentIcon.PAUSE, "停止")
         self.stop_button.clicked.connect(self.stop)
         self.stop_button.setEnabled(False)
-        self.fps_label = BodyLabel("Mode 模式: full-speed 全速不限速")
-        self.algorithm_label = BodyLabel("Algorithm 算法: --")
+        self.fps_label = BodyLabel("模式: 全速不限速")
+        self.algorithm_label = BodyLabel("算法: --")
         layout.addWidget(self.pick_button)
         layout.addWidget(self.path_label, 1)
         layout.addWidget(self.start_button)
         layout.addWidget(self.stop_button)
         layout.addWidget(self.fps_label)
         layout.addWidget(self.algorithm_label)
-        self.add_card("Video & Run 视频与运行", control)
+        self.add_card("视频与运行", control)
 
         if not INFERENCE_AVAILABLE:  # 依赖缺失时禁用运行并提示安装命令。
             self.start_button.setEnabled(False)
-            self.path_label.setText("OpenCV DIS optical flow not available 缺少 DIS 稠密光流，请升级 opencv-python")
+            self.path_label.setText("缺少 DIS 稠密光流，请升级 opencv-python")
 
         self.image_label = VisionLabel()
-        self.add_card("Process Vision 运算过程画面", self.image_label, stretch=1)
+        self.add_card("运算过程画面", self.image_label, stretch=1)
 
         self.log_edit = TextEdit()
         self.log_edit.setReadOnly(True)
         self.log_edit.setFixedHeight(160)
-        self.add_card("Run Log 运行日志", self.log_edit)
+        self.add_card("运行日志", self.log_edit)
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh)
@@ -387,7 +387,7 @@ class LieDetectorTab(CustomTab):  # 测谎检验页签：上传录像验证谎�
 
     def pick_video(self):  # 弹出文件对话框选择录像。
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select lie detector video 选择谎言检测器录像", "",
+            self, "选择谎言检测器录像", "",
             "Video Files (*.mp4 *.avi *.mkv *.mov *.webm)")
         if path:
             self.video_path = path
@@ -417,7 +417,7 @@ class LieDetectorTab(CustomTab):  # 测谎检验页签：上传录像验证谎�
             self.worker.stop()
 
     def on_algorithm_ready(self, summary):  # 算法就绪后更新徽标与日志。
-        self.algorithm_label.setText(f"算法 Algorithm: DIS光流+粒子滤波")
+        self.algorithm_label.setText(f"算法: DIS光流+粒子滤波")
         self.append_log(f"algorithm ready 算法就绪: {summary}")
 
     def on_finished(self, ok, message):  # 工作线程结束：恢复按钮并输出结论。

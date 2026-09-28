@@ -17,7 +17,7 @@ class MapleSingleSpotTask(MaplePatrolTask):  # 定义冒险岛单点挂机任务
 
     def __init__(self, *args, **kwargs):  # 构造函数，先复用父类全部配置再按单点场景裁剪。
         super().__init__(*args, **kwargs)  # 父类构造已填好小地图、黄点、Del 浮动等全部配置项与帮助文本。
-        self.name = "Maple Single Spot"  # 任务显示名称。
+        self.name = "单点挂机(自动回原点)"  # 任务显示名称。
         self.description = "Single-spot camping with minimap home anchor: record the character's horizontal minimap position percent at start, turn left/right in place and attack monsters within attack range without walking; monster collision may push the character away, so return to the recorded spot when no monster exists or the offset exceeds Return Offset Max Percent; character/monster parameters come from the dashboard config; live vision marks the home position and tolerance band. The lie detector is handled by an independent service, decoupled from this task.  # 任务描述：单点挂机，开始时记录角色在小地图的横向坐标比例，原地左右转向攻击不巡逻走动；怪物碰撞导致偏移超过阈值或场上无怪时自动走回记录点归位；角色/怪物参数统一从看板采集；实时画面标出归位点与容差带。测谎由独立服务值守，与本任务解耦。"
         self.icon = FluentIcon.PAUSE  # 任务图标。
         for key in ("Patrol Enabled", "Patrol Left Percent", "Patrol Right Percent",  # 巡逻边界与总开关由单点归位逻辑取代，裁剪掉对应配置。
@@ -163,7 +163,7 @@ class MapleSingleSpotTask(MaplePatrolTask):  # 定义冒险岛单点挂机任务
                 percent = (dot[0] - rect[0]) / rect[2] * 100 if dot is not None else None  # 黄点当前横向位置百分比，检测不到为 None。
                 offset = abs(percent - home_percent) if percent is not None else None  # 相对初始坐标比例的横向偏移（百分比）。
                 if percent is not None:  # 黄点就绪时在 GUI 状态区显示当前位置与偏移。
-                    self.info_set("Position", f"{percent:.1f}% (home {home_percent:.1f}%, offset {offset:.1f}%)")  # 当前位置、归位点与偏移量。
+                    self.info_set("Position", f"{percent:.1f}% (归位 {home_percent:.1f}%, 偏移 {offset:.1f}%)")  # 当前位置、归位点与偏移量。
                 gm = None  # 本帧 GPU 匹配句柄，默认不可用。
                 if gpu is not None:  # GPU 匹配器可用时才尝试批量匹配。
                     try:  # 上传/计算可能因显存等原因异常。
@@ -236,7 +236,7 @@ class MapleSingleSpotTask(MaplePatrolTask):  # 定义冒险岛单点挂机任务
                     if self._held_attack_key is None:  # 当前没有按住攻击键时才按下，已按住则保持不重复发送。
                         self.send_key_down(want_key)  # 持续按住近战或常规攻击键不放。
                         self._held_attack_key = want_key  # 记录当前按住的键。
-                    self.info_set("Status", "Attacking")  # 在 GUI 显示攻击状态。
+                    self.info_set("Status", "攻击中")  # 在 GUI 显示攻击状态。
                     self.sleep(0.1)  # 按住期间每 0.1 秒重新识别一次校准目标。
                     continue  # 目标消失时自动停止攻击重新扫描。
                 if percent is None:  # 小地图或黄点丢失时无法判定偏移：松开移动键原地待命，攻击照常。
@@ -244,7 +244,7 @@ class MapleSingleSpotTask(MaplePatrolTask):  # 定义冒险岛单点挂机任务
                         self.send_key_up(self._held_move_key)  # 松开方向键，位置未知时走动有越界风险。
                         self._held_move_key = None  # 清空按住状态。
                     anchor_x = None  # 黄点丢失时卡住锚点失效。
-                    self.info_set("Status", "Minimap/dot lost")  # 在 GUI 显示定位丢失状态。
+                    self.info_set("Status", "小地图/黄点丢失")  # 在 GUI 显示定位丢失状态。
                     self.sleep(loop_interval)  # 按固定 30FPS 节拍等待。
                     continue  # 定位恢复后自动继续归位判定。
                 if not monsters and not returning:  # 场上没有怪物且不在归位中时立即进入归位，把碰撞偏移拉回记录点。
@@ -265,7 +265,7 @@ class MapleSingleSpotTask(MaplePatrolTask):  # 定义冒险岛单点挂机任务
                             self._held_move_key = None  # 恢复过程已松键。
                             anchor_x, anchor_time = None, time.time()  # 脱困后重置卡住锚点。
                         if time.time() < self._attack_released_at + ATTACK_TO_MOVE_WAIT:  # 攻击刚结束的等待期内只识图不移动，方向键会被攻击后摇吞掉。
-                            self.info_set("Status", "Return wait")  # 在 GUI 显示归位等待状态。
+                            self.info_set("Status", "归位等待")  # 在 GUI 显示归位等待状态。
                             self.sleep(loop_interval)  # 按固定 30FPS 节拍等待。
                             continue  # 等待期结束后自动恢复走动。
                         want_key = "right" if walk_direction == 1 else "left"  # 归位方向需要的方向键。
@@ -275,14 +275,14 @@ class MapleSingleSpotTask(MaplePatrolTask):  # 定义冒险岛单点挂机任务
                             self.send_key_down(want_key)  # 持续按住新方向键走回归位点。
                             self._held_move_key = want_key  # 记录当前按住的键。
                             facing = walk_direction  # 走动时朝向与移动方向一致，供攻击换向判定直接使用。
-                        self.info_set("Status", f"Returning {'right' if walk_direction == 1 else 'left'} (offset {offset:.1f}%)")  # 在 GUI 显示归位方向与当前偏移。
+                        self.info_set("Status", f"{'向右' if walk_direction == 1 else '向左'}归位 (偏移 {offset:.1f}%)")  # 在 GUI 显示归位方向与当前偏移。
                         self.sleep(loop_interval)  # 按固定 30FPS 节拍等待后处理下一帧。
                         continue  # 归位中不进入原地待命分支。
                 if self._held_move_key is not None:  # 归位完成或无需归位时松开移动键，绝不带着移动键待命。
                     self.send_key_up(self._held_move_key)  # 松开方向键。
                     self._held_move_key = None  # 清空按住状态。
                 anchor_x = None  # 停止走动后卡住锚点失效。
-                self.info_set("Status", "Camping" if character is not None else "Character not found")  # 无怪或偏移在容差内时原地待命，显示当前状态。
+                self.info_set("Status", "原地待命" if character is not None else "未找到角色")  # 无怪或偏移在容差内时原地待命，显示当前状态。
                 self.sleep(loop_interval)  # 按固定 30FPS 节拍等待后处理下一帧。
         finally:  # 用户停止任务或异常退出时兜底松键，防止按键卡住。
             if self._held_attack_key is not None:  # 有按住未松的攻击键。

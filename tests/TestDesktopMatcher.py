@@ -108,9 +108,9 @@ class TestDesktopMatcherCpu(DesktopMatcherCase):
     """不依赖显卡的部分：开关语义、CPU 原生匹配行为与辅助方法。"""
 
     def test_default_switch_is_on(self):
-        # 看板旧配置没有该键时默认开启显卡加速，与 DASHBOARD_DEFAULTS 保持一致。
+        # 显卡加速隐藏式启用：不传参默认开启，仅测试可显式关闭构造纯 CPU 参考实现。
         self.assertTrue(self.make()._gpu_enabled)  # 默认开启。
-        self.assertFalse(self.make(gpu_enabled=False)._gpu_enabled)  # 显式关闭。
+        self.assertFalse(self.make(gpu_enabled=False)._gpu_enabled)  # 显式关闭（仅测试）。
 
     def test_switch_off_never_creates_gpu_matcher(self):
         # 开关关闭时完全不碰显卡：结果正常，且显卡匹配器始终为 None。
@@ -294,14 +294,12 @@ class TestDesktopMatcherOnGpu(DesktopMatcherCase):
         self.assertIsNone(matcher.best_box(matcher.frame(solid_frame), '纯色', 0.75))  # 因此也不会产生点击。
 
 
-class TestAutoLoginFlowGpuSwitch(DesktopMatcherCase):
-    """看板开关到匹配器的传递链路：AutoLoginFlow 从配置里读 Auto Login GPU Match。"""
+class TestAutoLoginFlowGpuHidden(DesktopMatcherCase):
+    """显卡加速隐藏式启用：AutoLoginFlow 不再读看板开关，构造的匹配器默认启用显卡。"""
 
-    def test_flow_reads_dashboard_switch(self):
+    def test_flow_always_enables_gpu(self):
         from src.autologin.flow import AutoLoginFlow  # 延迟导入：flow 依赖 pynput。
-        self.assertFalse(AutoLoginFlow(self.coco, {'Auto Login GPU Match': False}, self.logger)._matcher._gpu_enabled)  # 关闭。
-        self.assertTrue(AutoLoginFlow(self.coco, {'Auto Login GPU Match': True}, self.logger)._matcher._gpu_enabled)  # 开启。
-        self.assertTrue(AutoLoginFlow(self.coco, {}, self.logger)._matcher._gpu_enabled)  # 旧配置无该键时默认开启。
+        self.assertTrue(AutoLoginFlow(self.coco, {}, self.logger)._matcher._gpu_enabled)  # 无配置也默认开启。
         self.assertTrue(AutoLoginFlow(self.coco, None, self.logger)._matcher._gpu_enabled)  # 配置缺失也不崩，按默认开启。
 
 

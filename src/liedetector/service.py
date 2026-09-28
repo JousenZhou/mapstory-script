@@ -22,8 +22,8 @@
 #     若期间【测谎触发】连续丢失超过容忍帧数（弹窗已关）则放弃本局；延迟结束后重新取帧，不用陈旧画面开题。
 #   - 显卡加速：【测谎触发】【掉线】【掉线2】【掉线确定】的全屏模板匹配可走 CuPy FFT（src/gpu_feature_match.py），
 #     结果与框架 CPU 匹配（TM_CCOEFF_NORMED + 灰度 + limit=1）等价，但一帧只上传一次显存、只做一次帧变换即可
-#     覆盖全部模板，空闲监控 15FPS 的匹配耗时从数十毫秒降到几毫秒。由看板「GPU Match 显卡加速」开关控制，
-#     无 CuPy/无显卡/标注带 mask/运行期异常时自动回退 CPU 路径，行为保持一致。
+#     覆盖全部模板，空闲监控 15FPS 的匹配耗时从数十毫秒降到几毫秒。加速隐藏式启用（不设开关），
+#     无 CuPy/无显卡/标注带 mask/运行期异常时自动降级 CPU 路径，行为保持一致。
 import math  # 导入标准库 math，用于解测谎鼠标追踪的步长计算。
 import os  # 导入标准库 os，用于测谎报警音频的路径解析与存在性检查。
 import threading  # 导入标准库 threading，用于后台守护线程。
@@ -610,13 +610,8 @@ class LieDetectorService:  # 独立测谎监控服务：后台守护线程值守
 
     # ------------------------------------------------------------------ 显卡模板匹配加速
 
-    def _gpu_match_enabled(self):  # 看板「GPU Match 显卡加速」开关：默认开启，运行期显卡异常后本进程内不再重试。
-        if self._gpu_off:  # 已被异常关闭。
-            return False  # 直接走 CPU，不再反复初始化显卡。
-        try:  # 配置读取异常不能影响值守。
-            return bool(self._get_config().get('Lie Detector GPU Match', True))  # 看板未配该键（旧配置文件）时默认开启。
-        except Exception:  # 配置读取失败。
-            return False  # 保守回退 CPU。
+    def _gpu_match_enabled(self):  # 显卡加速隐藏式启用（不设开关）：默认优先走显卡，运行期显卡异常后本进程内降级 CPU 不再重试。
+        return not self._gpu_off  # 仅受运行期异常降级标志控制，无显卡环境由 _gpu_handle 探测后静默走 CPU。
 
     def _gpu_handle(self, frame, names):  # 取本帧的显卡匹配句柄：首次创建匹配器、模板或画面尺寸变化时自动重建，不可用时返回 None。
         if frame is None or not names:  # 无画面或无待匹配分类。
@@ -640,7 +635,7 @@ class LieDetectorService:  # 独立测谎监控服务：后台守护线程值守
 
     def _disable_gpu(self, error):  # 运行期显卡异常：本进程内关闭加速并回退 CPU，避免每帧重复失败刷日志。
         if not self._gpu_off:  # 首次失败才记日志。
-            logger.warning(f"Lie service GPU match failed, fallback to CPU: {error}. 测谎服务显卡匹配失败，已回退 CPU 模板匹配（可关闭看板「GPU Match」开关消除本提示）。")
+            logger.warning(f"Lie service GPU match failed, fallback to CPU: {error}. 测谎服务显卡匹配失败，已自动降级 CPU 模板匹配。")
         self._gpu_off = True  # 置位关闭标志。
         self._gpu = None  # 释放匹配器持有的显存。
 

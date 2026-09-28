@@ -6,7 +6,7 @@
 #     【服务区/频道/开始游戏】用游戏窗口当前选择框采集 + 窗口内相对坐标点击（模板即窗口客户区尺度，
 #     避免把客户区模板匹配到全桌面再点绝对坐标所产生的向上偏移）。
 #   - 模板匹配用原生尺度匹配器（DesktopTemplateMatcher），绕开框架按帧宽缩放；全桌面帧很大，
-#     匹配可走显卡（CuPy FFT），由看板「GPU Match 显卡加速」开关控制，异常时自动回退 CPU。
+#     匹配统一优先走显卡（CuPy FFT，隐藏式启用不设开关），无显卡/异常时自动降级 CPU。
 #   - 每步点击后监控画面推进，卡住超过 STUCK_RETRY_SECONDS 秒自动重试点击；仍不推进才判失败。
 #   - 频道/开始游戏等启动器按钮需双击才生效：步骤带连点次数，命中后在同一位置快速连点（默认双击）。
 import time  # 导入 time，用于超时计时与步骤间等待。
@@ -41,15 +41,14 @@ class AutoLoginFlow:
 
         Args:
             coco_json: 模板标注文件路径（ok_templates/coco_annotations.json），用于原生尺度匹配。
-            config: 看板配置 dict，包含 Auto Login Server Feature / Channel Feature / Threshold / Step Timeout / GPU Match。
+            config: 看板配置 dict，包含 Auto Login Server Feature / Channel Feature / Threshold / Step Timeout。
             logger: 日志器，None 时静默。
             game_frame_fn: 游戏窗口当前选择框采集回调（返回客户区 BGR 帧），窗口后端使用；None 时退回桌面采集。
             window_click_fn: 窗口内相对坐标点击回调 (x, y, clicks)；clicks 为需要在同一位置连点的次数。
                 连点必须由回调一次完成（窗口置前只做一次），否则每次点击都重新置前会把两次按下拉开到
                 250ms 以上，启动器只当成两次单击。None 时退回桌面绝对点击。
         """
-        gpu_enabled = bool((config or {}).get("Auto Login GPU Match", True))  # 看板显卡加速开关，旧配置无该键时默认开启。
-        self._matcher = DesktopTemplateMatcher(coco_json, logger, gpu_enabled=gpu_enabled)  # 原生尺度匹配器：绕开框架按帧宽缩放，可选显卡加速。
+        self._matcher = DesktopTemplateMatcher(coco_json, logger)  # 原生尺度匹配器：绕开框架按帧宽缩放，显卡加速隐藏式启用（无显卡/异常时自动降级 CPU）。
         self._config = config
         self._logger = logger
         self._mouse = MouseController()  # pynput 鼠标控制器，复用实例避免反复创建。

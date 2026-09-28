@@ -11,10 +11,11 @@ import cv2  # 导入 OpenCV，用于画面转换与区域裁剪预览。
 from PySide6.QtCore import QPoint, Qt, QTimer  # 导入 Qt 定时器、对齐常量与坐标点（多选菜单弹出定位）。
 from PySide6.QtGui import QImage, QPixmap  # 导入图像对象，用于把画面矩阵转成图片显示。
 from PySide6.QtWidgets import (QFormLayout, QGridLayout, QHBoxLayout, QLabel, QSizePolicy, QWidget)  # 导入布局与控件。
-from qfluentwidgets import (BodyLabel, CheckBox, DoubleSpinBox, EditableComboBox, FluentIcon, LineEdit,  # 导入 Fluent 控件。
-                            MenuAnimationType, PrimaryPushButton, PushButton, RoundMenu, SpinBox, SwitchButton)
+from qfluentwidgets import (BodyLabel, CheckBox, EditableComboBox, FluentIcon, LineEdit,  # 导入 Fluent 控件。
+                            MenuAnimationType, PrimaryPushButton, PushButton, RoundMenu, SwitchButton)
 
 from ok import og  # 导入全局对象，用于读取任务线程推送的画面与截图设备。
+from src.ui.spin_wheel_guard import DoubleSpinBox, SpinBox  # 数字框改用滚轮守卫子类：需点击聚焦后滚轮才生效，避免滚动页面误改数值。
 from ok.gui.widget.CustomTab import CustomTab  # 导入自定义页签基类。
 
 from src.dashboard_store import (DASHBOARD_DEFAULTS, SUPER_CHANNEL, SUPER_CHARACTER, SUPER_LIE_REGION,  # 看板共享配置存取层。
@@ -45,7 +46,7 @@ class VisionLabel(QLabel):  # 定义自适应缩放的画面标签。
         self.setMinimumSize(640, 360)  # 设置最小显示尺寸。
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)  # 允许随窗口拉伸。
         self.setStyleSheet("background-color: #1e1e1e;")  # 深色背景更接近游戏画面观感。
-        self.setText("No frame. 暂无画面")  # 初始占位文字。
+        self.setText("暂无画面")  # 初始占位文字。
 
     def set_frame(self, frame):  # 接收一帧新的 BGR 画面矩阵并按当前标签尺寸缩放显示。
         self.source = frame  # 保存原始画面供窗口缩放时重绘（任务推送的是 draw_overlay 的副本，不会被覆写）。
@@ -165,10 +166,10 @@ class DashboardTab(CustomTab):  # 定义看板页签：视图区 + 测谎栏 + �
 
         # —— 第 1 栏：视图区（原 Vision 页签迁移至此）——
         self.image_label = VisionLabel()  # 创建画面显示标签。
-        self.add_card("Realtime Vision 实时识图画面", self.image_label, stretch=1)  # 画面标签占满剩余空间。
+        self.add_card("实时识图画面", self.image_label, stretch=1)  # 画面标签占满剩余空间。
 
         # —— 第 2 栏：任务控制栏（原【任务】页的挂机/巡逻脚本迁移至此）——
-        self.add_card("Tasks 任务控制", TaskControlPanel())  # 手风琴任务卡 + 紧凑配置网格 + 内嵌运行日志面板。
+        self.add_card("任务控制", TaskControlPanel())  # 手风琴任务卡 + 紧凑配置网格 + 内嵌运行日志面板。
 
         # —— 第 3 栏：测谎栏 ——
         lie_widget = QWidget()  # 测谎栏容器。
@@ -176,7 +177,7 @@ class DashboardTab(CustomTab):  # 定义看板页签：视图区 + 测谎栏 + �
         lie_layout.setContentsMargins(0, 0, 0, 0)
         self.region_preview = VisionLabel()  # 测谎区域裁剪预览：时刻采集所选标注区域画面。
         self.region_preview.setMinimumSize(320, 180)  # 预览尺寸略小于主画面。
-        self.region_preview.setText("No region selected. 未选择测谎区域")  # 初始占位文字。
+        self.region_preview.setText("未选择测谎区域")  # 初始占位文字。
         lie_form = QFormLayout()  # 测谎参数表单。
         self.lie_auto_switch = SwitchButton()  # 测谎总开关：开启后全部任务运行时值守并自动解测谎。
         self.lie_region_combo = EditableComboBox()  # 测谎区域标注选择（类别为「测谎」的标注单选，可手工输入未标注名）。
@@ -191,17 +192,15 @@ class DashboardTab(CustomTab):  # 定义看板页签：视图区 + 测谎栏 + �
         self.lie_delay_spin.setSuffix(" s")  # 单位后缀，一眼看出是秒数。
         self.lie_alarm_edit = LineEdit()  # 报警音频路径输入框。
         self.lie_alarm_edit.setPlaceholderText("alarm.mp3")  # 占位提示。
-        self.lie_gpu_switch = SwitchButton()  # 测谎显卡加速开关：开启后【测谎触发】【掉线/掉线2/掉线确定】模板匹配走显卡，无显卡时自动回退 CPU。
-        lie_form.addRow("Auto Solve 自动解测谎", self.lie_auto_switch)
-        lie_form.addRow("Region 测谎区域标注", self.lie_region_combo)
-        lie_form.addRow("Trigger 测谎触发标注", self.lie_trigger_combo)
-        lie_form.addRow("Threshold 匹配阈值", self.lie_threshold_spin)
-        lie_form.addRow("Trigger Delay 触发延迟", self.lie_delay_spin)
-        lie_form.addRow("GPU Match 显卡加速", self.lie_gpu_switch)
-        lie_form.addRow("Alarm Sound 报警音频", self.lie_alarm_edit)
+        lie_form.addRow("自动解测谎", self.lie_auto_switch)
+        lie_form.addRow("测谎区域标注", self.lie_region_combo)
+        lie_form.addRow("测谎触发标注", self.lie_trigger_combo)
+        lie_form.addRow("匹配阈值", self.lie_threshold_spin)
+        lie_form.addRow("触发延迟", self.lie_delay_spin)
+        lie_form.addRow("报警音频", self.lie_alarm_edit)
         lie_layout.addWidget(self.region_preview, 1)  # 预览占左半。
         lie_layout.addLayout(lie_form, 1)  # 表单占右半。
-        self.add_card("Lie Detector 测谎", lie_widget)
+        self.add_card("测谎", lie_widget)
 
         # —— 第 3.5 栏：自动登录栏 ——
         login_widget = QWidget()  # 自动登录栏容器。
@@ -210,12 +209,10 @@ class DashboardTab(CustomTab):  # 定义看板页签：视图区 + 测谎栏 + �
         self.auto_login_switch = SwitchButton()  # 自动登录开关：开启后检测到掉线模板自动执行重登流程。
         self.server_combo = EditableComboBox()  # 服务区标注选择（类别为「服务区」的标注单选，如蓝蜗牛）。
         self.channel_combo = EditableComboBox()  # 频道标注选择（类别为「频道」的标注单选，如频道1）。
-        self.auto_login_gpu_switch = SwitchButton()  # 自动登录显卡加速开关：开启后重登流程的原生尺度模板匹配走显卡，无显卡时自动回退 CPU。
-        login_form.addRow("Auto Login 自动登录", self.auto_login_switch)
-        login_form.addRow("Server 服务区", self.server_combo)
-        login_form.addRow("Channel 频道", self.channel_combo)
-        login_form.addRow("GPU Match 显卡加速", self.auto_login_gpu_switch)
-        self.add_card("Auto Login 自动登录", login_widget)
+        login_form.addRow("自动登录", self.auto_login_switch)
+        login_form.addRow("服务区", self.server_combo)
+        login_form.addRow("频道", self.channel_combo)
+        self.add_card("自动登录", login_widget)
 
         # —— 第 4 栏：角色栏 ——
         char_widget = QWidget()  # 角色栏容器。
@@ -242,23 +239,23 @@ class DashboardTab(CustomTab):  # 定义看板页签：视图区 + 测谎栏 + �
         self.del_interval_spin = DoubleSpinBox()  # 自动按 Del 键间隔（秒），0 禁用。
         self.del_interval_spin.setRange(0.0, 86400.0)
         self.del_interval_spin.setDecimals(1)
-        char_grid.addWidget(BodyLabel("Feature 角色特征"), 0, 0)
+        char_grid.addWidget(BodyLabel("角色特征"), 0, 0)
         char_grid.addWidget(self.char_feature_combo, 0, 1)
-        char_grid.addWidget(BodyLabel("Threshold 阈值"), 0, 2)
+        char_grid.addWidget(BodyLabel("匹配阈值"), 0, 2)
         char_grid.addWidget(self.char_threshold_spin, 0, 3)
-        char_grid.addWidget(BodyLabel("Facing Left 左朝向"), 1, 0)
+        char_grid.addWidget(BodyLabel("左朝向"), 1, 0)
         char_grid.addWidget(self.char_facing_left_combo, 1, 1)
-        char_grid.addWidget(BodyLabel("Facing Right 右朝向"), 1, 2)
+        char_grid.addWidget(BodyLabel("右朝向"), 1, 2)
         char_grid.addWidget(self.char_facing_right_combo, 1, 3)
-        char_grid.addWidget(BodyLabel("Attack Key 攻击键"), 2, 0)
+        char_grid.addWidget(BodyLabel("攻击键"), 2, 0)
         char_grid.addWidget(self.attack_key_edit, 2, 1)
-        char_grid.addWidget(BodyLabel("Melee Key 近战键"), 2, 2)
+        char_grid.addWidget(BodyLabel("近战键"), 2, 2)
         char_grid.addWidget(self.melee_key_edit, 2, 3)
-        char_grid.addWidget(BodyLabel("Melee Distance 近战距离"), 3, 0)
+        char_grid.addWidget(BodyLabel("近战距离"), 3, 0)
         char_grid.addWidget(self.melee_distance_spin, 3, 1)
-        char_grid.addWidget(BodyLabel("Del Interval Del间隔"), 3, 2)
+        char_grid.addWidget(BodyLabel("Del间隔"), 3, 2)
         char_grid.addWidget(self.del_interval_spin, 3, 3)
-        char_grid.addWidget(BodyLabel("Range X 攻击范围X"), 4, 0)
+        char_grid.addWidget(BodyLabel("攻击范围X"), 4, 0)
         range_x = QWidget()  # X 范围两个输入框拼一行。
         range_x_layout = QHBoxLayout(range_x)
         range_x_layout.setContentsMargins(0, 0, 0, 0)
@@ -266,7 +263,7 @@ class DashboardTab(CustomTab):  # 定义看板页签：视图区 + 测谎栏 + �
         range_x_layout.addWidget(QLabel("~"))
         range_x_layout.addWidget(self.range_x_max_spin)
         char_grid.addWidget(range_x, 4, 1)
-        char_grid.addWidget(BodyLabel("Range Y 攻击范围Y"), 4, 2)
+        char_grid.addWidget(BodyLabel("攻击范围Y"), 4, 2)
         range_y = QWidget()  # Y 范围两个输入框拼一行。
         range_y_layout = QHBoxLayout(range_y)
         range_y_layout.setContentsMargins(0, 0, 0, 0)
@@ -274,7 +271,7 @@ class DashboardTab(CustomTab):  # 定义看板页签：视图区 + 测谎栏 + �
         range_y_layout.addWidget(QLabel("~"))
         range_y_layout.addWidget(self.range_y_max_spin)
         char_grid.addWidget(range_y, 4, 3)
-        self.add_card("Character 角色配置", char_widget)
+        self.add_card("角色配置", char_widget)
 
         # —— 第 5 栏：怪物栏 ——
         monster_widget = QWidget()  # 怪物栏容器。
@@ -287,25 +284,25 @@ class DashboardTab(CustomTab):  # 定义看板页签：视图区 + 测谎栏 + �
         self.monster_mirror_spin = DoubleSpinBox()  # 怪物镜像匹配阈值。
         self.monster_mirror_spin.setRange(0.01, 1.0)
         self.monster_mirror_spin.setSingleStep(0.05)
-        monster_form.addRow("Features 怪物特征(多选)", self.monster_multi)
-        monster_form.addRow("Threshold 阈值", self.monster_threshold_spin)
-        monster_form.addRow("Mirror Threshold 镜像阈值", self.monster_mirror_spin)
-        self.add_card("Monster 怪物配置", monster_widget)
+        monster_form.addRow("怪物特征(多选)", self.monster_multi)
+        monster_form.addRow("匹配阈值", self.monster_threshold_spin)
+        monster_form.addRow("镜像阈值", self.monster_mirror_spin)
+        self.add_card("怪物配置", monster_widget)
 
         # —— 底部操作行：刷新标注 + 保存 ——
         action_widget = QWidget()
         action_layout = QHBoxLayout(action_widget)
         action_layout.setContentsMargins(0, 0, 0, 0)
-        self.refresh_button = PushButton(FluentIcon.SYNC, "Refresh Annotations 刷新标注")  # 重新读取模板页标注填充下拉框。
+        self.refresh_button = PushButton(FluentIcon.SYNC, "刷新标注")  # 重新读取模板页标注填充下拉框。
         self.refresh_button.clicked.connect(self.reload_annotations)
-        self.save_button = PrimaryPushButton(FluentIcon.SAVE, "Save 保存")  # 校验并保存看板共享配置。
+        self.save_button = PrimaryPushButton(FluentIcon.SAVE, "保存")  # 校验并保存看板共享配置。
         self.save_button.clicked.connect(self.save)
         self.status_label = BodyLabel("")  # 保存结果提示。
         self.status_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         action_layout.addWidget(self.refresh_button)
         action_layout.addWidget(self.save_button)
         action_layout.addWidget(self.status_label, 1)
-        self.add_card("Actions 操作", action_widget)
+        self.add_card("操作", action_widget)
 
         self.reload_annotations()  # 首次加载标注选项。
         self.load_config()  # 首次加载看板共享配置填充表单。
@@ -328,7 +325,6 @@ class DashboardTab(CustomTab):  # 定义看板页签：视图区 + 测谎栏 + �
         self.lie_threshold_spin.setValue(float(data.get('Lie Detector Threshold') or 0.75))
         self.lie_delay_spin.setValue(float(data.get('Lie Detector Trigger Delay', DASHBOARD_DEFAULTS['Lie Detector Trigger Delay'])))
         self.lie_alarm_edit.setText(str(data.get('Lie Alarm Sound') or ''))
-        self.lie_gpu_switch.setChecked(bool(data.get('Lie Detector GPU Match', DASHBOARD_DEFAULTS['Lie Detector GPU Match'])))
         self._set_combo_value(self.char_feature_combo, str(data.get('Character Feature') or ''))
         self.char_threshold_spin.setValue(float(data.get('Character Threshold') or 0.8))
         self._set_combo_value(self.char_facing_left_combo, str(data.get('Character Facing Left Feature') or ''))
@@ -347,7 +343,6 @@ class DashboardTab(CustomTab):  # 定义看板页签：视图区 + 测谎栏 + �
         self.auto_login_switch.setChecked(bool(data.get('Auto Login Enabled')))
         self._set_combo_value(self.server_combo, str(data.get('Auto Login Server Feature') or ''))
         self._set_combo_value(self.channel_combo, str(data.get('Auto Login Channel Feature') or ''))
-        self.auto_login_gpu_switch.setChecked(bool(data.get('Auto Login GPU Match', DASHBOARD_DEFAULTS['Auto Login GPU Match'])))
 
     def _set_combo_value(self, combo, value):  # 把配置值设到下拉框，选项不存在时补充进去保证不丢用户配置。
         value = str(value or '')  # 统一转字符串。
@@ -378,11 +373,11 @@ class DashboardTab(CustomTab):  # 定义看板页签：视图区 + 测谎栏 + �
         self.monster_multi.set_options(sorted((annotations.get(SUPER_MONSTER) or {}).keys()))  # 怪物多选按「怪物」类别刷新可选项，已选值保留。
 
     def save(self):  # 校验并保存看板共享配置到 configs/Dashboard.json。
-        for label, key_edit in (("Attack Key 攻击键", self.attack_key_edit),  # 按键类字段必须与框架按键校验规则一致。
-                                ("Melee Key 近战键", self.melee_key_edit)):
+        for label, key_edit in (("攻击键", self.attack_key_edit),  # 按键类字段必须与框架按键校验规则一致。
+                                ("近战键", self.melee_key_edit)):
             value = key_edit.text().strip()  # 取按键文本。
             if value and not validate_key_name(value):  # 非空且不在键盘按键名单内。
-                self.status_label.setText(f"Invalid key {value}. 按键 {value} 不存在，请重新填写。")  # 阻止保存并提示。
+                self.status_label.setText(f"按键 {value} 不存在，请重新填写。")  # 阻止保存并提示。
                 return  # 中止保存。
         data = {  # 收集全部共享配置项。
             'Lie Detector Auto Solve': bool(self.lie_auto_switch.isChecked()),
@@ -391,7 +386,6 @@ class DashboardTab(CustomTab):  # 定义看板页签：视图区 + 测谎栏 + �
             'Lie Detector Threshold': round(float(self.lie_threshold_spin.value()), 2),
             'Lie Detector Trigger Delay': round(float(self.lie_delay_spin.value()), 1),
             'Lie Alarm Sound': self.lie_alarm_edit.text().strip(),
-            'Lie Detector GPU Match': bool(self.lie_gpu_switch.isChecked()),
             'Character Feature': self._combo_value(self.char_feature_combo),
             'Character Threshold': round(float(self.char_threshold_spin.value()), 2),
             'Character Facing Left Feature': self._combo_value(self.char_facing_left_combo),
@@ -412,13 +406,12 @@ class DashboardTab(CustomTab):  # 定义看板页签：视图区 + 测谎栏 + �
             'Auto Login Channel Feature': self._combo_value(self.channel_combo),
             'Auto Login Threshold': float(DASHBOARD_DEFAULTS.get('Auto Login Threshold', 0.75)),
             'Auto Login Step Timeout': float(DASHBOARD_DEFAULTS.get('Auto Login Step Timeout', 30.0)),
-            'Auto Login GPU Match': bool(self.auto_login_gpu_switch.isChecked()),
         }
         save_dashboard_config(data)  # 落盘，任务下次启动时采集生效。
         lie_service = getattr(og.my_app, 'lie_service', None) if og.my_app is not None else None  # 取独立测谎监控服务（由 Globals 持有）。
         if lie_service is not None:  # 服务已就绪时通知它立即重读配置。
             lie_service.reload_config()  # 测谎参数热更新，无需重启任务或等待轮询间隔。
-        self.status_label.setText("Saved. Lie detector config applies immediately; task config on next start. 已保存，测谎配置立即生效，任务配置下次启动时生效。")  # 提示保存成功。
+        self.status_label.setText("已保存，测谎配置立即生效，任务配置下次启动时生效。")  # 提示保存成功。
         self.logger.info('dashboard shared config saved 看板共享配置已保存')  # 记录日志供排查。
 
     # ------------------------------------------------------------------ 画面刷新
@@ -436,7 +429,7 @@ class DashboardTab(CustomTab):  # 定义看板页签：视图区 + 测谎栏 + �
         if frame is None:  # 仍无画面时显示占位提示。
             self._last_frame = None  # 清空缓存帧。
             self._rendered_frame, self._rendered_region = None, None  # 清空渲染记录，下一帧拿到画面时必须重新渲染。
-            self.image_label.clear_frame("No frame, please connect a window and start the task. 暂无画面，请先连接游戏窗口并启动任务。")  # 提示用户操作步骤。
+            self.image_label.clear_frame("暂无画面，请先连接游戏窗口并启动任务。")  # 提示用户操作步骤。
             return  # 结束本次刷新。
         self._last_frame = frame  # 缓存供区域裁剪预览。
         region_name = self._combo_value(self.lie_region_combo)  # 当前选择的测谎区域分类名。
@@ -449,7 +442,7 @@ class DashboardTab(CustomTab):  # 定义看板页签：视图区 + 测谎栏 + �
     def refresh_region_preview(self, frame, region_name=None):  # 按所选测谎区域标注从当前画面裁剪预览，坐标按画面分辨率等比缩放。
         region_name = self._combo_value(self.lie_region_combo) if region_name is None else region_name  # 未传入时自行读取当前选择。
         if not region_name:  # 未选择区域时显示占位。
-            self.region_preview.clear_frame("No region selected. 未选择测谎区域")  # 占位提示。
+            self.region_preview.clear_frame("未选择测谎区域")  # 占位提示。
             return  # 结束。
         try:  # 标注文件读取异常时不能拖垮刷新。
             info = (load_annotations_by_supercategory().get(SUPER_LIE_REGION) or {}).get(region_name)  # 取标注坐标与源图尺寸。
@@ -457,7 +450,7 @@ class DashboardTab(CustomTab):  # 定义看板页签：视图区 + 测谎栏 + �
             self.logger.warning(f'read annotation failed: {e}')  # 记录日志。
             info = None  # 按缺失处理。
         if info is None:  # 所选分类名没有「测谎」类别标注。
-            self.region_preview.clear_frame(f"Annotation not found: {region_name}. 未找到标注：{region_name}")  # 提示去模板页标注。
+            self.region_preview.clear_frame(f"未找到标注：{region_name}")  # 提示去模板页标注。
             return  # 结束。
         height, width = frame.shape[:2]  # 当前画面尺寸。
         src_w = info.get('img_w') or width  # 标注源图宽，缺失时按当前画面不缩放。
@@ -471,7 +464,7 @@ class DashboardTab(CustomTab):  # 定义看板页签：视图区 + 测谎栏 + �
         y = max(0, min(y, height - 1))  # 防越界。
         crop = frame[y:min(y + h, height), x:min(x + w, width)]  # 裁剪区域画面。
         if crop.size == 0:  # 区域完全在画面外。
-            self.region_preview.clear_frame(f"Region out of frame. 区域超出画面：{region_name}")  # 提示。
+            self.region_preview.clear_frame(f"区域超出画面：{region_name}")  # 提示。
             return  # 结束。
         self.region_preview.set_frame(crop)  # 显示裁剪预览，同样由标签自行预缩放。
 

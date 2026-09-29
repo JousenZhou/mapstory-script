@@ -16,7 +16,7 @@ RETURN_DONE_RATIO = 0.5  # 归位滞回系数：偏移回落到最大值的一�
 class MapleSingleSpotTask(MaplePatrolTask):  # 定义冒险岛单点挂机任务，继承巡逻任务复用小地图与攻击能力。
 
     def __init__(self, *args, **kwargs):  # 构造函数，先复用父类全部配置再按单点场景裁剪。
-        super().__init__(*args, **kwargs)  # 父类构造已填好小地图、黄点、Del 浮动等全部配置项与帮助文本。
+        super().__init__(*args, **kwargs)  # 父类构造已填好小地图、黄点等全部配置项与帮助文本。
         self.name = "单点挂机(自动回原点)"  # 任务显示名称。
         self.description = "Single-spot camping with minimap home anchor: record the character's horizontal minimap position percent at start, turn left/right in place and attack monsters within attack range without walking; monster collision may push the character away, so return to the recorded spot when no monster exists or the offset exceeds Return Offset Max Percent; character/monster parameters come from the dashboard config; live vision marks the home position and tolerance band. The lie detector is handled by an independent service, decoupled from this task.  # 任务描述：单点挂机，开始时记录角色在小地图的横向坐标比例，原地左右转向攻击不巡逻走动；怪物碰撞导致偏移超过阈值或场上无怪时自动走回记录点归位；角色/怪物参数统一从看板采集；实时画面标出归位点与容差带。测谎由独立服务值守，与本任务解耦。"
         self.icon = FluentIcon.PAUSE  # 任务图标。
@@ -96,10 +96,8 @@ class MapleSingleSpotTask(MaplePatrolTask):  # 定义冒险岛单点挂机任务
         melee_distance = float(self.config.get("Melee Distance") or 0)  # 读取近战距离（像素），横向距离绝对值不超过该值用近战键。
         attack_x_min, attack_x_max = sorted((int(self.config.get("Attack Range X Min")), int(self.config.get("Attack Range X Max"))))  # 读取攻击区域左右边界（符号化像素），填反时自动交换。
         attack_y_min, attack_y_max = sorted((int(self.config.get("Attack Range Y Min")), int(self.config.get("Attack Range Y Max"))))  # 读取攻击区域上下边界（符号化像素），填反时自动交换。
-        del_interval = float(self.config.get("Del Key Interval") or 0)  # 读取自动按 Del 键的基础间隔秒数，0 表示禁用。
-        del_variance = float(self.config.get("Del Key Interval Variance") or 0)  # 读取 Del 间隔的随机浮动量，0 表示固定间隔。
+        del_interval = float(self.config.get("Del Key Interval") or 0)  # 读取自动按 Del 键的间隔秒数，0 表示禁用。
         last_del_time = time.time()  # 上次按 Del 键的时间，从任务启动开始计时。
-        next_del_interval = self.next_del_interval(del_interval, del_variance)  # 首段间隔也带随机浮动，方法复用父类。
         minimap_threshold = float(self.config.get("Minimap Threshold"))  # 读取小地图匹配阈值。
         char_threshold = self.config.get("Character Threshold")  # 读取角色匹配阈值，朝向校准沿用同一阈值。
         hue_min, hue_max = sorted((int(self.config.get("Dot Hue Min")), int(self.config.get("Dot Hue Max"))))  # 读取黄点色相范围，填反时自动交换。
@@ -131,10 +129,9 @@ class MapleSingleSpotTask(MaplePatrolTask):  # 定义冒险岛单点挂机任务
                 if wait > 0:  # 未到下一帧时点时先等待，sleep 同时承担用户停止检查。
                     self.sleep(wait)  # 补齐帧间隔。
                 loop_start = time.time()  # 记录本轮起点供下轮计算。
-                if del_interval > 0 and time.time() - last_del_time >= next_del_interval:  # 到达本次随机间隔时自动按一下 Del 键。
+                if del_interval > 0 and time.time() - last_del_time >= del_interval:  # 到达固定间隔时自动按一下 Del 键。
                     last_del_time = time.time()  # 重置计时。
                     self.send_key("delete", down_time=0.05)  # 短按一下 Del 键。
-                    next_del_interval = self.next_del_interval(del_interval, del_variance)  # 重新随机下一段间隔，避免固定节奏。
                 frame = self.next_frame()  # 取最新一帧画面并清除旧帧。
                 if frame is None:  # 取不到画面时等待下一帧时点再重试。
                     self.sleep(loop_interval)  # 按固定 30FPS 节拍等待。

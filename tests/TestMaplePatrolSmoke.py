@@ -26,8 +26,10 @@ class TestMaplePatrolSmoke(TaskTestCase):
         for shared_key in DASHBOARD_DEFAULTS:  # 看板三栏共享键（含测谎六键与朝向模板）不再出现在任务页。
             self.assertNotIn(shared_key, self.task.default_config)
             self.assertNotIn(shared_key, self.task.config_description)
-        for kept in ("Patrol Enabled", "Patrol Left Percent", "Patrol Right Percent", "Minimap Feature", "Del Key Interval Variance"):
+        for kept in ("Patrol Enabled", "Patrol Left Percent", "Patrol Right Percent", "Minimap Feature"):
             self.assertIn(kept, self.task.default_config)
+        self.assertNotIn("Del Key Interval Variance", self.task.default_config)  # Del 间隔浮动功能已移除。
+        self.assertNotIn("Del Key Interval Variance", self.task.config_description)  # 对应帮助文本同步移除。
 
     def test_validate_config(self):
         self.assertIsNone(self.task.validate_config("Attack Key", "a"))  # 按键校验已搬到看板，任务侧不再拦截。

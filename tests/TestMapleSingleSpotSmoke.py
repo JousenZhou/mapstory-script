@@ -26,8 +26,10 @@ class TestMapleSingleSpotSmoke(TaskTestCase):
         for shared_key in DASHBOARD_DEFAULTS:  # 看板三栏共享键（含测谎六键与朝向模板）不再出现在任务页。
             self.assertNotIn(shared_key, self.task.default_config)
             self.assertNotIn(shared_key, self.task.config_description)
-        for kept in ("Minimap Feature", "Minimap Threshold", "Map Rect", "Dot Hue Min", "Dot Hue Max", "Dot Min Pixels", "Del Key Interval Variance"):
+        for kept in ("Minimap Feature", "Minimap Threshold", "Map Rect", "Dot Hue Min", "Dot Hue Max", "Dot Min Pixels"):
             self.assertIn(kept, self.task.default_config)
+        self.assertNotIn("Del Key Interval Variance", self.task.default_config)  # Del 间隔浮动功能已移除。
+        self.assertFalse(hasattr(self.task, "next_del_interval"))  # 浮动间隔生成方法随之删除。
         self.assertEqual(5.0, self.task.default_config["Return Offset Max Percent"])  # 碰撞偏移归位max 默认 5%。
         self.assertIn("Return Offset Max Percent", self.task.config_description)  # 新配置项有帮助文本。
 

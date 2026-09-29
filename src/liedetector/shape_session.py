@@ -19,6 +19,7 @@ from typing import Callable, Optional  # 类型标注：可选的日志回调。
 import cv2  # OpenCV：DIS 光流档位常量。
 import numpy as np  # 数值计算：随机数发生器与坐标数组。
 
+from src.liedetector.gpu_shape_backend import numpy_backend, require_gpu_backend  # 打分后端探测：有 N 卡走 CuPy，没有/关闭则 NumPy。
 from src.liedetector.shape_tracking import (  # 算法内核，纯计算无 I/O。
     DenseTemporalAligner,  # 多 lag 稠密光流时序残差对齐器。
     ParticleShapeTracker,  # 6 维状态粒子跟踪器。
@@ -38,22 +39,62 @@ SOURCE_PREDICTION = "prediction"  # 证据不足，仅靠粒子运动预测外�
 SOURCE_SCENE_ENDED = "scene-ended"  # 场景结束（切场景或出现结算文字）。
 SOURCE_INTERPOLATED = "interpolated"  # Pass 2 回看插值回填的帧。
 
+# 精度档预设：把「低/中等/高/极高」映射到一组跟踪参数。GPU 只决定打分走 cupy 还是 numpy，
+# 精度档由用户显式选择；无 N 卡（或运行期降级）时 high/ultra 会被 _resolve_scoring_backend 门控回落到 medium。
+PRECISION_TIER_KEYS = ("low", "medium", "high", "ultra")  # 合法精度档 key，顺序即由低到高。
+PRECISION_TIER_DEFAULT = "high"  # 默认精度档：GPU 机直接生效，CPU 机运行时回落 medium。
+PRECISION_TIERS = {  # 各档参数：dataclass 默认值即 medium 档，故 medium 应用时为空操作。
+    "low": {  # 低：弱机保底，降分辨率到 256 并压缩粒子/对照/粗扫，最省 CPU。
+        "dis_preset": cv2.DISOPTICAL_FLOW_PRESET_FAST,
+        "temporal_lags": (1, 2),
+        "particle_count": 180,
+        "control_count": 90,
+        "global_proposals": 250,
+        "max_process_side": 256.0,
+    },
+    "medium": {  # 中等：旧 CPU 实时档（30fps 逐帧处理基线）。
+        "dis_preset": cv2.DISOPTICAL_FLOW_PRESET_FAST,
+        "temporal_lags": (1, 2),
+        "particle_count": 280,
+        "control_count": 130,
+        "global_proposals": 400,
+        "max_process_side": 320.0,
+    },
+    "high": {  # 高：上一轮 GPU 精度档，DIS 恢复 MEDIUM + 第三个 lag，边界证据更锐利。
+        "dis_preset": cv2.DISOPTICAL_FLOW_PRESET_MEDIUM,
+        "temporal_lags": (1, 2, 4),
+        "particle_count": 420,
+        "control_count": 260,
+        "global_proposals": 1200,
+        "max_process_side": 320.0,
+    },
+    "ultra": {  # 极高：在高基础上加大粒子/对照/粗扫（打分在 GPU 上近乎免费），不升分辨率（320≡400 无收益且 DIS 成本随分辨率上升）。
+        "dis_preset": cv2.DISOPTICAL_FLOW_PRESET_MEDIUM,
+        "temporal_lags": (1, 2, 4),
+        "particle_count": 700,
+        "control_count": 420,
+        "global_proposals": 2000,
+        "max_process_side": 320.0,
+    },
+}
+
 
 @dataclass
 class ShapeTrackParams:
-    """一局跟踪的全部参数。默认值 = 实时档（目标 30fps 逐帧处理）。
+    """一局跟踪的全部参数。默认值 = 「中等」精度档（目标 30fps 逐帧处理）。
 
     本项目不新增任何任务配置项，参数一律以模块常量形式集中在这里。
-    实时档相对旧「精度档 A」的差异：粒子 420→280、重定位改为两级粗到细（粗扫 400 候选）并限频，
-    对照组 520→260；识别精度经合成帧回归验证无明显下降。
+    精度由 precision_tier 显式选择（低/中等/高/极高，见 PRECISION_TIERS）：GPU 只决定打分走
+    cupy 还是 numpy，精度档由用户选定；无 N 卡时 high/ultra 会被门控回落到 medium。
+    dataclass 默认值即 medium 档，_apply_precision_tier 只覆盖仍停在默认值的字段，尊重调用方显式自定义。
     """
 
     process_scale: float = 0.5  # 处理尺度上限：先把裁剪区域缩小再算，坐标输出时换算回全尺度。
     max_process_side: float = 320.0  # 处理分辨率上限（最长边像素）：大区域自动降低实际 scale；320 档实测三个参考视频跟踪结果与 400 档完全一致。
-    dis_preset: int = cv2.DISOPTICAL_FLOW_PRESET_FAST  # DIS 光流精度档位（实时档用 FAST，实测 9.1ms→≈5ms，证据图质量下降可忽略）。
-    temporal_lags: tuple[int, ...] = (1, 2)  # 时序残差使用的时间基线（实时档只留 2 个，光流次数 3→2）。
+    dis_preset: int = cv2.DISOPTICAL_FLOW_PRESET_FAST  # DIS 光流精度档位（medium 档用 FAST；high/ultra 由档位升到 MEDIUM）。
+    temporal_lags: tuple[int, ...] = (1, 2)  # 时序残差使用的时间基线（medium 档 2 个；high/ultra 升到 (1,2,4)）。
     play_height_ratio: float = 1.0  # 有效高度比例。偏离脚本的 0.89：页签处理的是裁出的图形区域，内部没有 UI 需要排除。
-    particle_count: int = 280  # 粒子数量（实时档）。
+    particle_count: int = 280  # 粒子数量（medium 档）。
     global_proposals: int = 400  # 重定位第一级粗扫候选数（两级粗到细，替代旧版 2400 一次性打分）。
     control_count: int = 130  # 对照组数量：只需中位数/ MAD 两个鲁棒统计量，130 足够稳定（实测跟踪结果与 260 一致，耗时减半）。
     coarse_top: int = 30  # 粗扫后进入精扫的 top-K 邻域数。
@@ -64,6 +105,8 @@ class ShapeTrackParams:
     max_correction_ratio: float = 0.24  # 单帧证据修正上限（相对形状尺寸的比例），超限整体回滚。
     max_speed_ratio: float = 0.16  # 单帧中心移动速度上限（相对形状尺寸的比例）。
     random_seed: int = 20260902  # 随机种子，保证同一局录像结果可复现。
+    gpu_scoring: bool = True  # 打分后端开关：True 时探测 CuPy + N 卡，可用则打分跑显卡，否则自动回落 NumPy（双编译结构）。仅决定打分后端，不改精度档。
+    precision_tier: str = PRECISION_TIER_DEFAULT  # 精度档 key（low/medium/high/ultra）：由 GUI 精度下拉选定，无 N 卡时 high/ultra 运行时回落 medium。
 
     @property
     def max_gap_frames(self) -> int:
@@ -105,7 +148,9 @@ class ShapeTrackSession:
     def __post_init__(self) -> None:
         """构造内部组件与状态；dataclass 的 __init__ 之后自动调用。"""
 
-        self.aligner = DenseTemporalAligner(  # 建时序残差对齐器。
+        self.backend = None  # 本局打分后端（CuPy 或 NumPy），创建跟踪器时注入。
+        self._resolve_scoring_backend()  # 先装配打分后端：显卡可用时同步恢复精度档参数（含 DIS 档位/时间基线），对齐器据此创建。
+        self.aligner = DenseTemporalAligner(  # 建时序残差对齐器（用已按后端恢复精度档的参数）。
             self.params.temporal_lags,  # 时间基线。
             self.params.play_height_ratio,  # 有效高度比例。
             self.params.dis_preset,  # DIS 精度档位。
@@ -128,6 +173,31 @@ class ShapeTrackSession:
 
         if self.logger is not None:  # 调用方注册了日志回调。
             self.logger(message)  # 转发消息。
+
+    def _resolve_scoring_backend(self) -> None:
+        """装配打分后端并按精度档设参：GPU 只决定打分走 cupy/numpy，精度档由 precision_tier 显式决定。
+
+        无 N 卡（或运行期永久降级）时 high/ultra 门控回落到 medium，避免 CPU 机负担不起高精度档；
+        这里用真实 backend 判定（含降级），是权威 clamp，GUI 侧的后端显示仅为最佳努力。
+        """
+
+        backend = require_gpu_backend() if self.params.gpu_scoring else numpy_backend()  # 开关关闭时显式走 NumPy。
+        tier = self.params.precision_tier if self.params.precision_tier in PRECISION_TIERS else PRECISION_TIER_DEFAULT  # 非法档位回退默认。
+        if not backend.is_gpu and tier in ("high", "ultra"):  # CPU 机禁用高/极高。
+            tier = "medium"  # 回落中等（旧 CPU 实时档）。
+        self.params.precision_tier = tier  # 记录生效档位。
+        self._apply_precision_tier(tier)  # 按档位设参（仅覆盖仍停在默认值的字段）。
+        self.backend = backend  # 记录本局后端，创建跟踪器时注入。
+        self._log(f"SHAPE backend={backend.name} tier={tier} particles={self.params.particle_count} controls={self.params.control_count} dis_preset={self.params.dis_preset} lags={self.params.temporal_lags} 打分后端与精度档已装配")  # 日志记录后端、生效档位与关键参数。
+
+    def _apply_precision_tier(self, tier: str) -> None:
+        """把 PRECISION_TIERS[tier] 应用到 params：仅覆盖仍等于 dataclass 默认值的字段，尊重调用方显式自定义。"""
+
+        preset = PRECISION_TIERS.get(tier) or PRECISION_TIERS[PRECISION_TIER_DEFAULT]  # 取档位参数，非法档位回退默认。
+        defaults = ShapeTrackParams.__dataclass_fields__  # 各字段的 dataclass 默认值。
+        for name, value in preset.items():  # 逐参数应用。
+            if getattr(self.params, name) == defaults[name].default:  # 该字段仍停在默认值（调用方未显式自定义）。
+                setattr(self.params, name, value)  # 升到目标档位值。
 
     def reset(self, region_w: int, region_h: int) -> None:
         """区域位移或尺寸变化时重置整局状态。
@@ -219,6 +289,7 @@ class ShapeTrackSession:
                 coarse_top=self.params.coarse_top,  # 精扫 top-K 邻域数。
                 refine_per_top=self.params.refine_per_top,  # 每邻域精扫候选数。
                 relocation_cooldown=self.params.relocation_cooldown_frames,  # 重定位限频间隔。
+                backend=self.backend,  # 打分后端（CuPy 或 NumPy）。
             )
             source = SOURCE_COLOR  # 本帧来源为白色强测量。
             self.last_color_frame = self.frame_index  # 记录测到颜色的帧号。

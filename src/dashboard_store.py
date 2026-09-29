@@ -31,7 +31,9 @@ DASHBOARD_DEFAULTS = {  # 看板共享配置默认值：键名与任务原配置
     'Lie Detector Region Feature': '测谎坐标框',  # 测谎区域标注：类别为「测谎」的标注分类名，直接采集坐标作为解测谎输入区域。
     'Lie Detector Trigger Feature': '测谎触发',  # 测谎触发标注：类别为「测谎触发」的标注分类名，画面匹配到即触发解测谎。
     'Lie Detector Threshold': 0.75,  # 测谎触发匹配阈值，越高越严格。
+    'Lie Detector Precision': 'high',  # 解测谎精度档（low/medium/high/ultra）：GPU 默认高，无 N 卡时 high/ultra 运行时回落 medium。
     'Lie Detector Trigger Delay': 5.0,  # 匹配到测谎触发后延迟多少秒才开始解测谎（等弹窗完全展开、图形动画起势），0 表示立即解题。
+    'Lie Detector Abort Key': '',  # 解测谎急停按键（键盘按键名，如 f8）：敲击即中止本次解测谎并把「自动解测谎」开关同步关掉，留空不启用（不装全局键盘监听）。
     'Lie Alarm Sound': 'alarm.mp3',  # 测谎报警音频（支持 wav/mp3，相对路径相对项目根目录），留空不报警。
     # —— 角色栏 ——
     'Character Feature': '角色名',  # 角色标注分类名。
@@ -103,6 +105,14 @@ def save_dashboard_config(data):  # 保存看板共享配置，写失败记日�
         logger.error(f'save dashboard config failed: {e}')
 
 
+def config_fingerprint():  # 取看板配置文件指纹（mtime_ns+size），文件不可读时返回 None：看板按它侦测服务端/外部写回，自动回填 UI 保持一致。
+    try:
+        stat = os.stat(DASHBOARD_CONFIG_FILE)  # 只读文件元数据，比整文件读取便宜得多。
+        return stat.st_mtime_ns, stat.st_size  # 修改时间与大小共同构成指纹，写回后必定变化。
+    except OSError:  # 文件不存在或不可读。
+        return None  # 返回空指纹，调用方据此跳过回填。
+
+
 def load_annotations_by_supercategory():  # 按类别（supercategory）读取模板页标注，返回 {类别: {分类名: 标注信息}}。
     # 标注信息为 {'x','y','w','h','img_w','img_h'}：坐标为标注图源图尺寸，
     # 使用时需按 当前画面尺寸/源图尺寸 等比缩放到实际游戏画面。
@@ -123,6 +133,10 @@ def _coco_fingerprint():  # 取标注文件指纹（修改时间与大小），�
         return stat.st_mtime_ns, stat.st_size  # 修改时间与大小共同构成指纹，重新标注后必定变化。
     except OSError:  # 文件不存在或不可读。
         return None  # 返回空指纹，调用方不写缓存。
+
+
+def coco_fingerprint():  # 对外暴露标注文件指纹（mtime_ns+size）：看板按它侦测标注增删改，自动刷新下拉选项，无需再点「刷新标注」。
+    return _coco_fingerprint()
 
 
 def _parse_annotations():  # 读盘并解析模板页标注文件，返回 {类别: {分类名: 标注信息}}。

@@ -31,7 +31,7 @@ class TestLieDetectorService(unittest.TestCase):
     # ------------------------------------------------------------------ 配置解析
 
     def test_read_config_parses_and_trims(self):
-        # 从看板配置读出六元组：开关、触发名、坐标框名、阈值、触发延迟、报警音频，字符串两端空格要清掉。
+        # 从看板配置读出七元组：开关、触发名、坐标框名、阈值、触发延迟、报警音频、精度档，字符串两端空格要清掉。
         fake = {
             "Lie Detector Auto Solve": True,
             "Lie Detector Trigger Feature": "  测谎触发  ",
@@ -39,38 +39,52 @@ class TestLieDetectorService(unittest.TestCase):
             "Lie Detector Threshold": "0.8",  # 字符串阈值应转成浮点。
             "Lie Detector Trigger Delay": "3.5",  # 字符串延迟同样应转成浮点。
             "Lie Alarm Sound": "  alarm.mp3 ",
+            "Lie Detector Precision": "  ultra  ",  # 精度档字符串两端空格也要清掉。
         }
         with patch.object(self.service, "_get_config", return_value=fake):
-            auto, trigger, region, threshold, trigger_delay, alarm = self.service._read_config()
+            auto, trigger, region, threshold, trigger_delay, alarm, precision = self.service._read_config()
         self.assertTrue(auto)
         self.assertEqual("测谎触发", trigger)
         self.assertEqual("测谎坐标框", region)
         self.assertEqual(0.8, threshold)
         self.assertEqual(3.5, trigger_delay)
         self.assertEqual("alarm.mp3", alarm)
+        self.assertEqual("ultra", precision)  # 精度档已解析并去空格。
 
     def test_read_config_bad_threshold_falls_back(self):
         # 阈值非法时回退默认 0.75，不能让服务崩溃。
         with patch.object(self.service, "_get_config", return_value={"Lie Detector Threshold": "abc"}):
-            _, _, _, threshold, _, _ = self.service._read_config()
+            _, _, _, threshold, _, _, _ = self.service._read_config()
         self.assertEqual(0.75, threshold)
 
     def test_read_config_delay_defaults_and_clamps(self):
         # 触发延迟：未配置或非法时兜底默认 5 秒，负数按 0 处理，过大值截断到上限。
         default_delay = service_module.LIE_TRIGGER_DELAY_DEFAULT
         with patch.object(self.service, "_get_config", return_value={}):
-            _, _, _, _, missing, _ = self.service._read_config()
+            _, _, _, _, missing, _, _ = self.service._read_config()
         self.assertEqual(default_delay, missing)  # 看板未配该键时用默认值。
         with patch.object(self.service, "_get_config", return_value={"Lie Detector Trigger Delay": "abc"}):
-            _, _, _, _, bad, _ = self.service._read_config()
+            _, _, _, _, bad, _, _ = self.service._read_config()
         self.assertEqual(default_delay, bad)  # 非数字延迟回退默认值。
         with patch.object(self.service, "_get_config", return_value={"Lie Detector Trigger Delay": -2}):
-            _, _, _, _, negative, _ = self.service._read_config()
+            _, _, _, _, negative, _, _ = self.service._read_config()
         self.assertEqual(0.0, negative)  # 负数按不延迟处理。
         with patch.object(self.service, "_get_config",
                           return_value={"Lie Detector Trigger Delay": service_module.LIE_TRIGGER_DELAY_MAX + 100}):
-            _, _, _, _, huge, _ = self.service._read_config()
+            _, _, _, _, huge, _, _ = self.service._read_config()
         self.assertEqual(service_module.LIE_TRIGGER_DELAY_MAX, huge)  # 误填过大值被截断，不会长时间卡在等待。
+
+    def test_read_config_precision_defaults_and_validates(self):
+        # 精度档：未配置或非法值都回退默认 high，合法档位原样返回（避免把未知 key 传给 ShapeTrackParams）。
+        with patch.object(self.service, "_get_config", return_value={}):
+            *_, missing = self.service._read_config()
+        self.assertEqual("high", missing)  # 看板未配该键时用默认档。
+        with patch.object(self.service, "_get_config", return_value={"Lie Detector Precision": "not_a_tier"}):
+            *_, bad = self.service._read_config()
+        self.assertEqual("high", bad)  # 非法档位回退默认。
+        with patch.object(self.service, "_get_config", return_value={"Lie Detector Precision": "low"}):
+            *_, low = self.service._read_config()
+        self.assertEqual("low", low)  # 合法档位原样返回。
 
     def test_reload_config_forces_refresh(self):
         # reload_config 把刷新时间戳清零，主循环下一轮立即重读看板配置（看板保存时调用）。
@@ -269,13 +283,17 @@ class TestLieDetectorService(unittest.TestCase):
         with patch.object(self.service, "_pause_current_task", return_value=task), \
                 patch.object(self.service, "_resume_task") as resume, \
                 patch.object(self.service, "_play_alarm") as alarm, \
+                patch.object(self.service, "_start_recorder") as start_rec, \
+                patch.object(self.service, "_stop_recorder") as stop_rec, \
                 patch.object(self.service, "_get_region_box", return_value=None), \
                 patch.object(self.service, "_update_vision"), \
                 patch.object(self.service, "_solve", side_effect=fake_solve) as solve, \
                 patch.object(self.service, "_idle_sleep"):
-            self.service._handle_trigger(frame, trigger, "测谎触发", "测谎坐标框", 0.7, 0.0, "alarm.mp3")
+            self.service._handle_trigger(frame, trigger, "测谎触发", "测谎坐标框", 0.7, 0.0, "alarm.mp3", "high")
         alarm.assert_called_once_with("alarm.mp3")  # 报警按配置播放。
         solve.assert_called_once()  # 解题被调用。
+        start_rec.assert_called_once()  # 触发确认即起录。
+        stop_rec.assert_called_once()  # finally 收尾录像。
         self.assertEqual(STATE_SOLVING, seen["state"])  # 解题期间处于 SOLVING 态。
         resume.assert_called_once_with(task)  # 解题后恢复被暂停的任务。
         self.assertEqual(STATE_IDLE, self.service.state)  # 结束回到空闲态。
@@ -287,11 +305,13 @@ class TestLieDetectorService(unittest.TestCase):
         with patch.object(self.service, "_pause_current_task", return_value=None), \
                 patch.object(self.service, "_resume_task") as resume, \
                 patch.object(self.service, "_play_alarm"), \
+                patch.object(self.service, "_start_recorder"), \
+                patch.object(self.service, "_stop_recorder"), \
                 patch.object(self.service, "_get_region_box", return_value=None), \
                 patch.object(self.service, "_update_vision"), \
                 patch.object(self.service, "_solve") as solve, \
                 patch.object(self.service, "_idle_sleep"):
-            self.service._handle_trigger(frame, trigger, "测谎触发", "测谎坐标框", 0.7, 0.0, "")
+            self.service._handle_trigger(frame, trigger, "测谎触发", "测谎坐标框", 0.7, 0.0, "", "high")
         solve.assert_called_once()  # 无任务也独立解题。
         resume.assert_not_called()  # 没有暂停任务就不恢复。
         self.assertEqual(STATE_IDLE, self.service.state)
@@ -304,13 +324,16 @@ class TestLieDetectorService(unittest.TestCase):
         with patch.object(self.service, "_pause_current_task", return_value=task), \
                 patch.object(self.service, "_resume_task") as resume, \
                 patch.object(self.service, "_play_alarm"), \
+                patch.object(self.service, "_start_recorder"), \
+                patch.object(self.service, "_stop_recorder") as stop_rec, \
                 patch.object(self.service, "_get_region_box", return_value=None), \
                 patch.object(self.service, "_update_vision"), \
                 patch.object(self.service, "_solve", side_effect=RuntimeError("boom")), \
                 patch.object(self.service, "_idle_sleep"):
             with self.assertRaises(RuntimeError):
-                self.service._handle_trigger(frame, trigger, "测谎触发", "测谎坐标框", 0.7, 0.0, "")
+                self.service._handle_trigger(frame, trigger, "测谎触发", "测谎坐标框", 0.7, 0.0, "", "high")
         resume.assert_called_once_with(task)  # finally 保证恢复。
+        stop_rec.assert_called_once_with("abandoned")  # 解题抛异常时 outcome 仍为初值 abandoned，finally 照样收尾录像。
         self.assertEqual(STATE_IDLE, self.service.state)
 
     # ------------------------------------------------------------------ 触发延迟
@@ -358,15 +381,18 @@ class TestLieDetectorService(unittest.TestCase):
         with patch.object(self.service, "_pause_current_task", return_value=task), \
                 patch.object(self.service, "_resume_task") as resume, \
                 patch.object(self.service, "_play_alarm") as alarm, \
+                patch.object(self.service, "_start_recorder"), \
+                patch.object(self.service, "_stop_recorder") as stop_rec, \
                 patch.object(self.service, "_get_region_box", return_value=None), \
                 patch.object(self.service, "_update_vision"), \
                 patch.object(self.service, "_wait_trigger_delay", return_value=False) as wait, \
                 patch.object(self.service, "_solve") as solve, \
                 patch.object(self.service, "_idle_sleep"):
-            self.service._handle_trigger(frame, trigger, "测谎触发", "测谎坐标框", 0.7, 5.0, "alarm.mp3")
+            self.service._handle_trigger(frame, trigger, "测谎触发", "测谎坐标框", 0.7, 5.0, "alarm.mp3", "high")
         wait.assert_called_once()  # 延迟确实被评估过。
         alarm.assert_called_once_with("alarm.mp3")  # 报警先于延迟播放，用户立即收到提示。
         solve.assert_not_called()  # 弹窗已关，不进解题。
+        stop_rec.assert_called_once_with("abandoned")  # 延迟期放弃，录像标记为 abandoned。
         resume.assert_called_once_with(task)  # finally 仍恢复任务。
         self.assertEqual(STATE_IDLE, self.service.state)
 
@@ -379,14 +405,109 @@ class TestLieDetectorService(unittest.TestCase):
         with patch.object(self.service, "_pause_current_task", return_value=None), \
                 patch.object(self.service, "_resume_task"), \
                 patch.object(self.service, "_play_alarm"), \
+                patch.object(self.service, "_start_recorder"), \
+                patch.object(self.service, "_stop_recorder"), \
                 patch.object(self.service, "_get_region_box", return_value=None), \
                 patch.object(self.service, "_update_vision"), \
                 patch.object(self.service, "_wait_trigger_delay", return_value=True), \
                 patch.object(self.service, "_capture", return_value=fresh), \
                 patch.object(self.service, "_solve", side_effect=lambda f, *a: seen.setdefault("frame", f)), \
                 patch.object(self.service, "_idle_sleep"):
-            self.service._handle_trigger(stale, trigger, "测谎触发", "测谎坐标框", 0.7, 5.0, "")
+            self.service._handle_trigger(stale, trigger, "测谎触发", "测谎坐标框", 0.7, 5.0, "", "high")
         self.assertIs(fresh, seen["frame"])  # 解题拿到的是延迟后重新采集的帧。
+
+    # ------------------------------------------------------------------ 解测谎急停按键
+
+    def test_normalize_key_name_lowercases_and_aliases(self):
+        # 按键名归一：统一小写去空格，左右修饰键与命名风格收敛到同一规范名，供配置与 pynput 报出的键名比较。
+        self.assertEqual('', service_module.normalize_key_name(''))
+        self.assertEqual('', service_module.normalize_key_name(None))
+        self.assertEqual('f8', service_module.normalize_key_name(' F8 '))  # 功能键原样小写。
+        self.assertEqual('shift', service_module.normalize_key_name('shift_l'))  # 左 shift 收敛到 shift。
+        self.assertEqual('pageup', service_module.normalize_key_name('page_up'))  # 命名风格差异收敛。
+
+    def test_sync_abort_key_arms_and_disarms_listener(self):
+        # 配置了急停键则装监听并记下规范键名；配置未变不重复装；清空配置则卸监听。
+        with patch.object(self.service, "_get_config", return_value={"Lie Detector Abort Key": "f8"}), \
+                patch.object(self.service, "_start_abort_listener") as start, \
+                patch.object(self.service, "_stop_abort_listener") as stop:
+            self.service._sync_abort_key()
+            self.assertEqual('f8', self.service._abort_key)  # 记下规范急停键。
+            start.assert_called_once()  # 首次配置装上监听。
+            stop.assert_not_called()
+            self.service._sync_abort_key()  # 配置未变。
+            start.assert_called_once()  # 不重复装监听。
+        with patch.object(self.service, "_get_config", return_value={"Lie Detector Abort Key": ""}), \
+                patch.object(self.service, "_start_abort_listener") as start2, \
+                patch.object(self.service, "_stop_abort_listener") as stop2:
+            self.service._sync_abort_key()  # 清空急停键。
+            self.assertEqual('', self.service._abort_key)  # 停用。
+            stop2.assert_called_once()  # 卸掉监听。
+            start2.assert_not_called()
+
+    def test_on_abort_key_press_triggers_only_on_match(self):
+        # 全局按键回调：命中配置的急停键才触发急停，其它键（含字符键）忽略。
+        self.service._abort_key = 'f8'
+        with patch.object(self.service, "_trigger_abort") as abort:
+            self.service._on_abort_key_press(SimpleNamespace(name='f8'))  # 功能键无 char，取 name。
+            abort.assert_called_once()
+            self.service._on_abort_key_press(SimpleNamespace(char='x'))  # 字符键不匹配。
+            self.service._on_abort_key_press(SimpleNamespace(name='esc'))  # 其它功能键不匹配。
+            abort.assert_called_once()  # 仍只触发过一次。
+
+    def test_trigger_abort_sets_flag_writes_switch_off_and_notifies(self):
+        # 急停动作：置中止标志、把总开关读改写为关（保留其它键）、置一次性通知、请求立即重读配置；重复触发幂等。
+        with patch.object(service_module, "load_dashboard_config",
+                          return_value={"Lie Detector Auto Solve": True, "Other": 1}), \
+                patch.object(service_module, "save_dashboard_config") as save, \
+                patch.object(self.service, "reload_config") as reload:
+            self.service._trigger_abort()
+        self.assertTrue(self.service._abort_event.is_set())  # 中止标志已置位，解题/延迟循环会立即退出。
+        self.assertTrue(self.service._abort_notice)  # 一次性通知已置位，供看板同步开关。
+        saved = save.call_args[0][0]
+        self.assertFalse(saved["Lie Detector Auto Solve"])  # 总开关写回为关。
+        self.assertEqual(1, saved["Other"])  # 读改写保留了其它配置键。
+        reload.assert_called_once()  # 请求主循环立即重读配置。
+        with patch.object(service_module, "save_dashboard_config") as save2:
+            self.service._trigger_abort()  # 已置位后重复触发（按键长按连发）。
+        save2.assert_not_called()  # 幂等：不重复落盘。
+
+    def test_consume_abort_notice_is_one_shot(self):
+        # 看板轮询消费一次性通知：取走后置回 False，只同步一次。
+        self.assertFalse(self.service.consume_abort_notice())  # 初始无通知。
+        self.service._abort_notice = True
+        self.assertTrue(self.service.consume_abort_notice())  # 取走通知。
+        self.assertFalse(self.service._abort_notice)  # 已清除。
+        self.assertFalse(self.service.consume_abort_notice())  # 再取为空。
+
+    def test_wait_trigger_delay_aborts_when_abort_event_set(self):
+        # 延迟等待期收到急停：立即放弃本局，不白等剩余延迟。
+        self.service._abort_event.set()
+        with patch.object(self.service, "_capture", return_value=np.full((300, 400, 3), 20, dtype=np.uint8)), \
+                patch.object(self.service, "_idle_sleep"):
+            proceed = self.service._wait_trigger_delay(None, "测谎触发", "测谎坐标框", 0.7, 30.0)
+        self.assertFalse(proceed)  # 急停 -> 放弃解题。
+
+    @unittest.skipUnless(service_module.LIE_SOLVER_AVAILABLE, "liedetector optical-flow solver unavailable")
+    def test_solve_aborts_immediately_when_abort_event_set(self):
+        # 解题循环开头检查急停标志：置位则立即以 aborted 退出，不再喂光流会话。
+        self.service._abort_event.set()
+        frame = np.full((300, 400, 3), 20, dtype=np.uint8)
+        updates = {"n": 0}
+
+        def fake_update(crop, fps):  # 计数光流会话被喂帧次数，急停时应为 0。
+            updates["n"] += 1
+            return SimpleNamespace(source="waiting", center=None, contour=None, confidence=0.0,
+                                   border_snr=0.0, tracker_alive=False, white_candidates=0, flow_residual=None)
+
+        fake_session = SimpleNamespace(reset=lambda w, h: None, update=fake_update)
+        with patch.object(self.service, "_ensure_in_front"), \
+                patch.object(service_module, "ShapeTrackSession", return_value=fake_session), \
+                patch.object(self.service, "_update_vision"), \
+                patch.object(self.service, "_idle_sleep"):
+            outcome = self.service._solve(frame, "测谎触发", "测谎坐标框", 0.7)
+        self.assertEqual("aborted", outcome)  # 录像标记为用户急停中止。
+        self.assertEqual(0, updates["n"])  # 急停在循环开头，未喂任何一帧给光流会话。
 
     # ------------------------------------------------------------------ 解题子循环
 
@@ -413,9 +534,10 @@ class TestLieDetectorService(unittest.TestCase):
                 patch.object(self.service, "_update_vision") as vision, \
                 patch.object(self.service, "_idle_sleep"), \
                 patch.object(self.service, "_capture", return_value=None):  # 隔离窗口/光流/匹配/UI/取帧。
-            self.service._solve(frame, "测谎触发", "测谎坐标框", 0.7)
+            outcome = self.service._solve(frame, "测谎触发", "测谎坐标框", 0.7)
         # 首帧命中后需再连续丢失 LIE_TRIGGER_LOST_TOLERANCE+1 帧才判定结束，避免弹窗淡出抖动造成秒退。
         self.assertEqual(service_module.LIE_TRIGGER_LOST_TOLERANCE + 2, state["tick"])
+        self.assertEqual("gone", outcome)  # 触发持续消失 -> 结束原因标记为 gone。
         self.assertTrue(vision.called)  # 解测谎画面已推送给 UI。
 
     @unittest.skipUnless(service_module.LIE_SOLVER_AVAILABLE, "liedetector optical-flow solver unavailable")
@@ -452,9 +574,116 @@ class TestLieDetectorService(unittest.TestCase):
                 patch.object(self.service, "_update_vision"), \
                 patch.object(self.service, "_idle_sleep"), \
                 patch.object(self.service, "_capture", return_value=None):
-            self.service._solve(frame, "测谎触发", "测谎坐标框", 0.7)
+            outcome = self.service._solve(frame, "测谎触发", "测谎坐标框", 0.7)
         self.assertEqual(5, state["tick"])  # 瞬时丢失的 3 帧没有导致提前退出，一直撑到场景结束。
         self.assertEqual(1, state["resets"])  # 光流会话只在区域首次出现时建了一次，未被抖动打断重建。
+        self.assertEqual("solved", outcome)  # 场景结束 -> 结束原因标记为 solved。
+
+    @unittest.skipUnless(service_module.LIE_SOLVER_AVAILABLE, "liedetector optical-flow solver unavailable")
+    def test_solve_writes_raw_frames_to_recorder(self):
+        # 解题循环每帧把整帧写给录像器（录像器按触发时确定的区域框内部裁剪），frame 全程干净供验证页签复算。
+        frame = np.full((300, 400, 3), 20, dtype=np.uint8)
+        region = SimpleNamespace(x=100, y=50, width=200, height=150)
+        ended = SimpleNamespace(source=service_module.SOURCE_SCENE_ENDED, center=None, contour=None,
+                                confidence=0.0, border_snr=0.0, tracker_alive=False, white_candidates=0,
+                                flow_residual=None)  # 首轮即场景结束，跑一帧就退出。
+        fake_session = SimpleNamespace(reset=lambda w, h: None, update=lambda crop, fps: ended)
+        recorder = MagicMock()  # 假录像器，只验证 write 按帧被调用。
+        self.service._recorder = recorder
+        with patch.object(self.service, "_ensure_in_front"), \
+                patch.object(service_module, "ShapeTrackSession", return_value=fake_session), \
+                patch.object(self.service, "_find_trigger", return_value=SimpleNamespace(x=10, y=10, width=50, height=20)), \
+                patch.object(self.service, "_get_region_box", return_value=region), \
+                patch.object(self.service, "_update_vision"), \
+                patch.object(self.service, "_idle_sleep"), \
+                patch.object(self.service, "_capture", return_value=None):
+            outcome = self.service._solve(frame, "测谎触发", "测谎坐标框", 0.7)
+        self.assertEqual("solved", outcome)  # 场景结束退出。
+        recorder.write.assert_called_once()  # 写了一帧。
+        self.assertIs(frame, recorder.write.call_args[0][0])  # 写入的是未裁剪的原始整帧（与触发帧同一对象）。
+
+    # ------------------------------------------------------------------ 录像集成
+
+    def test_handle_trigger_starts_and_stops_recorder_with_solve_outcome(self):
+        # 触发处理：起录带触发帧/触发框/精度档 -> 解题 -> 用 _solve 返回的 outcome 收尾录像。
+        frame = np.full((300, 400, 3), 20, dtype=np.uint8)
+        trigger = SimpleNamespace(x=10, y=10, width=50, height=20, confidence=0.88)
+        with patch.object(self.service, "_pause_current_task", return_value=None), \
+                patch.object(self.service, "_resume_task"), \
+                patch.object(self.service, "_play_alarm"), \
+                patch.object(self.service, "_start_recorder") as start_rec, \
+                patch.object(self.service, "_stop_recorder") as stop_rec, \
+                patch.object(self.service, "_get_region_box", return_value=None), \
+                patch.object(self.service, "_update_vision"), \
+                patch.object(self.service, "_wait_trigger_delay", return_value=True), \
+                patch.object(self.service, "_capture", return_value=None), \
+                patch.object(self.service, "_solve", return_value="solved"), \
+                patch.object(self.service, "_idle_sleep"):
+            self.service._handle_trigger(frame, trigger, "测谎触发", "测谎坐标框", 0.7, 0.0, "", "ultra")
+        self.assertEqual(1, start_rec.call_count)  # 起录一次。
+        called_frame, called_box, called_region, called_tier = start_rec.call_args[0]  # 取起录实参（避开 numpy 数组直接 == 比较）。
+        self.assertIs(frame, called_frame)  # 带上触发帧。
+        self.assertIs(trigger, called_box)  # 带上触发框（取置信度写入录像名）。
+        self.assertIsNone(called_region)  # 本用例 _get_region_box 返回 None，无坐标框则录整帧。
+        self.assertEqual("ultra", called_tier)  # 带上精度档。
+        stop_rec.assert_called_once_with("solved")  # 收尾用 _solve 返回的 outcome。
+
+    def test_start_recorder_swallows_exception(self):
+        # 录像器构造/起流抛异常时 _start_recorder 吞掉不外溢，self._recorder 保持 None，解题照常。
+        frame = np.full((300, 400, 3), 20, dtype=np.uint8)
+        trigger = SimpleNamespace(x=10, y=10, width=50, height=20, confidence=0.9)
+        with patch.object(service_module, "LieRecorder", side_effect=RuntimeError("no encoder")):
+            self.service._start_recorder(frame, trigger, None, "high")  # 不应抛异常。
+        self.assertIsNone(self.service._recorder)  # 起录失败，录像器保持 None。
+
+    def test_start_recorder_derives_crop_from_region_box(self):
+        # 采到【测谎坐标框】时，_start_recorder 按框推导 crop 传给 recorder.start，只录该区域。
+        frame = np.full((300, 400, 3), 20, dtype=np.uint8)
+        trigger = SimpleNamespace(x=10, y=10, width=50, height=20, confidence=0.9)
+        region = SimpleNamespace(x=100, y=50, width=200, height=150)
+        fake_rec = MagicMock()
+        with patch.object(service_module, "LieRecorder", return_value=fake_rec):
+            self.service._start_recorder(frame, trigger, region, "ultra")
+        shape_arg, meta_arg, crop_arg = fake_rec.start.call_args[0]  # 取起流实参。
+        self.assertEqual((300, 400), tuple(shape_arg), "分辨率取触发帧 (高, 宽)")
+        self.assertEqual("ultra", meta_arg["tier"], "元数据带精度档")
+        self.assertEqual((100, 50, 200, 150), crop_arg, "按坐标框推导裁剪区域 (x,y,w,h)")
+        self.assertIs(fake_rec, self.service._recorder, "起录成功后记录录像器")
+
+    def test_start_recorder_crop_none_when_region_missing(self):
+        # 未采到坐标框（region_box=None）时 crop 为 None，录整帧兜底。
+        frame = np.full((300, 400, 3), 20, dtype=np.uint8)
+        trigger = SimpleNamespace(x=10, y=10, width=50, height=20, confidence=0.9)
+        fake_rec = MagicMock()
+        with patch.object(service_module, "LieRecorder", return_value=fake_rec):
+            self.service._start_recorder(frame, trigger, None, "high")
+        crop_arg = fake_rec.start.call_args[0][2]  # 第三个实参为 crop。
+        self.assertIsNone(crop_arg, "无坐标框时 crop 应为 None（录整帧）")
+
+    def test_handle_trigger_passes_region_box_to_recorder(self):
+        # _handle_trigger 先采集【测谎坐标框】，把它作为 region_box 传给 _start_recorder 作录像裁剪区域。
+        frame = np.full((300, 400, 3), 20, dtype=np.uint8)
+        trigger = SimpleNamespace(x=10, y=10, width=50, height=20, confidence=0.88)
+        region = SimpleNamespace(x=100, y=50, width=200, height=150)
+        with patch.object(self.service, "_pause_current_task", return_value=None), \
+                patch.object(self.service, "_resume_task"), \
+                patch.object(self.service, "_play_alarm"), \
+                patch.object(self.service, "_start_recorder") as start_rec, \
+                patch.object(self.service, "_stop_recorder"), \
+                patch.object(self.service, "_get_region_box", return_value=region), \
+                patch.object(self.service, "_update_vision"), \
+                patch.object(self.service, "_wait_trigger_delay", return_value=True), \
+                patch.object(self.service, "_capture", return_value=None), \
+                patch.object(self.service, "_solve", return_value="solved"), \
+                patch.object(self.service, "_idle_sleep"):
+            self.service._handle_trigger(frame, trigger, "测谎触发", "测谎坐标框", 0.7, 0.0, "", "ultra")
+        self.assertIs(region, start_rec.call_args[0][2], "起录第三参应为采集到的【测谎坐标框】region_box")
+
+    def test_stop_recorder_noop_when_none(self):
+        # 未起录（self._recorder 为 None）时 _stop_recorder 空转不报错。
+        self.service._recorder = None
+        self.service._stop_recorder("solved")  # 不应抛异常。
+        self.assertIsNone(self.service._recorder)
 
     # ------------------------------------------------------------------ 结束后初始化与冷却
 
@@ -736,7 +965,7 @@ class TestLieDetectorService(unittest.TestCase):
             return None  # 两个检测都未命中，本轮只做值守。
 
         with patch.object(service_module, "LIE_SOLVER_AVAILABLE", True), \
-                patch.object(service, "_read_config", return_value=(True, "测谎触发", "测谎坐标框", 0.75, 0.0, "")), \
+                patch.object(service, "_read_config", return_value=(True, "测谎触发", "测谎坐标框", 0.75, 0.0, "", "high")), \
                 patch.object(service, "_read_auto_login_config", return_value={'enabled': True, 'threshold': 0.75,
                                                                               'server': '', 'channel': '',
                                                                               'step_timeout': 30.0, 'raw': {}}), \

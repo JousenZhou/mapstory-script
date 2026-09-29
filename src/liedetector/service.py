@@ -20,6 +20,9 @@
 #   - 触发延迟：确认命中后不立即解题，先等看板配置的「触发延迟」秒数（默认 5 秒），给弹窗完全展开、
 #     图形动画起势留出时间，避免光流会话在弹窗还在淡入/图形尚未移动时建模板。延迟期持续推送框选画面并倒计时，
 #     若期间【测谎触发】连续丢失超过容忍帧数（弹窗已关）则放弃本局；延迟结束后重新取帧，不用陈旧画面开题。
+#   - 急停按键：看板可配一个键盘按键（默认留空=不装全局钩子），配置后由 pynput 守护监听器全局监听；
+#     敲击即置急停标志，解题与延迟等待循环每帧检查后立即退出（录像 outcome=aborted、恢复被暂停的任务），
+#     同时把看板「自动解测谎」开关写回为关并通知 UI 同步，用于发现光流跟踪路径跑偏时人为及时接管。
 #   - 显卡加速：【测谎触发】【掉线】【掉线2】【掉线确定】的全屏模板匹配可走 CuPy FFT（src/gpu_feature_match.py），
 #     结果与框架 CPU 匹配（TM_CCOEFF_NORMED + 灰度 + limit=1）等价，但一帧只上传一次显存、只做一次帧变换即可
 #     覆盖全部模板，空闲监控 15FPS 的匹配耗时从数十毫秒降到几毫秒。加速隐藏式启用（不设开关），
@@ -34,16 +37,18 @@ import numpy as np  # 导入 NumPy，用于光流轮廓点集的坐标偏移。
 
 from ok import Logger, TriggerTask, og  # 导入日志器、触发任务类型（暂停时需排除）与全局对象（executor/device_manager/my_app）。
 
-from src.dashboard_store import load_dashboard_config  # 导入看板共享配置读取函数，测谎参数以看板为单一数据源。
+from src.dashboard_store import load_dashboard_config, save_dashboard_config  # 看板共享配置读写：测谎参数以看板为单一数据源，急停时也要回写总开关。
+from src.liedetector.recorder import LieRecorder  # 测谎触发录像器：触发->解除全过程录原始帧 + 边车记录，供验证页签复算。
 from src.autologin.flow import DOUBLE_CLICK_GAP, AutoLoginFlow  # 导入自动重登流程状态机与双击间隔常量（掉线触发后执行全桌面重登序列）。
 
 try:  # 解测谎依赖可选：DIS 稠密光流 + 粒子滤波在线编排，缺失时服务照常运行，仅禁用自动解测谎。
     from src.liedetector.shape_session import (  # 与测谎检验页签同一套光流解法（无神经网络）。
-        ShapeTrackParams, ShapeTrackSession,
+        ShapeTrackParams, ShapeTrackSession, PRECISION_TIER_KEYS,
         SOURCE_COLOR, SOURCE_BORDER, SOURCE_INTERPOLATED, SOURCE_PREDICTION, SOURCE_SCENE_ENDED)
     LIE_SOLVER_AVAILABLE = hasattr(cv2, "DISOpticalFlow_create")  # 光流解法依赖 OpenCV DIS 稠密光流。
 except Exception:  # liedetector 模块缺失或依赖损坏。
     LIE_SOLVER_AVAILABLE = False  # 禁用自动解测谎，运行时日志提示。
+    PRECISION_TIER_KEYS = ("low", "medium", "high", "ultra")  # 兜底精度档名单：模块缺失时 _read_config 仍能校验配置值不报错。
 
 logger = Logger.get_logger(__name__)  # 服务日志器。
 
@@ -78,6 +83,30 @@ STATE_IDLE = "idle"  # 服务空闲监控态。
 STATE_SOLVING = "solving"  # 服务正在解测谎态。
 STATE_RELOGGING = "relogging"  # 服务正在执行掉线重登态。
 
+try:  # 复用框框 Pynput 交互的按键名映射（如 lshift -> shift_l），保证急停键与任务按键用同一套命名。
+    from ok.device.interaction_methods.pynput import PynputInteraction as _PynputInteraction
+    _KEY_NAME_MAP = _PynputInteraction.KEY_MAP  # ok-script 按键名 -> pynput 按键名（只收录需要改名的键）。
+except Exception:  # 框框结构变化时降级为空映射，急停键仍按原名比较。
+    _KEY_NAME_MAP = {}
+
+# pynput 监听回调报出的键名 -> 规范名：pynput 不区分左右修饰键（Key.shift_l.name 也是 'shift'），
+# 且命名风格与看板配置不同（page_up vs pageup），故两侧都归一到同一规范名再比较。
+_KEY_NAME_ALIAS = {
+    'shift_l': 'shift', 'shift_r': 'shift', 'ctrl_l': 'ctrl', 'ctrl_r': 'ctrl',
+    'alt_l': 'alt', 'alt_r': 'alt', 'alt_gr': 'alt', 'cmd_l': 'cmd', 'cmd_r': 'cmd',
+    'page_up': 'pageup', 'page_down': 'pagedown', 'caps_lock': 'capslock',
+    'num_lock': 'numlock', 'scroll_lock': 'scrolllock', 'print_screen': 'printscreen',
+    'return': 'enter',
+}
+
+
+def normalize_key_name(value):  # 把看板配置的按键名或 pynput 报出的按键名归一到同一规范名，供急停键匹配比较。
+    name = str(value or '').strip().lower()  # 统一小写并去空格。
+    if not name:  # 未配置。
+        return ''
+    name = _KEY_NAME_MAP.get(name, name)  # 先按框框映射转成 pynput 名（表里没有的键原样保留，如 f8）。
+    return _KEY_NAME_ALIAS.get(name, name)  # 再收敛左右修饰键与命名风格差异。
+
 
 class LieDetectorService:  # 独立测谎监控服务：后台守护线程值守测谎触发，命中即暂停任务并自动解测谎。
 
@@ -95,6 +124,11 @@ class LieDetectorService:  # 独立测谎监控服务：后台守护线程值守
         self._gpu = None  # 显卡匹配器（GpuFeatureMatcher），首次需要时创建，看板开关关闭或显卡异常时为 None。
         self._gpu_off = False  # 显卡加速是否已被运行期异常永久关闭：置位后本进程内不再重试，避免每帧失败刷日志。
         self._watch_names = None  # 本轮值守要在同一帧上匹配的全部分类名，单点调用匹配时沿用同一组模板避免反复重建。
+        self._recorder = None  # 当前测谎录像器（LieRecorder）：触发确认时起录、finally 收尾；非解题期为 None。
+        self._abort_event = threading.Event()  # 急停标志：敲击看板配置的急停键后置位，解题与延迟等待循环每帧检查并立即退出。
+        self._abort_key = ''  # 规范化后的急停按键名，空字符串表示未启用急停（也不装全局键盘钩子）。
+        self._abort_listener = None  # pynput 全局键盘监听器，仅在配置了急停键时启动。
+        self._abort_notice = False  # 急停已发生、等待看板 UI 把「自动解测谎」开关同步为关的一次性标志。
 
     def start(self):  # 启动后台守护线程；重复调用只启动一次。
         if self._thread is not None:  # 已启动过。
@@ -106,7 +140,7 @@ class LieDetectorService:  # 独立测谎监控服务：后台守护线程值守
     def reload_config(self):  # 通知服务立即重读看板配置（DashboardTab 保存时调用）。
         self._config_time = 0.0  # 把刷新时间戳清零，主循环下一轮立即重读配置。
 
-    def _read_config(self):  # 读取并解析看板测谎配置，返回 (自动解开关, 触发标注名, 坐标框标注名, 阈值, 触发延迟秒数, 报警音频)。
+    def _read_config(self):  # 读取并解析看板测谎配置，返回 (自动解开关, 触发标注名, 坐标框标注名, 阈值, 触发延迟秒数, 报警音频, 精度档)。
         config = self._get_config()  # 取（必要时刷新）配置缓存。
         auto_solve = bool(config.get("Lie Detector Auto Solve"))  # 测谎总开关。
         trigger_name = str(config.get("Lie Detector Trigger Feature") or '').strip()  # 【测谎触发】标注分类名。
@@ -121,7 +155,10 @@ class LieDetectorService:  # 独立测谎监控服务：后台守护线程值守
             trigger_delay = LIE_TRIGGER_DELAY_DEFAULT  # 回退默认延迟。
         trigger_delay = min(max(trigger_delay, 0.0), LIE_TRIGGER_DELAY_MAX)  # 夹到 [0, 上限]：负数按不延迟处理，过大值截断。
         alarm_sound = str(config.get("Lie Alarm Sound") or '').strip()  # 报警音频路径，留空表示不报警。
-        return auto_solve, trigger_name, region_name, threshold, trigger_delay, alarm_sound  # 返回解析后的配置元组。
+        precision = str(config.get("Lie Detector Precision") or 'high').strip()  # 解测谎精度档 key，缺省按高。
+        if precision not in PRECISION_TIER_KEYS:  # 非法档位（配置被手改成未知值）。
+            precision = 'high'  # 回退默认精度档，与 DASHBOARD_DEFAULTS 一致。
+        return auto_solve, trigger_name, region_name, threshold, trigger_delay, alarm_sound, precision  # 返回解析后的配置元组。
 
     def _get_config(self):  # 取看板配置缓存，超过刷新间隔时重读文件。
         now = time.time()  # 当前时间。
@@ -133,10 +170,22 @@ class LieDetectorService:  # 独立测谎监控服务：后台守护线程值守
             self._config_time = now  # 记录本次刷新时间。
         return self._config  # 返回配置缓存。
 
+    def _warmup_scoring_backend(self):  # 预热测谎打分后端：在守护线程里触发 CuPy 初始化与显存池分配，避免解测谎首帧冷启动卡顿（约 1~3 秒）。
+        if not LIE_SOLVER_AVAILABLE:  # 光流解法不可用时不会有打分调用，无需预热。
+            return  # 跳过。
+        try:  # 预热失败不影响正常路径，正式求解时会再走一次后端装配与降级链路。
+            from src.liedetector.gpu_shape_backend import warmup_shape_backend  # 延迟导入：无显卡环境不应影响服务启动，CuPy 初始化也较重。
+            backend_name = warmup_shape_backend()  # 触发探测、单例创建与一次假数据打分，返回 "cupy" 或 "numpy"。
+            logger.info(f"Lie solve scoring backend ready: {backend_name}. 测谎打分后端预热完成：{backend_name}（有 N 卡走 CuPy，否则 NumPy）。")  # 记录实际生效的后端，便于核对走的是显卡还是 CPU。
+        except Exception as e:  # 预热异常不能拖垮服务。
+            logger.warning(f"Lie solve scoring backend warmup failed: {e}. 测谎打分后端预热失败，将在首次求解时重试。")  # 记录异常。
+
     def _run(self):  # 服务主循环：空闲监控掉线触发与测谎触发，命中则暂停任务并处理，直到进程退出。
+        self._warmup_scoring_backend()  # 主循环前预热打分后端：已在守护线程内，1~3 秒的 CuPy 初始化不会阻塞 app 启动。
         while not self._exit_event.is_set():  # 主循环，退出事件置位时结束。
             try:  # 单轮异常不能拖垮服务，捕获后记录并继续下一轮。
-                auto_solve, trigger_name, region_name, threshold, trigger_delay, alarm_sound = self._read_config()  # 读取测谎配置。
+                auto_solve, trigger_name, region_name, threshold, trigger_delay, alarm_sound, precision = self._read_config()  # 读取测谎配置。
+                self._sync_abort_key()  # 刷新急停按键并按需启停全局键盘监听（配置改动 0.5 秒内生效）。
                 auto_login_cfg = self._read_auto_login_config()  # 读取自动登录配置。
                 watch_names = [DISCONNECT_TEMPLATE, DISCONNECT_DIALOG_TEMPLATE, DISCONNECT_OK_TEMPLATE]  # 本轮要在同一帧上匹配的全部分类名，一次帧变换全部复用。
                 if trigger_name:  # 测谎触发标注已配置。
@@ -200,33 +249,67 @@ class LieDetectorService:  # 独立测谎监控服务：后台守护线程值守
                     self._idle_sleep(MONITOR_INTERVAL)  # 短等后取下一帧继续确认。
                     continue  # 下一轮。
                 self._trigger_hits = 0  # 确认通过，清零计数供下一局重新累计。
-                self._handle_trigger(frame, trigger_box, trigger_name, region_name, threshold, trigger_delay, alarm_sound)  # 命中触发：暂停任务、延迟等待并解测谎。
+                self._handle_trigger(frame, trigger_box, trigger_name, region_name, threshold, trigger_delay, alarm_sound, precision)  # 命中触发：暂停任务、延迟等待并解测谎。
             except Exception as e:  # 主循环兜底异常处理。
                 logger.warning(f"Lie detector service loop error: {e}. 测谎服务循环异常，已忽略并继续监控。")  # 记录异常并继续。
                 self._idle_sleep(MONITOR_INTERVAL)  # 异常后短暂等待，避免热循环刷屏。
+        self._stop_abort_listener()  # 主循环退出（进程结束）：停掉急停按键全局监听，避免残留键盘钩子线程。
 
-    def _handle_trigger(self, frame, trigger_box, trigger_name, region_name, threshold, trigger_delay, alarm_sound):  # 处理一次测谎触发：暂停任务 -> 报警 -> 推送标注 -> 延迟等待 -> 解测谎 -> 恢复任务。
+    def _handle_trigger(self, frame, trigger_box, trigger_name, region_name, threshold, trigger_delay, alarm_sound, precision):  # 处理一次测谎触发：暂停任务 -> 报警 -> 推送标注 -> 延迟等待 -> 解测谎 -> 恢复任务。
+        self._abort_event.clear()  # 清掉上一局可能残留的急停标志，本局重新接受急停键控制。
         self.state = STATE_SOLVING  # 切换到解题态。
         self._set_status("solving")  # 记录状态。
         paused_task = self._pause_current_task()  # 暂停当前脚本任务（用户已手动暂停的任务返回 None，解题后不自动恢复）。
+        outcome = "abandoned"  # 录像结束原因：默认延迟期放弃；进入解题后由 _solve 返回值覆盖为 solved/timeout/gone。
         try:  # 无论解题成功与否，最终都要恢复被本服务暂停的任务。
+            region_box = self._get_region_box(frame, region_name)  # 采集【测谎坐标框】坐标：既作录像裁剪区域，也供画面框选。
+            self._start_recorder(frame, trigger_box, region_box, precision)  # 触发确认即起录，覆盖延迟等待与解题全程（触发->解除）。
             self._play_alarm(alarm_sound)  # 播放报警音频（未配置或文件不存在时自动跳过）；先于延迟播放，让用户立即知道测谎已触发。
-            region_box = self._get_region_box(frame, region_name)  # 采集【测谎坐标框】坐标供画面框选。
             self._update_vision(self.draw_lie_annotations(frame, trigger_box, region_box))  # 触发瞬间立即把两个标注框选推送到实时画面。
             if not self._wait_trigger_delay(trigger_box, trigger_name, region_name, threshold, trigger_delay):  # 延迟等待期间弹窗已关或进程退出，本局无需再解。
-                return  # 直接返回，finally 仍会恢复任务、重置状态并开启冷却。
+                return  # 直接返回，finally 以 outcome=abandoned 收尾录像、恢复任务、重置状态并开启冷却。
             fresh = self._capture()  # 延迟结束后重新取一帧，避免拿几秒前的陈旧画面开题。
             if fresh is not None:  # 取到新帧才替换，取不到沿用触发帧。
                 frame = fresh  # 更新为最新画面。
             self._set_status("solving")  # 延迟倒计时状态改回解题态，避免日志停在 delaying。
-            self._solve(frame, trigger_name, region_name, threshold)  # 进入解测谎子循环，直到触发标注消失或兜底超时。
-        finally:  # 解题结束（正常/异常/退出）都要恢复任务与状态。
+            outcome = self._solve(frame, trigger_name, region_name, threshold, precision)  # 进入解测谎子循环，返回 solved/timeout/gone。
+        finally:  # 解题结束（正常/异常/退出）都要收尾录像、恢复任务与状态。
+            self._stop_recorder(outcome)  # 收尾录像并写边车记录（未起录则空转）。
             if paused_task is not None:  # 本服务暂停了任务。
                 self._resume_task(paused_task)  # 恢复它。
             self.state = STATE_IDLE  # 切回空闲监控态。
             self._reset_solve_state()  # 初始化跨帧状态并开启冷却，确保下一局从干净状态重新等触发。
             self._set_status("watching")  # 记录状态。
         self._idle_sleep(POST_SOLVE_SLEEP)  # 等弹窗关闭后画面稳定再继续监控（冷却期随后接管）。
+
+    def _start_recorder(self, frame, trigger_box, region_box, precision):  # 触发确认即起录：录「触发->解除」全过程，只录【测谎区域标注】区域，异常吞掉绝不影响解题。
+        try:  # 触发分取框上的置信度，写进录像名与边车。
+            score = float(getattr(trigger_box, "confidence", 0.0) or 0.0)
+        except (TypeError, ValueError):  # 分数非法。
+            score = 0.0
+        crop = None  # 录像裁剪区域 (x,y,w,h)；未采到坐标框时录整帧兜底。
+        if region_box is not None:  # 采到【测谎坐标框】：按它裁剪，只录该区域。
+            try:  # 框字段可能异常，宽松解析。
+                crop = (int(region_box.x), int(region_box.y), int(region_box.width), int(region_box.height))
+            except (TypeError, ValueError, AttributeError):  # 框字段非法。
+                crop = None  # 退回录整帧。
+        try:  # 录像为最佳努力能力，启动失败不得拖垮解测谎。
+            recorder = LieRecorder()  # 一局一个录像器实例。
+            recorder.start(frame.shape[:2], {"score": score, "tier": precision}, crop)  # 起流：分辨率取触发帧，元数据带触发分与精度档，裁剪区域取【测谎坐标框】。
+            self._recorder = recorder  # 记录，供延迟等待与解题循环写帧、finally 收尾。
+        except Exception as e:  # 录像启动异常。
+            logger.warning(f"Lie record start failed: {e}. 测谎录像启动失败，本局不录，解题照常进行。")
+            self._recorder = None
+
+    def _stop_recorder(self, outcome):  # 收尾录像并写边车记录，异常吞掉；未起录时空转。
+        recorder = self._recorder  # 取当前录像器。
+        self._recorder = None  # 先摘引用，避免重复收尾或收尾后仍被写帧。
+        if recorder is None:  # 本局未起录（录像不可用或启动失败）。
+            return
+        try:  # 收尾异常不影响主流程。
+            recorder.stop(outcome)  # 排空写线程、关流、写边车、滚动保留。
+        except Exception as e:  # 收尾异常。
+            logger.warning(f"Lie record stop failed: {e}. 测谎录像收尾失败。")
 
     # ------------------------------------------------------------------ 掉线自动重登
 
@@ -337,6 +420,82 @@ class LieDetectorService:  # 独立测谎监控服务：后台守护线程值守
         self._cooldown_until = time.time() + LIE_SOLVE_COOLDOWN  # 冷却截止时间：这段时间内主循环不检测触发，等弹窗完全淡出、画面稳定。
         logger.info(f"Lie detector state reset, cooldown {LIE_SOLVE_COOLDOWN}s. 测谎状态已初始化，冷却 {LIE_SOLVE_COOLDOWN} 秒后重新等待下一次触发。")  # 记录重置，便于核对冷却是否生效。
 
+    # ------------------------------------------------------------------ 解测谎急停按键
+
+    def _sync_abort_key(self):  # 每轮主循环刷新急停按键：配置变化时按需启停 pynput 全局监听（改动 0.5 秒内生效）。
+        config = self._get_config()  # 取（必要时刷新）配置缓存。
+        raw = str(config.get("Lie Detector Abort Key") or '').strip()  # 看板配置的急停按键原文，留空表示不启用。
+        normalized = normalize_key_name(raw)  # 归一到规范名，与 pynput 报出的键名同一口径比较。
+        if normalized == self._abort_key:  # 按键未变化。
+            return  # 无需启停监听。
+        self._abort_key = normalized  # 记录新的规范急停键（空串=停用）。
+        if normalized:  # 配置了急停键：启动全局监听。
+            self._start_abort_listener()  # 装 pynput 键盘钩子。
+            logger.info(f"Lie abort hotkey armed: {raw}. 解测谎急停按键已启用：{raw}（敲击即中止本次解测谎并关闭自动解测谎）。")  # 记录启用。
+        else:  # 清空了急停键：停用监听。
+            self._stop_abort_listener()  # 卸 pynput 键盘钩子。
+            logger.info("Lie abort hotkey disabled. 解测谎急停按键已停用（看板配置留空）。")  # 记录停用。
+
+    def _start_abort_listener(self):  # 启动 pynput 全局键盘监听（守护线程）；先停旧监听避免重复挂钩，pynput 不可用时降级停用。
+        self._stop_abort_listener()  # 停掉可能存在的旧监听器。
+        try:  # pynput 为可选依赖，缺失时急停按键不可用，但服务其余功能照常。
+            from pynput import keyboard  # 延迟导入：无 pynput 环境不应影响服务导入与启动。
+        except Exception as e:  # pynput 不可用。
+            logger.warning(f"pynput unavailable, abort hotkey disabled: {e}. pynput 不可用，解测谎急停按键无法启用。")  # 记录降级。
+            self._abort_key = ''  # 标记停用，避免每轮重试导入。
+            return  # 不装监听。
+        try:  # 监听器启动失败（权限/平台限制）不能拖垮服务。
+            listener = keyboard.Listener(on_press=self._on_abort_key_press)  # 全局按键回调。
+            listener.daemon = True  # 守护线程，随进程退出不阻塞关闭。
+            listener.start()  # 启动监听线程。
+            self._abort_listener = listener  # 记录句柄供停用时回收。
+        except Exception as e:  # 启动异常。
+            logger.warning(f"Lie abort listener start failed: {e}. 解测谎急停按键监听启动失败。")  # 记录异常。
+            self._abort_listener = None  # 无监听器。
+
+    def _stop_abort_listener(self):  # 停掉当前的 pynput 全局键盘监听（若有），异常吞掉。
+        listener = self._abort_listener  # 取当前监听器。
+        self._abort_listener = None  # 先摘引用，避免重复停。
+        if listener is None:  # 本就没有监听器。
+            return  # 空转。
+        try:  # 停止异常不影响主流程。
+            listener.stop()  # 通知 pynput 结束监听线程。
+        except Exception:  # 停止失败（已停等）。
+            pass  # 忽略。
+
+    def _on_abort_key_press(self, key):  # pynput 全局按键回调：命中配置的急停键则触发急停（运行在监听线程，务必轻量并吞异常）。
+        if not self._abort_key:  # 未配置急停键（监听器本不应处于活动态）。
+            return  # 忽略。
+        try:  # 解析按键名：字符键取 char，功能/修饰键取 name（pynput 对二者用不同类型表示）。
+            name = getattr(key, 'char', None) or getattr(key, 'name', '') or ''
+        except Exception:  # 异常键对象。
+            return  # 忽略。
+        if not name:  # 无法识别的按键。
+            return  # 忽略。
+        if normalize_key_name(name) != self._abort_key:  # 非配置的急停键。
+            return  # 忽略。
+        self._trigger_abort()  # 命中：执行急停动作。
+
+    def _trigger_abort(self):  # 急停动作：置中止标志让解题/延迟循环立即退出，并把「自动解测谎」开关写回为关、通知 UI 同步。
+        if self._abort_event.is_set():  # 本局急停已生效（按键长按连发会重复回调），忽略后续重复触发。
+            return  # 幂等。
+        self._abort_event.set()  # 置急停标志：_solve 与 _wait_trigger_delay 每帧检查后立即退出。
+        self._abort_notice = True  # 置一次性通知标志，供看板 refresh 把开关同步为关并提示。
+        try:  # 关闭总开关落盘失败也要让本次中止生效（标志已置位），故异常仅记录。
+            config = load_dashboard_config()  # 重新读盘，只改总开关，避免覆盖用户其它未保存改动。
+            config['Lie Detector Auto Solve'] = False  # 「自动解测谎」同步为关。
+            save_dashboard_config(config)  # 落盘 configs/Dashboard.json。
+        except Exception as e:  # 写盘异常。
+            logger.warning(f"Lie abort write config failed: {e}. 急停时关闭自动解测谎开关落盘失败。")  # 记录异常。
+        self.reload_config()  # 让主循环下一轮立即重读配置（总开关已关），无需等 0.5 秒轮询。
+        logger.warning("Lie solve ABORTED by hotkey, auto-solve switched OFF. 已按急停按键中止解测谎，「自动解测谎」开关已同步关闭。")  # 记录急停，便于核对是谁中止的。
+
+    def consume_abort_notice(self):  # 供看板 UI 轮询：取走一次性急停通知（取后即清），返回是否需要把开关同步为关。
+        if self._abort_notice:  # 有未消费的急停通知。
+            self._abort_notice = False  # 清除，保证只同步一次。
+            return True  # 通知 UI。
+        return False  # 无通知。
+
     def _wait_trigger_delay(self, trigger_box, trigger_name, region_name, threshold, delay):  # 触发确认后的延迟等待：等弹窗完全展开、图形动画起势再解题，返回是否应继续解题。
         if delay <= 0:  # 未配置延迟（或配为 0）。
             return True  # 立即解题，与原有行为一致。
@@ -344,12 +503,17 @@ class LieDetectorService:  # 独立测谎监控服务：后台守护线程值守
         deadline = time.time() + delay  # 延迟结束时间点。
         lost_ticks = 0  # 连续未匹配到【测谎触发】的帧数，容忍值与解题态一致。
         while not self._exit_event.is_set():  # 循环直到延迟结束或进程退出。
+            if self._abort_event.is_set():  # 用户在延迟等待期敲了急停键：本局直接放弃。
+                logger.info("Lie solve aborted by hotkey during delay, skip solving. 延迟等待期间收到急停按键，已放弃本局解测谎。")
+                return False  # 放弃解题，由 _handle_trigger 的 finally 收尾录像、恢复任务并开启冷却。
             remaining = deadline - time.time()  # 剩余等待秒数。
             if remaining <= 0:  # 延迟已到。
                 return True  # 继续解题。
             self._set_status(f"delaying {math.ceil(remaining)}s")  # 倒计时按整秒变化，既能在日志看到进度又不会每帧刷屏。
             frame = self._capture()  # 延迟期也持续取帧，保证实时画面不冻结。
             if frame is not None:  # 取到画面才做复检与推送。
+                if self._recorder is not None:  # 延迟期也录进「触发->解除」全过程，覆盖弹窗展开与图形起势。
+                    self._recorder.write(frame)  # 非阻塞入队，队列满即丢帧，绝不阻塞等待循环。
                 found = self._find_trigger(frame, trigger_name, threshold)  # 复检触发标注是否仍在画面上。
                 if found is None:  # 本帧未命中：可能只是弹窗拖动或分数抖动造成的瞬时丢失，先容忍。
                     lost_ticks += 1  # 累计连续丢失帧数。
@@ -417,9 +581,9 @@ class LieDetectorService:  # 独立测谎监控服务：后台守护线程值守
             return None  # 排除。
         return task  # 返回可暂停的脚本任务。
 
-    def _solve(self, first_frame, trigger_name, region_name, threshold):  # 解测谎子循环：DIS 光流+粒子滤波跟踪透明图形并移动光标，直到【测谎触发】标注消失或场景结束。
+    def _solve(self, first_frame, trigger_name, region_name, threshold, precision_tier="high"):  # 解测谎子循环：DIS 光流+粒子滤波跟踪透明图形并移动光标，直到【测谎触发】标注消失或场景结束。
         self._ensure_in_front()  # 游戏窗口置顶：鼠标追踪依赖前台窗口接收鼠标事件。
-        session = ShapeTrackSession(params=ShapeTrackParams(), logger=None)  # 光流粒子滤波在线会话，与测谎检验页签同一套算法（无神经网络）。
+        session = ShapeTrackSession(params=ShapeTrackParams(precision_tier=precision_tier), logger=None)  # 光流粒子滤波在线会话，与测谎检验页签同一套算法（无神经网络）；按看板精度档装配。
         fps = float(CAPTURE_FPS)  # 采集帧率，喂给会话换算时间阈值（场景结束/淡出判定）。
         region = None  # 当前有效的【测谎坐标框】区域 (x, y, w, h)，未采集到前保持 None。
         mouse_pos = None  # 上一帧鼠标目标点（画面坐标），用于分步平滑追赶。
@@ -428,16 +592,24 @@ class LieDetectorService:  # 独立测谎监控服务：后台守护线程值守
         last_diag_time = 0.0  # 上次诊断日志时间。
         trigger_box = None  # 最近一次命中的【测谎触发】框，丢失容忍期内沿用它继续绘制。
         lost_ticks = 0  # 连续未匹配到【测谎触发】的帧数，超过容忍值才判定测谎真正结束。
-        while not self._exit_event.is_set():  # 循环直到触发标注持续消失、场景结束、兜底超时或进程退出。
+        outcome = "timeout"  # 录像结束原因，默认兜底超时（含进程退出中断）；命中三个 break 出口时分别改写为 timeout/gone/solved。
+        while not self._exit_event.is_set():  # 循环直到触发标注持续消失、场景结束、兜底超时、用户急停或进程退出。
+            if self._abort_event.is_set():  # 用户敲了急停键：立即中止解题（跟踪路径不对时人为及时接管）。
+                logger.info(f"Lie solve aborted by hotkey at tick {tick}, resume. 第 {tick} 帧收到急停按键，已立即中止解测谎并退回监控。")
+                outcome = "aborted"  # 录像标记为用户急停中止。
+                self._set_status("aborted by hotkey")  # 状态立即可见，便于核对是谁中止的。
+                break  # 退出子循环，finally 会恢复被暂停的任务并开启冷却。
             tick += 1  # 帧计数累加。
             if tick > LIE_MAX_TICKS:  # 长时间未结束，可能触发标注误匹配，退回监控。
                 logger.warning(f"Lie solve exceeded {LIE_MAX_TICKS} frames, resume. 解测谎超过 {LIE_MAX_TICKS} 帧未结束，退回监控。")  # 记录兜底退出。
+                outcome = "timeout"  # 录像标记为兜底超时。
                 break  # 退出子循环。
             found = self._find_trigger(frame, trigger_name, threshold)  # 本帧匹配【测谎触发】标注。
             if found is None:  # 本帧未匹配到：可能只是弹窗淡出期或分数抖动造成的瞬时丢失，先容忍。
                 lost_ticks += 1  # 累计连续丢失帧数。
                 if lost_ticks > LIE_TRIGGER_LOST_TOLERANCE:  # 连续多帧都丢失才认定测谎结束，避免抖动导致光流会话刚建立就被打断。
                     logger.info(f"Lie detector finished after {lost_ticks} lost frames, resume. 【测谎触发】标注连续 {lost_ticks} 帧消失，测谎已结束，解除测谎状态。")  # 记录退出原因与丢失帧数。
+                    outcome = "gone"  # 录像标记为触发消失（正常解除）。
                     break  # 退出子循环。
             else:  # 本帧命中，触发仍在页面上。
                 lost_ticks = 0  # 丢失计数清零。
@@ -457,6 +629,8 @@ class LieDetectorService:  # 独立测谎监控服务：后台守护线程值守
                 mouse_pos = None  # 鼠标目标点重新校准。
             else:  # 区域位置稳定。
                 region = new_region  # 刷新区域（尺寸可能微调）。
+            if self._recorder is not None:  # 写整帧给录像器：录像器按触发时确定的【测谎坐标框】内部裁剪，frame 全程干净，可直接供验证页签复算。
+                self._recorder.write(frame)  # 非阻塞入队，队列满即丢帧，绝不回压 30FPS 求解。
             crop = frame[region[1]:region[1] + region[3], region[0]:region[0] + region[2]]  # 裁出谎言检测图形区域。
             result = session.update(crop, fps)  # 喂入光流粒子滤波会话，返回单帧跟踪结果（区域局部坐标）。
             if result.tracker_alive and result.center is not None:  # 有有效跟踪输出时才移动光标。
@@ -470,11 +644,13 @@ class LieDetectorService:  # 独立测谎监控服务：后台守护线程值守
             self._update_vision(self.draw_shape_overlay(frame, region, result, trigger_box))  # 把光流轮廓、目标中心与触发标注框选推送给 UI。
             if result.source == SOURCE_SCENE_ENDED:  # 场景结束（切场景/结算文字）：测谎已解，退出。
                 logger.info("Lie detector scene ended, resume. 光流判定场景结束，测谎已解，解除测谎状态。")  # 记录退出原因。
+                outcome = "solved"  # 录像标记为已解出。
                 break  # 退出子循环。
             self._idle_sleep(CAPTURE_MIN_INTERVAL)  # 按固定 30FPS 节拍取帧。
             new_frame = self._capture()  # 取最新一帧画面。
             if new_frame is not None:  # 取到新帧才替换，取不到沿用上一帧继续求解。
                 frame = new_frame  # 更新当前帧。
+        return outcome  # 返回结束原因（solved/timeout/gone），供录像边车记录。
 
     def _move_mouse_toward(self, current, target):  # 每帧向预测光标位置分步移动鼠标，返回移动后的位置。
         if current is None:  # 首帧无参照点，直接跳到预测点（游戏内光标也会瞬间到位）。

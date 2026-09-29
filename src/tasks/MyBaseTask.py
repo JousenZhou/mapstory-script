@@ -20,7 +20,7 @@ _feature_set_module.load_json = _load_json_utf8  # 替换库内默认按系统 G
 _THREE_DECIMAL_KEYS = frozenset({"Move Away Seconds", "Move Back Seconds"})
 
 # 需要放大上限的浮点配置键：框默认上限 99.99，Del 间隔需要输入三位数（如 100 秒）。
-_LARGE_MAX_KEYS = frozenset({"Del Key Interval", "Del Key Interval Variance"})
+_LARGE_MAX_KEYS = frozenset({"Del Key Interval"})
 
 _original_double_spinbox_init = _double_spinbox_module.LabelAndDoubleSpinBox.__init__  # 保存框架浮点控件的原构造函数。
 

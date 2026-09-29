@@ -131,6 +131,21 @@ class TestDashboardTaskPanel(unittest.TestCase):
         self.assertIsInstance(mod._build_control(task, "Ratio"), DoubleSpinBox)  # float -> 小数框。
         self.assertIsInstance(mod._build_control(task, "Label"), LineEdit)  # str -> 输入框。
 
+    def test_hidden_keys_not_rendered(self):
+        # 隐藏名单里的底层变量（如灰度匹配）不应出现在配置网格中，普通键照常渲染。
+        from qfluentwidgets import BodyLabel
+        from src.ui import DashboardTaskPanel as mod
+        task = _StubTask()
+        task.default_config["Use Gray Scale"] = True  # 属于 _HIDDEN_KEYS，应被跳过。
+        task.config["Use Gray Scale"] = True
+        card = mod.TaskAccordionCard(task)
+        try:
+            texts = [label.text() for label in card.findChildren(BodyLabel)]
+            self.assertNotIn("灰度匹配", texts)  # 隐藏键不渲染标签。
+            self.assertIn("Count", texts)  # 未隐藏的普通整数键仍渲染。
+        finally:
+            mod.communicate.task.disconnect(card._on_task_event)  # 断开全局信号，避免回调已销毁控件。
+
     def test_write_config_and_str(self):
         from src.ui import DashboardTaskPanel as mod
         task = _StubTask()

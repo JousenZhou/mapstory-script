@@ -54,7 +54,6 @@ _FLOAT_SPEC = {
     "Move Back Seconds": (3, 0.0, 999.0, 0.05),
     "Turn Interval": (1, 0.0, 86400.0, 1.0),
     "Frame Interval": (3, 0.0, 10.0, 0.01),
-    "Del Key Interval Variance": (1, 0.0, 999.0, 1.0),
     "Minimap Threshold": (2, 0.01, 1.0, 0.05),
     "Patrol Left Percent": (1, 0.0, 100.0, 1.0),
     "Patrol Right Percent": (1, 0.0, 100.0, 1.0),
@@ -88,7 +87,6 @@ _CONFIG_LABEL_ZH = {
     "Frame Interval": "帧间隔(秒)",
     # —— 巡逻任务（MaplePatrolTask）——
     "Patrol Enabled": "启用巡逻",
-    "Del Key Interval Variance": "Del间隔浮动",
     "Minimap Feature": "小地图标注",
     "Minimap Threshold": "小地图阈值",
     "Map Rect": "地图区域(%)",
@@ -102,6 +100,17 @@ _CONFIG_LABEL_ZH = {
     # —— 单点挂机任务（MapleSingleSpotTask）——
     "Return Offset Max Percent": "碰撞偏移归位max(%)",
 }
+
+# 任务控制栏统一隐藏的底层配置键：这些变量对日常挂机没有调整价值，一律不在配置网格中渲染，
+# 运行时沿用任务 default_config 的默认值（灰度匹配、帧间隔、地图区域与黄点取色/面积阈值）。
+_HIDDEN_KEYS = frozenset({
+    "Use Gray Scale",  # 灰度匹配。
+    "Frame Interval",  # 帧间隔(秒)。
+    "Map Rect",  # 地图区域(%)。
+    "Dot Hue Min",  # 黄点色相下限。
+    "Dot Hue Max",  # 黄点色相上限。
+    "Dot Min Pixels",  # 黄点最小面积。
+})
 
 
 def _tr(text):  # 翻译文本：优先用 app 的 gettext 目录（任务名与配置键都在其中），app 尚未就绪时原样返回，与框架 start_controller.tr 的防御式写法一致。
@@ -197,6 +206,8 @@ class TaskAccordionCard(ExpandSettingCard):  # 单个任务的手风琴卡片：
         row, col = 0, 0  # 当前写入的行列（col 取 0/1 表示本行第几对）。
         for key in self.task.default_config:  # 遍历任务默认配置的键（已在任务构造时剔除搬到看板的共享键）。
             if key.startswith('_'):  # 下划线开头是框架内部键，不展示。
+                continue
+            if key in _HIDDEN_KEYS:  # 灰度匹配/帧间隔/地图区域/黄点取色等底层变量统一隐藏，运行时沿用默认值。
                 continue
             label = BodyLabel(_CONFIG_LABEL_ZH.get(key) or _tr(key))  # 标签优先用简短中文，未收录的键回退翻译/原文。
             control = _build_control(self.task, key)  # 按类型创建绑定控件。

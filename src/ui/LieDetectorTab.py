@@ -1,6 +1,7 @@
 # 测谎检验页签：用户上传谎言检测器录像，按视频原帧率实时播放（处理跟不上时丢帧保实时，贴近真实采集场景），
 # 用 DIS 稠密光流对齐历史帧 + 粒子滤波跟踪透明轮廓（无神经网络），
 # 画面叠加轮廓、状态与实测/源帧率，视频模式不发送鼠标，仅验证算法效果。
+import math
 import os
 from pathlib import Path
 import queue
@@ -10,15 +11,20 @@ import time
 import cv2  # 导入 OpenCV，用于读视频与叠加绘制。
 import numpy as np  # 导入 NumPy，用于画面矩阵。
 from PySide6.QtCore import Qt, QThread, QTimer, Signal  # 导入 Qt 线程、定时器与信号。
-from PySide6.QtWidgets import QFileDialog, QHBoxLayout, QLabel, QSizePolicy, QWidget  # 导入布局与控件。
-from qfluentwidgets import BodyLabel, FluentIcon, PushButton, TextEdit  # 导入 Fluent 控件。
+from PySide6.QtWidgets import QFileDialog, QHBoxLayout, QLabel, QWidget  # 导入布局与控件。
+from qfluentwidgets import BodyLabel, ComboBox, FlowLayout, FluentIcon, PushButton, TextEdit  # 导入 Fluent 控件。
 
+from ok import og  # 导入全局对象：改精度/延迟后通知独立测谎服务热更新配置。
 from ok.gui.widget.CustomTab import CustomTab  # 导入自定义页签基类。
-from src.ui.DashboardTab import VisionLabel  # 复用看板页签的自适应画面标签。
+from src.ui.DashboardTab import LIE_PRECISION_GPU_ONLY, LIE_PRECISION_TIERS, VisionLabel  # 复用看板页签的画面标签与精度档定义（单一数据源，避免两处不一致）。
+from src.ui.spin_wheel_guard import DoubleSpinBox  # 触发延迟数字框用滚轮守卫子类：需点击聚焦后滚轮才生效，避免滚动页面误改数值。
+from src.dashboard_store import load_dashboard_config, save_dashboard_config  # 读写看板配置：验证页签与线上服务同档复算，改精度/延迟合并写回 Dashboard.json。
+from src.liedetector.gpu_shape_backend import cupy_available  # 探测 CuPy+N 卡可用性：决定验证页签精度下拉可选档位与运算后端显示。
 
 TICK_FPS_FALLBACK = 30  # 源帧率缺失时的回退帧率，与参考项目 FPS=30 一致。
-TIMEOUT_TICKS = 545  # 超时预算 545 tick@30fps（约 18 秒），与参考项目 solve_shape.rs 一致；实际按源帧率折算成视频时长。
+TIMEOUT_TICKS = 545  # 算法超时预算下限 545 tick@30fps（约 18 秒），与参考项目 solve_shape.rs 一致；实际 timeout_ticks 取此预算与视频总帧数的较大者（回放整段录像）。
 LOCATE_MAX_SIDE = 400  # 全屏弹窗定位的分辨率上限（最长边像素）：超过则先缩帧再匹配，坐标换算回原图。
+LIE_TIER_LABELS = {"low": "低", "medium": "中等", "high": "高", "ultra": "极高"}  # 精度档 key -> 中文，历史下拉摘要用。
 
 try:  # 探测 OpenCV 是否包含 DIS 稠密光流，缺失时页签降级为不可运行。
     INFERENCE_AVAILABLE = hasattr(cv2, 'DISOpticalFlow_create')
@@ -28,8 +34,9 @@ except Exception:
 from src.liedetector.detector import (  # 仅保留多尺度模板定位能力（弹窗标题定位），不再需要 YOLO 检测器。
     TEMPLATE_THRESHOLD, LieDetectorRegion, MultiScaleTemplate, _template_best_score)
 from src.liedetector.shape_session import (  # 在线编排。
-    ShapeTrackParams, ShapeTrackSession,
+    ShapeTrackParams, ShapeTrackSession, PRECISION_TIER_KEYS,
     SOURCE_BORDER, SOURCE_COLOR, SOURCE_INTERPOLATED, SOURCE_PREDICTION, SOURCE_SCENE_ENDED)
+from src.liedetector.recorder import LIE_RECORD_DIR, list_records  # 测谎录像历史：列举 lie_records 边车记录供下拉复算。
 
 
 class _EmitLogger:  # 把检测器内部日志转发成 Qt 信号的适配器。
@@ -87,15 +94,17 @@ def draw_shape_overlay(frame, region, result, tick, status, timeout_ticks, fps_t
                     cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2, cv2.LINE_AA)
 
 
-class LieDetectorWorker(QThread):  # 工作线程：在线分析 + 实时预览，不限速全速处理。
+class LieDetectorWorker(QThread):  # 工作线程：在线分析 + 实时预览，按视频原帧率播放（处理超时丢帧保实时）。
 
     log_message = Signal(str)  # 日志消息信号。
     algorithm_ready = Signal(str)  # 算法准备就绪信号（参数摘要）。
     finished_result = Signal(bool, str)  # 结束信号：(是否通过, 结果描述)。
 
-    def __init__(self, video_path, parent=None):
+    def __init__(self, video_path, tier="high", parent=None, delay=0.0):
         super().__init__(parent)
         self.video_path = video_path  # 录像路径。
+        self.tier = tier  # 复算精度档：由页签精度下拉传入，与线上服务同档验证。
+        self.delay = max(0.0, float(delay))  # 触发延迟秒数：定位到弹窗后先等待再解题，与线上服务一致；<=0 表示不延迟。
         self.frame_queue = queue.Queue(maxsize=2)  # 只保留最新帧，避免 UI 积压。
         self._stopped = threading.Event()  # 停止标志。
 
@@ -113,7 +122,7 @@ class LieDetectorWorker(QThread):  # 工作线程：在线分析 + 实时预览�
                 pass
             self.frame_queue.put_nowait(frame)
 
-    def run(self):  # 线程主循环：全速逐帧分析 + 实时预览。
+    def run(self):  # 线程主循环：按源帧率逐帧分析 + 实时预览（处理超时丢帧保实时）。
         cap = cv2.VideoCapture(self.video_path)  # 打开录像。
         if not cap.isOpened():  # 打开失败。
             self.log_message.emit(f"cannot open video 无法打开视频: {self.video_path}")
@@ -125,9 +134,12 @@ class LieDetectorWorker(QThread):  # 工作线程：在线分析 + 实时预览�
         if not (5.0 <= src_fps <= 240.0):  # 部分容器返回 0/1000 等异常值：回退 30。
             src_fps = float(TICK_FPS_FALLBACK)
         frame_interval = 1.0 / src_fps  # 原帧率播放的单帧间隔（秒）。
-        timeout_ticks = max(1, int(round(TIMEOUT_TICKS / TICK_FPS_FALLBACK * src_fps)))  # 超时预算按源帧率折算，固定约 18 秒视频时长。
+        budget_ticks = max(1, int(round(TIMEOUT_TICKS / TICK_FPS_FALLBACK * src_fps)))  # 算法超时预算按源帧率折算，约 18 秒。
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)  # 视频总帧数：录像按真实时长补齐后可能长于 18 秒预算。
+        # 验证需回放整段录像：取「算法预算」与「总帧数+1 秒余量」的较大者，避免长录像（含触发延迟/慢采集补齐）在片尾判定前被判超时。
+        timeout_ticks = max(budget_ticks, frame_count + int(round(src_fps))) if frame_count > 0 else budget_ticks
         self.log_message.emit(
-            f"video {frame_w}x{frame_h} opened 视频已打开 src_fps={src_fps:.1f} 源帧率 timeout={timeout_ticks} ticks")
+            f"video {frame_w}x{frame_h} opened 视频已打开 src_fps={src_fps:.1f} 源帧率 frames={frame_count} timeout={timeout_ticks} ticks")
         region_finder = LieDetectorRegion()  # 多尺度模板定位器。
         try:  # 前置流程（模板缩小/探测/定位器构造）异常时也要正常收尾，避免线程静默死亡卡死 UI。
             locate_scale = min(1.0, LOCATE_MAX_SIDE / max(frame_w, frame_h, 1))  # 定位缩帧系数：按最长边封顶。
@@ -172,7 +184,10 @@ class LieDetectorWorker(QThread):  # 工作线程：在线分析 + 实时预览�
             return
 
         # ---- 在线分析初始化 ----
-        params = ShapeTrackParams()  # 使用实时档参数。
+        tier = str(self.tier or 'high').strip()  # 用页签精度下拉传入的档位复算，与线上服务同档验证。
+        if tier not in PRECISION_TIER_KEYS:  # 非法档位（防御性校验）。
+            tier = 'high'
+        params = ShapeTrackParams(precision_tier=tier)  # 按精度档装配，与线上解测谎同档复算（无 N 卡时 high/ultra 会在会话构造时回落 medium）。
         logger_adapter = _EmitLogger(self.log_message.emit)  # 日志适配器。
         session = None  # 先置空：收尾日志兼容会话构造失败的情形。
         session = ShapeTrackSession(params=params, logger=logger_adapter)  # 在线编排状态机。
@@ -195,9 +210,12 @@ class LieDetectorWorker(QThread):  # 工作线程：在线分析 + 实时预览�
         frame_idx = 0  # 下一个待读帧序号，丢帧快进时推进。
         play_start = 0.0  # 原帧率播放的绝对时间起点，主循环首帧时锁定。
         next_deadline = 0.0  # 当前帧的原帧率播放节拍点（绝对时间）。
+        delay_active = False  # 触发延迟等待中：定位到弹窗后先按原速播放 self.delay 秒再解题。
+        delay_done = False  # 触发延迟是否已结束（避免区域抖动重置时重复计时）。
+        delay_deadline = 0.0  # 触发延迟结束的绝对时间点。
 
         self.log_message.emit(  # 打印实际生效的参数，便于与外部脚本回归对照。
-            f"algorithm params: scale={params.process_scale} lags={params.temporal_lags} "
+            f"algorithm params: tier={params.precision_tier} scale={params.process_scale} lags={params.temporal_lags} "
             f"particles={params.particle_count} proposals={params.global_proposals}")
 
         try:  # ---- 在线分析 + 实时预览（按源帧率播放，处理超时丢帧保实时） ----
@@ -282,11 +300,36 @@ class LieDetectorWorker(QThread):  # 工作线程：在线分析 + 实时预览�
                             f"tick {tick}: title match score {score:.3f} (threshold {TEMPLATE_THRESHOLD}) "
                             f"标题模板最高分 {score:.3f}（阈值 {TEMPLATE_THRESHOLD}）")
                     self._push_frame(frame)
-                else:  # 弹窗已定位：推进求解。
+                else:  # 弹窗已定位：推进求解（触发延迟未到则先按原速等待，模拟线上服务延迟解题）。
                     if not found_dialog:  # 首次定位到弹窗。
                         found_dialog = True
                         if not crop_mode:
                             self.log_message.emit(f"dialog located at tick {tick}, region={region} 定位到弹窗区域")
+                        if self.delay > 0 and not delay_done:  # 配置了触发延迟：从定位到弹窗这一刻起计时等待。
+                            delay_deadline = time.perf_counter() + self.delay  # 延迟结束时间点。
+                            delay_active = True  # 进入延迟等待。
+                            self.log_message.emit(
+                                f"trigger delay {self.delay:.1f}s, wait before solving 触发延迟 {self.delay:.1f} 秒后再开始解测谎")
+                    if delay_active:  # 延迟等待期：只按原速播放预览，不喂求解器。
+                        if time.perf_counter() >= delay_deadline:  # 延迟已到，开始解题。
+                            delay_active = False
+                            delay_done = True
+                            self.log_message.emit("trigger delay elapsed, start solving 触发延迟结束，开始解测谎")
+                        else:  # 仍在延迟：叠加倒计时状态并跳过本帧求解。
+                            remaining = delay_deadline - time.perf_counter()  # 剩余等待秒数。
+                            status = f"delaying {math.ceil(remaining)}s"  # 倒计时按整秒显示。
+                            cv2.putText(frame, f"tick {tick}/{timeout_ticks} [{mode_tag}] {status}", (8, 22),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+                            if fps_text:  # 延迟期也显示实测/源帧率。
+                                fw = frame.shape[1]  # 帧宽。
+                                (text_w, _), _ = cv2.getTextSize(fps_text, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2)  # 文本宽度。
+                                cv2.putText(frame, fps_text, (fw - text_w - 8, 24),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2, cv2.LINE_AA)
+                            self._push_frame(frame)  # 推送延迟期预览帧。
+                            now = time.perf_counter()  # 延迟期同样按原帧率节拍播放。
+                            if now < next_deadline:
+                                time.sleep(next_deadline - now)
+                            continue  # 本帧不解题，读下一帧。
                     rx, ry, rw, rh = region
                     # 区域首次出现或位移超阈值时 reset 状态机（清空光流历史、模板、跟踪器）。
                     if last_region is None or abs(rw - last_region[2]) > 4 or abs(rh - last_region[3]) > 4:
@@ -341,25 +384,47 @@ class LieDetectorTab(CustomTab):  # 测谎检验页签：上传录像验证谎�
         self.video_path = ""
 
         control = QWidget()
-        layout = QHBoxLayout(control)
+        layout = FlowLayout(control, needAni=False)  # 自适应流式布局：控件按可用宽度自动换行，不再全挤在一行。
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.setHorizontalSpacing(10)  # 同行控件的水平间距。
+        layout.setVerticalSpacing(10)  # 换行后行与行的垂直间距。
         self.pick_button = PushButton(FluentIcon.FOLDER, "选择视频")
         self.pick_button.clicked.connect(self.pick_video)
+        self.history_combo = ComboBox()  # 历史录像下拉：列出 lie_records 里的触发录像，选中即可复算验证。
+        self.history_combo.setMinimumWidth(220)  # 保证摘要（时间/分/档/结果）可见。
+        self.history_combo.activated.connect(self._on_history_selected)  # activated 仅用户点选时触发，程序重建不误触发。
+        self.refresh_history_button = PushButton(FluentIcon.SYNC, "刷新")  # 手动刷新历史下拉。
+        self.refresh_history_button.clicked.connect(self._reload_history)
+        self.precision_label = BodyLabel("精度")  # 精度下拉标签。
+        self.precision_combo = ComboBox()  # 复算精度档下拉（低/中等/高/极高，GPU 门控），与看板 Dashboard.json 同键，改动即合并写回并通知服务。
+        self.precision_combo.setMinimumWidth(90)  # 保证档位中文可见。
+        self.precision_combo.currentIndexChanged.connect(self._persist_lie_settings)  # 用户改档即持久化（加载期由 _loading 守卫屏蔽）。
+        self.backend_label = BodyLabel("运算后端: --")  # 只读显示当前测谎打分后端（GPU/CPU），按显卡可用性刷新。
+        self.delay_label = BodyLabel("触发延迟")  # 触发延迟标签。
+        self.delay_spin = DoubleSpinBox()  # 触发延迟秒数，与看板 Dashboard.json 同键，改动即合并写回并通知服务。
+        self.delay_spin.setRange(0.0, 60.0)  # 延迟范围 0~60 秒，0 表示不延迟立即解题。
+        self.delay_spin.setSingleStep(0.5)  # 步长。
+        self.delay_spin.setDecimals(1)  # 保留一位小数。
+        self.delay_spin.setSuffix(" s")  # 单位后缀，一眼看出是秒数。
+        self.delay_spin.valueChanged.connect(self._persist_lie_settings)  # 用户改延迟即持久化（加载期由 _loading 守卫屏蔽）。
         self.path_label = BodyLabel("未选择视频")
-        self.path_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.path_label.setMinimumWidth(180)  # 流式布局不做拉伸，给个最小宽保证所选视频名可读。
         self.start_button = PushButton(FluentIcon.PLAY, "开始")
         self.start_button.clicked.connect(self.start)
         self.stop_button = PushButton(FluentIcon.PAUSE, "停止")
         self.stop_button.clicked.connect(self.stop)
         self.stop_button.setEnabled(False)
-        self.fps_label = BodyLabel("模式: 全速不限速")
+        self.fps_label = BodyLabel("模式: 原速播放")
         self.algorithm_label = BodyLabel("算法: --")
+        # 成对的「标签+控件」与「开始/停止」各自包进小容器，作为整体参与流式换行，避免标签与其控件被拆到两行。
         layout.addWidget(self.pick_button)
-        layout.addWidget(self.path_label, 1)
-        layout.addWidget(self.start_button)
-        layout.addWidget(self.stop_button)
-        layout.addWidget(self.fps_label)
-        layout.addWidget(self.algorithm_label)
+        layout.addWidget(self._flow_group(self.history_combo, self.refresh_history_button))
+        layout.addWidget(self._flow_group(self.precision_label, self.precision_combo))
+        layout.addWidget(self.backend_label)
+        layout.addWidget(self._flow_group(self.delay_label, self.delay_spin))
+        layout.addWidget(self._flow_group(self.start_button, self.stop_button))
+        layout.addWidget(self.path_label)
+        layout.addWidget(self._flow_group(self.fps_label, self.algorithm_label))
         self.add_card("视频与运行", control)
 
         if not INFERENCE_AVAILABLE:  # 依赖缺失时禁用运行并提示安装命令。
@@ -377,6 +442,10 @@ class LieDetectorTab(CustomTab):  # 测谎检验页签：上传录像验证谎�
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh)
         self.timer.start(33)  # 按 30FPS 节拍拉取标注帧显示。
+        self._loading = False  # 加载守卫：程序回填控件值期间置 True，避免 _persist_lie_settings 被自身触发回写。
+        self._load_lie_settings()  # 从 Dashboard.json 回填精度下拉与触发延迟（含 GPU 门控刷新）。
+        self._reload_history()  # 初始填充历史录像下拉（页签每次显示时也会刷新）。
+        self._center_status_labels()  # 只读标签与控件等高，流式行内垂直居中（首显示时按真实控件高度再校正一次）。
 
     @property
     def name(self):
@@ -385,9 +454,122 @@ class LieDetectorTab(CustomTab):  # 测谎检验页签：上传录像验证谎�
     def append_log(self, message):  # 追加一行运行日志。
         self.log_edit.append(message)
 
+    def showEvent(self, event):  # 页签每次显示时刷新精度/延迟与历史下拉，让看板改动与刚录好的触发录像即时同步。
+        super().showEvent(event)  # 先走父类显示逻辑。
+        self._load_lie_settings()  # 从 Dashboard.json 回填精度与延迟（看板页签可能已改动，切回来时同步）。
+        self._reload_history()  # 重建历史下拉。
+        self._center_status_labels()  # 按显示后的真实控件高度校正只读标签高度，保证流式行内垂直居中。
+
+    def _reload_history(self):  # 用 list_records 重建历史下拉：首项占位，其余每条录像一项（摘要 label，data=mp4 路径）。
+        current = self.video_path  # 记录当前视频路径，重建后尽量保持选中。
+        records = list_records()  # 扫描 lie_records 边车，按时间倒序（新->旧）。
+        self.history_combo.blockSignals(True)  # 重建期间屏蔽信号（activated 本就只在用户点选时发，双保险）。
+        self.history_combo.clear()  # 清空旧项。
+        self.history_combo.addItem("历史记录", None, None)  # 首项占位，data=None 表示未选具体录像。
+        for rec in records:  # 逐条录像填一项。
+            self.history_combo.addItem(self._format_history_label(rec), None, rec.get("path"))
+        self.history_combo.blockSignals(False)  # 恢复信号。
+        index = self.history_combo.findData(current) if current else -1  # 定位当前视频对应项。
+        self.history_combo.setCurrentIndex(index if index >= 0 else 0)  # 命中则选中，否则回占位首项。
+
+    def _format_history_label(self, rec):  # 把一条记录格式化成下拉摘要：MM-DD HH:MM 分X.XX 档 结果。
+        ts = str(rec.get("timestamp") or "")  # ISO 起录时间戳。
+        short = ts  # 默认原样，解析失败也不至于空。
+        if "T" in ts:  # "2026-09-28T18:39:00" -> "09-28 18:39"。
+            date_part, time_part = ts.split("T", 1)  # 拆日期与时间。
+            short = f"{date_part[5:]} {time_part[:5]}"  # MM-DD HH:MM。
+        try:  # 触发分保留两位小数。
+            score_txt = f"{float(rec.get('score')):.2f}"
+        except (TypeError, ValueError):  # 分数缺失或非法。
+            score_txt = "--"
+        tier = LIE_TIER_LABELS.get(str(rec.get("tier") or ""), str(rec.get("tier") or "--"))  # 精度档中文。
+        outcome = str(rec.get("outcome") or "--")  # 结束原因（solved/timeout/gone/abandoned）。
+        return f"{short} 分{score_txt} {tier} {outcome}"  # 拼接摘要。
+
+    def _on_history_selected(self, index):  # 用户从历史下拉选中一条录像：设为当前视频，供「开始」复算验证。
+        path = self.history_combo.itemData(index)  # 取该项的 mp4 路径。
+        if not path:  # 占位项或无路径，忽略。
+            return
+        self.video_path = path  # 设为当前待验证视频。
+        self.path_label.setText(os.path.basename(path))  # 显示文件名。
+        self.append_log(f"history selected 已选择历史录像: {path}")  # 记日志。
+
+    def _refresh_precision_options(self):  # 按显卡可用性刷新精度下拉可选档与运算后端显示：GPU 四档齐全，CPU 移除高/极高并回落中等。
+        try:  # 探测异常（驱动问题等）按无显卡处理，不能拖垮验证页签加载。
+            gpu = bool(cupy_available())
+        except Exception:  # 探测本身报错。
+            gpu = False
+        self.backend_label.setText("运算后端: GPU" if gpu else "运算后端: CPU")  # 后端显示项，最佳努力（运行期真实降级以会话构造 clamp 为准）。
+        current = self.precision_combo.currentData()  # 记录当前选中档 key，重建后尽量保持。
+        tiers = LIE_PRECISION_TIERS if gpu else tuple(t for t in LIE_PRECISION_TIERS if t[0] not in LIE_PRECISION_GPU_ONLY)  # CPU 只保留低/中等。
+        self.precision_combo.blockSignals(True)  # 重建期间不触发信号（也避免误触发持久化）。
+        self.precision_combo.clear()  # 清空旧项：qfluentwidgets ComboBox 非 QComboBox 子类，逐项 disable 不可靠，改用重建规避。
+        for key, label in tiers:  # 按可用档重新填充。
+            self.precision_combo.addItem(label, None, key)
+        self.precision_combo.blockSignals(False)  # 恢复信号。
+        self._set_precision_value(current or 'high')  # 还原原选中档；被移除（CPU 下高/极高）时回落中等。
+
+    def _set_precision_value(self, key):  # 按 key 选中精度档；key 不在可选档（如 CPU 下的高/极高）时回落中等，再不行落首项。
+        index = self.precision_combo.findData(key)  # 按 userData 定位目标档。
+        if index < 0:  # 目标档不可用。
+            index = self.precision_combo.findData('medium')  # 回落中等。
+        if index < 0:  # 连中等也不在（理论上不会）。
+            index = 0  # 落首项兜底。
+        self.precision_combo.setCurrentIndex(index)  # 选中目标档。
+
+    def _load_lie_settings(self):  # 从 Dashboard.json 回填精度下拉与触发延迟，加载期置守卫避免自我触发回写。
+        self._loading = True  # 进入加载：屏蔽 _persist_lie_settings。
+        try:  # 配置读取异常不能拖垮页签构造/显示。
+            data = load_dashboard_config()  # 读看板配置（缺失键由其内部补默认）。
+            self._refresh_precision_options()  # 先按显卡可用性重建可选档。
+            self._set_precision_value(str(data.get('Lie Detector Precision') or 'high'))  # 选中配置精度档（CPU 下高/极高自动回落中等）。
+            self.delay_spin.setValue(float(data.get('Lie Detector Trigger Delay', 5.0)))  # 回填触发延迟秒数。
+        except Exception:  # 读取/回填异常：保持控件默认值。
+            pass
+        finally:
+            self._loading = False  # 退出加载：恢复持久化。
+
+    def _persist_lie_settings(self, *args):  # 用户改精度/延迟即合并写回 Dashboard.json 并通知测谎服务热更新（加载期由守卫跳过）。
+        if getattr(self, '_loading', False):  # 程序回填控件值触发的信号，不回写。
+            return
+        try:  # 合并写：先读全量配置，只改精度与延迟两键，避免覆盖看板其它字段。
+            data = load_dashboard_config()  # 读当前全量配置。
+            data['Lie Detector Precision'] = self.precision_combo.currentData() or 'high'  # 精度档。
+            data['Lie Detector Trigger Delay'] = round(float(self.delay_spin.value()), 1)  # 触发延迟（一位小数，与看板一致）。
+            save_dashboard_config(data)  # 全量落盘（save 内部原子写）。
+            lie_service = getattr(og.my_app, 'lie_service', None) if og.my_app is not None else None  # 取独立测谎监控服务（由 Globals 持有）。
+            if lie_service is not None:  # 服务已就绪时通知它立即重读配置。
+                lie_service.reload_config()  # 测谎参数热更新，验证页签与线上服务同档。
+            self.append_log(f"settings saved 精度={data['Lie Detector Precision']} 触发延迟={data['Lie Detector Trigger Delay']}s 已写回看板配置")  # 记日志。
+        except Exception as exc:  # 写回失败不影响验证，仅记日志。
+            self.append_log(f"settings save failed 配置写回失败: {exc}")
+
+    def _flow_group(self, *widgets):  # 把若干控件横向包进一个小容器，供流式布局当作整体摆放（标签与其控件不被拆行）。
+        box = QWidget()
+        row = QHBoxLayout(box)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)  # 组内控件紧凑些。
+        for widget in widgets:
+            row.addWidget(widget)
+        return box
+
+    def _center_status_labels(self):  # 让只读标签与相邻控件等高并垂直居中：FlowLayout 按各项 sizeHint 高度贴行顶摆放，矮标签会顶对齐。
+        try:  # 控件高度尚未就绪时保持默认，不影响页签可用。
+            ref_h = max(self.pick_button.sizeHint().height(),
+                        self.precision_combo.sizeHint().height(),
+                        self.delay_spin.sizeHint().height())  # 取相邻控件的最大高度作基准。
+        except Exception:  # 读取高度异常。
+            return
+        if ref_h <= 0:  # 未取得有效高度。
+            return
+        for label in (self.backend_label, self.path_label, self.fps_label, self.algorithm_label):  # 全部只读标签统一处理。
+            label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)  # 文本左对齐 + 垂直居中。
+            label.setMinimumHeight(ref_h)  # 抬高到控件高度，配合流式行高即在行内垂直居中。
+
     def pick_video(self):  # 弹出文件对话框选择录像。
+        default_dir = LIE_RECORD_DIR if os.path.isdir(LIE_RECORD_DIR) else ""  # 默认打开录像目录（存在时），方便直接选历史录像。
         path, _ = QFileDialog.getOpenFileName(
-            self, "选择谎言检测器录像", "",
+            self, "选择谎言检测器录像", default_dir,
             "Video Files (*.mp4 *.avi *.mkv *.mov *.webm)")
         if path:
             self.video_path = path
@@ -401,14 +583,16 @@ class LieDetectorTab(CustomTab):  # 测谎检验页签：上传录像验证谎�
         if self.worker is not None and self.worker.isRunning():
             return
         self.log_edit.clear()
-        self.worker = LieDetectorWorker(self.video_path, self)
+        tier = self.precision_combo.currentData() or 'high'  # 用页签精度下拉当前档复算，与线上服务同档验证。
+        delay = float(self.delay_spin.value())  # 触发延迟：验证时同样在定位到弹窗后等待该秒数再解题，与线上服务一致。
+        self.worker = LieDetectorWorker(self.video_path, tier, self, delay=delay)  # delay 走关键字，保持 (path, tier, parent) 位置参数不变。
         self.worker.log_message.connect(self.append_log)
         self.worker.algorithm_ready.connect(self.on_algorithm_ready)
         self.worker.finished_result.connect(self.on_finished)
         self.start_button.setEnabled(False)
         self.pick_button.setEnabled(False)
         self.stop_button.setEnabled(True)
-        self.append_log(f"start verifying at full speed 开始全速验证（画面右上角显示实测 FPS）")
+        self.append_log(f"start verifying at source fps 开始按原速验证（精度 {tier}，触发延迟 {delay:.1f}s，画面右上角显示实测/源 FPS）")
         self.worker.start()
 
     def stop(self):  # 请求停止工作线程。
@@ -426,6 +610,7 @@ class LieDetectorTab(CustomTab):  # 测谎检验页签：上传录像验证谎�
         self.stop_button.setEnabled(False)
         verdict = "PASSED 通过" if ok else "NOT PASSED 未通过"
         self.append_log(f"result 结果: {verdict} - {message}")
+        self._reload_history()  # 复算结束后刷新历史下拉，让最新触发录像即时可选。
 
     def refresh(self):  # 定时从工作线程队列取最新标注帧显示。
         if self.worker is None:

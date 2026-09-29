@@ -1,4 +1,3 @@
-import random  # 导入标准库 random，用于 Del 间隔的随机浮动。
 import time  # 导入标准库 time，用于边界折返节奏、卡住计时与攻击节奏。
 
 import cv2  # 导入 OpenCV，用于小地图模板匹配、黄点取色与画面标注绘制。
@@ -41,7 +40,6 @@ class MaplePatrolTask(MapleIdleTask):  # 定义冒险岛小地图巡逻打怪任
             self.config_description.pop(key, None)  # 同步移除帮助文本。
         self.default_config.update({  # 巡逻专属配置项，父类没有需自行补充。
             "Patrol Enabled": True,  # 巡逻打怪总开关：关闭后不移动不攻击不按 Del，只推送画面并值守测谎触发。
-            "Del Key Interval Variance": 20.0,  # Del 间隔随机浮动量：每次按完后下一次间隔在基础值 ±该值内随机，设为 0 表示固定间隔。
             "Minimap Feature": "完整小地图",  # 小地图：模板页标注的分类名，按分类匹配小地图位置。
             "Minimap Threshold": 0.8,  # 小地图匹配阈值：越高匹配越严格。
             "Map Rect": "",  # 小地图框内的实际地图区域（相对小地图框的百分比，格式 x,y,w,h 如 5,20,90,75），留空表示整个小地图框。
@@ -55,7 +53,6 @@ class MaplePatrolTask(MapleIdleTask):  # 定义冒险岛小地图巡逻打怪任
         })
         self.config_description.update({  # 巡逻专属配置项的帮助文本。
             "Patrol Enabled": "Master switch of patrol movement and attacking; when off the task only watches the live vision and handles the lie detector trigger. 巡逻打怪总开关：关闭后不巡逻移动、不打怪、不按 Del，仅推送实时画面并在触发测谎时处理解测谎。",
-            "Del Key Interval Variance": "Random ±variance applied to Del Key Interval after each press, e.g. 100 with 20 gives 80-120; 0 means fixed. Del 间隔随机浮动量：每次按完后下一次间隔在基础值 ±该值内随机，0 表示固定间隔。",
             "Minimap Feature": "Category name annotated for the minimap in the Template tab. 小地图：在模板页标注的分类名。",
             "Minimap Threshold": "Template match threshold for the minimap, higher means stricter. 小地图匹配阈值，越高越严格。",
             "Map Rect": "Actual map area inside the minimap box as percents of the minimap box, format x,y,w,h e.g. 5,20,90,75; empty means the whole minimap box. 小地图框内的实际地图区域（相对小地图框的百分比，格式 x,y,w,h），留空表示整个小地图框。",
@@ -92,13 +89,6 @@ class MaplePatrolTask(MapleIdleTask):  # 定义冒险岛小地图巡逻打怪任
             except ValueError:  # 格式不合法。
                 return "Map Rect must be 4 comma-separated percents like x,y,w,h. 地图区域必须是 x,y,w,h 四个逗号分隔的百分比。"  # 阻止保存并提示。
         return None  # 其他配置项不做额外校验。
-
-    def next_del_interval(self, base, variance):  # 生成下一次按 Del 键前的等待秒数。
-        if base <= 0:  # 基础间隔为 0 表示禁用自动按 Del。
-            return 0.0  # 返回 0，调用方不会触发按键。
-        if variance <= 0:  # 未配置浮动量时保持固定间隔。
-            return base  # 直接返回基础值。
-        return max(0.1, base + random.uniform(-variance, variance))  # 基础值 ±浮动量内随机，下限 0.1 秒防止浮动过大导致连续快速按键。
 
     def detect_template_facing(self, frame, left_name, right_name, threshold):  # 串行版：用左右朝向模板判定角色实际朝向，两个匹配都在当前线程跑。
         left_box = self.find_one_raw(left_name, frame, threshold)  # 匹配左朝向模板。
@@ -148,10 +138,8 @@ class MaplePatrolTask(MapleIdleTask):  # 定义冒险岛小地图巡逻打怪任
         melee_distance = float(self.config.get("Melee Distance") or 0)  # 读取近战距离（像素），横向距离绝对值不超过该值用近战键。
         attack_x_min, attack_x_max = sorted((int(self.config.get("Attack Range X Min")), int(self.config.get("Attack Range X Max"))))  # 读取攻击区域左右边界（符号化像素），填反时自动交换。
         attack_y_min, attack_y_max = sorted((int(self.config.get("Attack Range Y Min")), int(self.config.get("Attack Range Y Max"))))  # 读取攻击区域上下边界（符号化像素），填反时自动交换。
-        del_interval = float(self.config.get("Del Key Interval") or 0)  # 读取自动按 Del 键的基础间隔秒数，0 表示禁用。
-        del_variance = float(self.config.get("Del Key Interval Variance") or 0)  # 读取 Del 间隔的随机浮动量，0 表示固定间隔。
+        del_interval = float(self.config.get("Del Key Interval") or 0)  # 读取自动按 Del 键的间隔秒数，0 表示禁用。
         last_del_time = time.time()  # 上次按 Del 键的时间，从任务启动开始计时。
-        next_del_interval = self.next_del_interval(del_interval, del_variance)  # 首段间隔也带随机浮动，方法复用父类。
         minimap_threshold = float(self.config.get("Minimap Threshold"))  # 读取小地图匹配阈值。
         char_threshold = self.config.get("Character Threshold")  # 读取角色匹配阈值，朝向校准沿用同一阈值；提前取成局部变量，并发匹配线程就不再读配置字典。
         left_pct, right_pct = sorted((float(self.config.get("Patrol Left Percent")), float(self.config.get("Patrol Right Percent"))))  # 读取巡逻左右边界（百分比），填反时自动交换。
@@ -182,10 +170,9 @@ class MaplePatrolTask(MapleIdleTask):  # 定义冒险岛小地图巡逻打怪任
                 if wait > 0:  # 未到下一帧时点时先等待，sleep 同时承担用户停止检查。
                     self.sleep(wait)  # 补齐帧间隔。
                 loop_start = time.time()  # 记录本轮起点供下轮计算。
-                if patrol_enabled and del_interval > 0 and time.time() - last_del_time >= next_del_interval:  # 巡逻模式下到达本次随机间隔时自动按一下 Del 键。
+                if patrol_enabled and del_interval > 0 and time.time() - last_del_time >= del_interval:  # 巡逻模式下到达固定间隔时自动按一下 Del 键。
                     last_del_time = time.time()  # 重置计时。
                     self.send_key("delete", down_time=0.05)  # 短按一下 Del 键。
-                    next_del_interval = self.next_del_interval(del_interval, del_variance)  # 重新随机下一段间隔，避免固定节奏。
                 frame = self.next_frame()  # 取最新一帧画面并清除旧帧。
                 if frame is None:  # 取不到画面时等待下一帧时点再重试。
                     self.sleep(loop_interval)  # 按固定 30FPS 节拍等待。

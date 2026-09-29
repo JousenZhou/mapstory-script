@@ -191,6 +191,12 @@
       "file_name": "31.png",
       "width": 1366,
       "height": 768
+    },
+    {
+      "id": 38,
+      "file_name": "32.png",
+      "width": 1366,
+      "height": 768
     }
   ],
   "annotations": [
@@ -765,6 +771,45 @@
       ],
       "area": 18642,
       "iscrowd": 0
+    },
+    {
+      "id": 45,
+      "image_id": 38,
+      "category_id": 45,
+      "bbox": [
+        18,
+        74,
+        88,
+        129
+      ],
+      "area": 11352,
+      "iscrowd": 0
+    },
+    {
+      "id": 46,
+      "image_id": 38,
+      "category_id": 46,
+      "bbox": [
+        644,
+        534,
+        46,
+        26
+      ],
+      "area": 1196,
+      "iscrowd": 0
+    },
+    {
+      "id": 47,
+      "image_id": 38,
+      "category_id": 47,
+      "bbox": [
+        563,
+        194,
+        53,
+        22
+      ],
+      "area": 1166,
+      "iscrowd": 0
     }
   ],
   "categories": [
@@ -886,7 +931,7 @@
     {
       "id": 24,
       "name": "测谎触发2",
-      "supercategory": ""
+      "supercategory": "测谎触发"
     },
     {
       "id": 25,
@@ -987,6 +1032,21 @@
       "id": 44,
       "name": "沼泽地2",
       "supercategory": ""
+    },
+    {
+      "id": 45,
+      "name": "树林底",
+      "supercategory": ""
+    },
+    {
+      "id": 46,
+      "name": "猴子1",
+      "supercategory": "怪物"
+    },
+    {
+      "id": 47,
+      "name": "蘑菇",
+      "supercategory": "怪物"
     }
   ]
 }

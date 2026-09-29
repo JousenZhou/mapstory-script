@@ -25,6 +25,50 @@ from dataclasses import dataclass  # 数据类装饰器，承载算法中间结�
 import cv2  # OpenCV：HSV 转换、形态学、轮廓、光流、重映射。
 import numpy as np  # 数值计算：向量化旋转、打分、粒子群运算。
 
+from src.liedetector.gpu_shape_backend import (  # 打分内核双后端：同一份算法代码，有 N 卡走 CuPy，没有则 NumPy。
+    BorderEvidence,  # 矩形四边打分结果（定义迁至后端模块，此处 re-export 保持旧导入路径可用）。
+    ShapeEvidence,  # 轮廓打分结果（同上）。
+    ShapeScoreBackend,  # 打分后端类型。
+    clear_gpu_failure,  # 打分成功后清零显卡连续失败计数。
+    mark_gpu_failure,  # 记录显卡运行期异常，连续失败达上限后永久回退 NumPy。
+    numpy_backend,  # NumPy 后端单例。
+    require_gpu_backend,  # 请求显卡后端（不可用/已降级时返回 NumPy 后端）。
+    sample_map_core,  # 采样内核（后端版）。
+    score_rotated_borders_core,  # 矩形四边打分内核（后端版）。
+    score_shape_contours_core,  # 通用轮廓打分内核（后端版）。
+    transform_template_points_core,  # 模板点变换内核（后端版）。
+)
+
+
+def _resolve_backend(backend):  # 解析本次打分使用的后端：显式传入优先，否则取全局生效后端（CuPy 或 NumPy）。
+    if backend is not None:  # 调用方显式指定了后端（会话装配时注入）。
+        return backend  # 直接使用。
+    return require_gpu_backend()  # 未指定：请求显卡后端，不可用/已降级时返回 NumPy 后端。
+
+
+def _to_numpy_array(item):  # 把后端数组统一转回 NumPy（CuPy 数组用 .get() 下载，NumPy 数组直接复用）。
+    if isinstance(item, np.ndarray):  # 已是 NumPy 数组。
+        return item  # 直接返回。
+    getter = getattr(item, "get", None)  # CuPy 数组的 D2H 下载方法。
+    if callable(getter):  # 显卡数组。
+        return getter()  # 下载到主存。
+    return np.asarray(item)  # 其余情况兼容处理。
+
+
+def _run_scoring(core, kind, backend, *args):  # 统一的打分调度：显卡后端异常时自动改走 NumPy 重算本帧，返回 NumPy 版结果数据类。
+    chosen = _resolve_backend(backend)  # 本次生效的后端。
+    if chosen.is_gpu and chosen is require_gpu_backend():  # 全局显卡后端：运行期异常（显存不足/驱动重置等）不能中断求解。
+        try:  # 显卡执行段。
+            result = core(chosen.xp, *args)  # 在显卡上执行打分内核。
+            packed = kind(_to_numpy_array(result.scores), _to_numpy_array(result.coverage))  # 下载并重新打包成 NumPy 版结果。
+            clear_gpu_failure()  # 打分成功，清零连续失败计数。
+            return packed  # 返回结果。
+        except Exception:  # 显卡运行期异常。
+            mark_gpu_failure()  # 计数，连续 3 次后本进程永久回退 NumPy。
+            chosen = numpy_backend()  # 本帧改走 CPU 重算，调用方拿到的结果与显卡正常时等价。
+    result = core(chosen.xp, *args)  # NumPy 后端（或显卡降级后）直接计算。
+    return kind(_to_numpy_array(result.scores), _to_numpy_array(result.coverage))  # 打包成 NumPy 版结果返回。
+
 
 @dataclass
 class ShapeDetection:
@@ -57,27 +101,11 @@ class ShapeTemplate:
 
 
 @dataclass
-class ShapeEvidence:
-    """一批粒子假设在证据图上的轮廓打分结果。"""
-
-    scores: np.ndarray  # 每个粒子的综合得分 (count,)。
-    coverage: np.ndarray  # 每个粒子的边界覆盖率 (count,)，衡量有多少采样点命中。
-
-
-@dataclass
 class TemporalEvidence:
     """多 lag 光流对齐后的时序残差证据。"""
 
     normalized: np.ndarray  # 鲁棒归一化后的残差图（单通道 float32），边界处响应强。
     raw_mean: float  # 各 lag 归一化前残差均值的最小值，用于判断场景切换/静止。
-
-
-@dataclass
-class BorderEvidence:
-    """矩形模型专用的四边打分结果。"""
-
-    scores: np.ndarray  # 每个粒子的四边综合得分 (count,)。
-    coverage: np.ndarray  # 每个粒子取最强两边后的覆盖率 (count,)。
 
 
 def resize_for_processing(frame: np.ndarray, scale: float) -> np.ndarray:
@@ -462,135 +490,29 @@ class DenseTemporalAligner:
         return TemporalEvidence(combined, min(raw_means))  # 残差均值取最小，避免单一 lag 的抖动误判场景切换。
 
 
-def sample_map(image: np.ndarray, x: np.ndarray, y: np.ndarray) -> np.ndarray:
-    """在单通道证据图上做最近邻批量采样，越界位置返回 0。"""
+def sample_map(image: np.ndarray, x: np.ndarray, y: np.ndarray, backend=None) -> np.ndarray:
+    """在单通道证据图上做最近邻批量采样，越界位置返回 0（双后端薄壳，实现在 gpu_shape_backend）。"""
 
-    height, width = image.shape  # 证据图尺寸。
-    xi = np.rint(x).astype(np.int32)  # x 坐标整数化。
-    yi = np.rint(y).astype(np.int32)  # y 坐标整数化。
-    valid = (xi >= 0) & (xi < width) & (yi >= 0) & (yi < height)  # 标记在图内的采样点。
-    xi = np.clip(xi, 0, width - 1)  # 钳制索引，防止花式索引越界报错。
-    yi = np.clip(yi, 0, height - 1)  # 钳制 y 索引。
-    values = image[yi, xi]  # 批量取值。
-    return np.where(valid, values, 0.0)  # 越界点置 0，等价于「此处没有证据」。
+    chosen = _resolve_backend(backend)  # 解析本次生效的后端。
+    return _to_numpy_array(sample_map_core(chosen.xp, image, x, y))  # 后端采样后统一转回 NumPy。
 
 
 def score_rotated_borders(
-    evidence: np.ndarray, states: np.ndarray, side: float, play_height: int
+    evidence: np.ndarray, states: np.ndarray, side: float, play_height: int, backend=None
 ) -> BorderEvidence:
-    """矩形模型专用：给一批位姿假设的四条薄边打分，边响应要显著高于其邻域上下文。"""
+    """矩形模型专用：给一批位姿假设的四条薄边打分（双后端薄壳，实现在 gpu_shape_backend）。"""
 
-    count = len(states)  # 假设数量（用于返回数组形状）。
-    samples_per_side = 22  # 每条边的采样点数。
-    half = side * 0.5  # 半边长。
-    along = np.linspace(-0.82 * half, 0.82 * half, samples_per_side, dtype=np.float32)  # 边内采样位置，只取中间 82% 避免角点歧义。
-
-    local_x = np.stack(  # 四条边上采样点的局部 x 坐标（上、右、下、左）。
-        [along, np.full_like(along, half), along[::-1], np.full_like(along, -half)]  # 下边反向，保证四条边环绕方向一致。
-    )
-    local_y = np.stack(  # 四条边上采样点的局部 y 坐标。
-        [np.full_like(along, -half), along, np.full_like(along, half), along[::-1]]  # 与 local_x 配对构成闭合正方形。
-    )
-    normal_x = np.stack(  # 四条边的外法向 x 分量。
-        [np.zeros_like(along), np.ones_like(along), np.zeros_like(along), -np.ones_like(along)]  # 上/右/下/左。
-    )
-    normal_y = np.stack(  # 四条边的外法向 y 分量。
-        [-np.ones_like(along), np.zeros_like(along), np.ones_like(along), np.zeros_like(along)]  # 上/右/下/左。
-    )
-
-    radians = np.deg2rad(states[:, 4])[:, None, None]  # 每个假设的角度转弧度，扩维便于广播。
-    cosine = np.cos(radians)  # 余弦。
-    sine = np.sin(radians)  # 正弦。
-    base_x = (  # 旋转平移后的采样点 x 坐标，形状 (count, 4, samples)。
-        states[:, 0, None, None]  # 假设中心 x。
-        + local_x[None, :, :] * cosine  # 局部 x 旋转分量。
-        - local_y[None, :, :] * sine  # 局部 y 旋转分量。
-    )
-    base_y = (  # 旋转平移后的采样点 y 坐标。
-        states[:, 1, None, None]  # 假设中心 y。
-        + local_x[None, :, :] * sine  # 局部 x 旋转分量。
-        + local_y[None, :, :] * cosine  # 局部 y 旋转分量。
-    )
-    rotated_normal_x = normal_x[None, :, :] * cosine - normal_y[None, :, :] * sine  # 法向 x 分量随角度旋转。
-    rotated_normal_y = normal_x[None, :, :] * sine + normal_y[None, :, :] * cosine  # 法向 y 分量随角度旋转。
-
-    border_samples = []  # 收集边界上的多偏移采样。
-    for offset in (-3.0, -1.5, 0.0, 1.5, 3.0):  # 沿法向取 5 个偏移，容忍边界定位误差。
-        border_samples.append(  # 追加一个偏移下的采样结果。
-            sample_map(  # 在证据图上采样。
-                evidence,  # 证据图。
-                base_x + offset * rotated_normal_x,  # 偏移后的 x。
-                base_y + offset * rotated_normal_y,  # 偏移后的 y。
-            )
-        )
-    border = np.max(np.stack(border_samples, axis=0), axis=0)  # 5 个偏移取最大，得到边界响应。
-
-    context_samples = []  # 收集上下文采样。
-    context_distance = max(7.0, side * 0.085)  # 上下文距离随边长自适应，至少 7 像素。
-    for offset in (-1.35 * context_distance, -context_distance, context_distance, 1.35 * context_distance):  # 边界两侧各取 2 个上下文点。
-        context_samples.append(  # 追加一个上下文偏移的采样结果。
-            sample_map(  # 在证据图上采样。
-                evidence,  # 证据图。
-                base_x + offset * rotated_normal_x,  # 偏移后的 x。
-                base_y + offset * rotated_normal_y,  # 偏移后的 y。
-            )
-        )
-    context = np.mean(np.stack(context_samples, axis=0), axis=0)  # 4 个上下文点取均值，代表局部背景水平。
-
-    contrast = border - context  # 边界相对背景的对比度，是真正的形状证据。
-    side_scores = np.mean(contrast, axis=2)  # 每条边的平均对比度 (count, 4)。
-    # 片段后期可能只剩一个角（相邻两条边）还看得见。因此取最强两边，
-    # 但要对「单条边一枝独秀」施加惩罚，避免仅凭一条岩石边缘就取胜。
-    sorted_sides = np.sort(side_scores, axis=1)  # 四条边得分升序排列。
-    strongest_two = np.mean(sorted_sides[:, -2:], axis=1)  # 最强两边的均值。
-    side_imbalance = sorted_sides[:, -1] - sorted_sides[:, -2]  # 最强边与次强边的差距，衡量失衡程度。
-    mean_score = np.mean(side_scores, axis=1)  # 四条边的整体均值。
-    coverage_by_side = np.mean(border > context + 0.70, axis=2)  # 每条边上「显著高于背景」的采样点比例。
-    sorted_coverage = np.sort(coverage_by_side, axis=1)  # 覆盖率升序排列。
-    coverage = np.mean(sorted_coverage[:, -2:], axis=1)  # 取最强两边的覆盖率。
-    scores = (  # 综合得分。
-        0.25 * mean_score  # 整体对比度。
-        + 0.65 * strongest_two  # 最强两边为主。
-        + 0.10 * sorted_sides[:, -1]  # 最强边额外加成。
-        - 0.12 * np.maximum(side_imbalance - 2.0, 0.0)  # 失衡惩罚，超过 2.0 才开始扣。
-        + 0.80 * coverage  # 覆盖率加成。
-    )
-    # 惩罚那些把视频/UI 强边界当成自己一条边的假设。
-    # 用软惩罚而非硬剔除，真实目标靠近面板时仍然允许被找回。
-    valid = (  # 采样点是否落在可靠区域内。
-        (base_x >= 12.0)  # 左边留 12 像素。
-        & (base_x <= evidence.shape[1] - 13.0)  # 右边留 13 像素。
-        & (base_y >= 6.0)  # 上边留 6 像素。
-        & (base_y <= play_height - 7.0)  # 下边以有效高度为准留 7 像素。
-    )
-    valid_fraction = np.mean(valid, axis=(1, 2))  # 每个假设的有效采样点比例。
-    scores -= 8.0 * (1.0 - valid_fraction)  # 越界惩罚。
-    return BorderEvidence(scores.astype(np.float32), coverage.astype(np.float32))  # 返回打分与覆盖率。
+    return _run_scoring(score_rotated_borders_core, BorderEvidence, backend, evidence, states, side, play_height)  # 统一调度与降级。
 
 
 def transform_template_points(
-    template: ShapeTemplate, states: np.ndarray, scales: np.ndarray | float
+    template: ShapeTemplate, states: np.ndarray, scales: np.ndarray | float, backend=None
 ) -> tuple[np.ndarray, np.ndarray]:
-    """把模板轮廓点与法向批量旋转缩放到每个粒子假设的当前姿态。"""
+    """把模板轮廓点与法向批量旋转缩放到每个粒子假设的当前姿态（双后端薄壳，实现在 gpu_shape_backend）。"""
 
-    angles = np.deg2rad(states[:, 4])[:, None, None]  # 各假设角度转弧度并扩维广播。
-    cosine = np.cos(angles)  # 余弦。
-    sine = np.sin(angles)  # 正弦。
-    if np.isscalar(scales):  # 标量尺度：所有假设共用同一尺度。
-        scale_values = np.full((len(states), 1, 1), float(scales), dtype=np.float32)  # 广播成 (count,1,1)。
-    else:  # 数组尺度：每个假设一个尺度。
-        scale_values = np.asarray(scales, dtype=np.float32)[:, None, None]  # 扩维成 (count,1,1)。
-    local_x = template.points[None, :, 0:1]  # 模板局部 x，形状 (1,N,1)。
-    local_y = template.points[None, :, 1:2]  # 模板局部 y。
-    point_x = states[:, 0, None, None] + scale_values * (  # 旋转缩放后平移到假设中心 x。
-        local_x * cosine - local_y * sine  # 二维旋转的 x 分量。
-    )
-    point_y = states[:, 1, None, None] + scale_values * (  # 旋转缩放后平移到假设中心 y。
-        local_x * sine + local_y * cosine  # 二维旋转的 y 分量。
-    )
-    normal_x = template.normals[None, :, 0:1] * cosine - template.normals[None, :, 1:2] * sine  # 法向只旋转不平移不缩放。
-    normal_y = template.normals[None, :, 0:1] * sine + template.normals[None, :, 1:2] * cosine  # 法向 y 分量。
-    return np.concatenate([point_x, point_y], axis=2), np.concatenate([normal_x, normal_y], axis=2)  # 返回 (count,N,2) 的点集与法向。
+    chosen = _resolve_backend(backend)  # 解析本次生效的后端。
+    points, normals = transform_template_points_core(chosen.xp, template, states, scales)  # 后端上变换。
+    return _to_numpy_array(points), _to_numpy_array(normals)  # 统一转回 NumPy。
 
 
 def score_shape_contours(
@@ -599,99 +521,11 @@ def score_shape_contours(
     template: ShapeTemplate,
     scales: np.ndarray | float,
     play_height: int,
+    backend=None,
 ) -> ShapeEvidence:
-    """给一批粒子假设打分：联合轮廓边界对比度与半透明区域内部残差。"""
+    """给一批粒子假设打分：联合轮廓边界对比度与半透明区域内部残差（双后端薄壳，实现在 gpu_shape_backend）。"""
 
-    if template.use_rectangle_model and np.isscalar(scales):  # 矩形模型且标量尺度时走规则四边评分（更抗白色蒙版毛边）。
-        rectangle_states = states.copy()  # 复制状态，避免污染调用方的角度。
-        rectangle_states[:, 4] = (  # 角度叠加矩形偏置并折回 90 度对称域。
-            rectangle_states[:, 4] + template.rectangle_angle
-        ) % 90.0
-        rectangle_evidence = score_rotated_borders(  # 转发到矩形四边评分。
-            evidence,  # 证据图。
-            rectangle_states,  # 调整角度后的状态。
-            template.rectangle_side * float(scales),  # 按尺度缩放的边长。
-            play_height,  # 有效高度。
-        )
-        return ShapeEvidence(  # 统一封装成 ShapeEvidence 返回。
-            rectangle_evidence.scores,  # 得分。
-            rectangle_evidence.coverage,  # 覆盖率。
-        )
-    points, normals = transform_template_points(template, states, scales)  # 通用模型：变换学习到的 120 点轮廓。
-    point_x, point_y = points[:, :, 0], points[:, :, 1]  # 拆出采样点坐标。
-    normal_x, normal_y = normals[:, :, 0], normals[:, :, 1]  # 拆出法向。
-    # 边界 5 个法向偏移 + 上下文 4 个偏移合并成一次 sample_map 调用，减少重复裁剪/钳位开销。
-    offsets = (-3.0, -1.5, 0.0, 1.5, 3.0)  # 边界法向偏移。
-    context_distance = max(7.0, template.nominal_size * 0.08)  # 上下文距离随形状尺寸自适应。
-    context_offsets = (  # 边界两侧各 2 个上下文偏移。
-        -1.35 * context_distance,  # 外侧远点。
-        -context_distance,  # 外侧近点。
-        context_distance,  # 内侧近点。
-        1.35 * context_distance,  # 内侧远点。
-    )
-    sample_x = np.concatenate(  # 9 组采样坐标纵向拼接。
-        [point_x + offset * normal_x for offset in offsets + context_offsets]  # 边界 + 上下文。
-    )
-    sample_y = np.concatenate(
-        [point_y + offset * normal_y for offset in offsets + context_offsets]
-    )
-    sampled = sample_map(evidence, sample_x, sample_y)  # 一次性采样。
-    grouped = sampled.reshape(9, *point_x.shape)  # 拆回 9 组，前 5 组边界、后 4 组上下文。
-    border = grouped[:5].max(axis=0)  # 边界 5 组取最大得边界响应。
-    context = grouped[5:].mean(axis=0)  # 上下文 4 组取均值得局部背景。
-    contrast = border - context  # 边界相对背景的对比度。
-    sector_count = 12  # 把轮廓分成 12 个扇区分别统计。
-    sector_length = len(template.points) // sector_count  # 每个扇区的采样点数。
-    usable = sector_length * sector_count  # 实际可用点数（丢弃除不尽的尾巴）。
-    sector_scores = np.mean(  # 每个扇区的平均对比度 (count, 12)。
-        contrast[:, :usable].reshape(len(states), sector_count, sector_length), axis=2  # 按扇区聚合。
-    )
-    point_coverage = border > context + 0.70  # 单点是否「显著高于背景」。
-    sector_coverage = np.mean(  # 每个扇区的覆盖率。
-        point_coverage[:, :usable].reshape(len(states), sector_count, sector_length),  # 按扇区聚合。
-        axis=2,  # 求均值。
-    )
-    sorted_scores = np.sort(sector_scores, axis=1)  # 扇区得分升序。
-    sorted_coverage = np.sort(sector_coverage, axis=1)  # 扇区覆盖率升序。
-    top_half = np.mean(sorted_scores[:, -6:], axis=1)  # 最强 6 个扇区的均值。
-    top_quarter = np.mean(sorted_scores[:, -3:], axis=1)  # 最强 3 个扇区的均值。
-    imbalance = sorted_scores[:, -1] - sorted_scores[:, -3]  # 最强与第三强的差距，衡量是否只靠单侧取胜。
-    coverage = np.mean(sorted_coverage[:, -6:], axis=1)  # 最强 6 个扇区的覆盖率均值。
-    scores = (  # 边界综合得分。
-        0.28 * np.mean(sector_scores, axis=1)  # 全部扇区均值。
-        + 0.54 * top_half  # 最强一半扇区为主。
-        + 0.18 * top_quarter  # 最强四分之一额外加成。
-        - 0.10 * np.maximum(imbalance - 2.2, 0.0)  # 失衡惩罚，超过 2.2 才开始扣。
-        + 0.75 * coverage  # 覆盖率加成。
-    )
-    radians = np.deg2rad(states[:, 4])[:, None]  # 角度转弧度，用于变换内部点。
-    cosine = np.cos(radians)  # 余弦。
-    sine = np.sin(radians)  # 正弦。
-    if np.isscalar(scales):  # 标量尺度。
-        scale_values = np.full((len(states), 1), float(scales), dtype=np.float32)  # 广播成 (count,1)。
-    else:  # 数组尺度。
-        scale_values = np.asarray(scales, dtype=np.float32)[:, None]  # 扩维成 (count,1)。
-    interior_x = states[:, 0, None] + scale_values * (  # 内部采样点变换后的 x。
-        template.interior_points[None, :, 0] * cosine  # 局部 x 旋转分量。
-        - template.interior_points[None, :, 1] * sine  # 局部 y 旋转分量。
-    )
-    interior_y = states[:, 1, None] + scale_values * (  # 内部采样点变换后的 y。
-        template.interior_points[None, :, 0] * sine  # 局部 x 旋转分量。
-        + template.interior_points[None, :, 1] * cosine  # 局部 y 旋转分量。
-    )
-    interior = sample_map(evidence, interior_x, interior_y)  # 采样内部残差。
-    interior_mean = np.mean(np.clip(interior, 0.0, 8.0), axis=1)  # 内部残差均值，截断 8.0 抑制异常亮区。
-    interior_coverage = np.mean(interior > 1.40, axis=1)  # 内部有显著残差的点比例。
-    scores += 0.28 * interior_mean + 0.55 * interior_coverage  # 内部证据叠加到总分（半透明目标内部也会有残差）。
-    coverage = 0.78 * coverage + 0.22 * interior_coverage  # 覆盖率以边界为主、内部为辅混合。
-    valid = (  # 轮廓采样点是否落在可靠区域内。
-        (point_x >= 10.0)  # 左边留 10 像素。
-        & (point_x <= evidence.shape[1] - 11.0)  # 右边留 11 像素。
-        & (point_y >= 6.0)  # 上边留 6 像素。
-        & (point_y <= play_height - 7.0)  # 下边以有效高度为准留 7 像素。
-    )
-    scores -= 7.0 * (1.0 - np.mean(valid, axis=1))  # 越界惩罚：有效比例越低扣分越多。
-    return ShapeEvidence(scores.astype(np.float32), coverage.astype(np.float32))  # 返回打分与覆盖率。
+    return _run_scoring(score_shape_contours_core, ShapeEvidence, backend, evidence, states, template, scales, play_height)  # 统一调度与降级。
 
 
 class ParticleShapeTracker:
@@ -717,8 +551,10 @@ class ParticleShapeTracker:
         coarse_top: int = 30,  # 粗扫后进入精扫的 top-K 邻域数。
         refine_per_top: int = 8,  # 每个粗扫邻域生成的精扫拖尾候选数。
         relocation_cooldown: int = 15,  # 两次全局重定位之间的最小间隔帧数（限频）。
+        backend=None,  # 打分后端（gpu_shape_backend.ShapeScoreBackend），None 时用 NumPy 后端。
     ):
         self.template = template  # 保存模板。
+        self.backend = numpy_backend() if backend is None else backend  # 打分后端：会话装配时注入，缺省 NumPy（双后端结构：有 N 卡时为 CuPy）。
         self.count = particle_count  # 保存粒子数。
         self.frame_width = frame_width  # 保存帧宽。
         self.play_height = play_height  # 保存有效高度。
@@ -923,7 +759,7 @@ class ParticleShapeTracker:
         scale_factors = (0.90, 1.0, 1.10)  # 精扫跑三个尺度。
         coarse_states = self._proposal_states(predicted_center)  # 第一级粗扫候选，数量 = global_proposals（实时档 400）。
         coarse_result = score_shape_contours(  # 粗扫只在 1.0 尺度下打分。
-            temporal_map, coarse_states, self.template, 1.0, self.play_height  # 证据图、候选、模板、尺度、有效高度。
+            temporal_map, coarse_states, self.template, 1.0, self.play_height, self.backend  # 证据图、候选、模板、尺度、有效高度与打分后端。
         )
         prior_radius = self.template.nominal_size * (  # 距离先验半径：丢失越久容忍越宽。
             0.55 + 0.060 * min(self.frames_since_reliable, 10)  # 基础 0.55，每丢失一帧 +0.06，上限 10 帧。
@@ -955,29 +791,22 @@ class ParticleShapeTracker:
             refined_list.append(variants)  # 收集本邻域候选。
         proposals = np.vstack(refined_list).astype(np.float32)  # 合并成精扫候选集。
         self._apply_bounds(proposals)  # 统一施加边界约束。
-        proposal_states: list[np.ndarray] = []  # 收集各尺度的候选状态。
-        proposal_scores: list[np.ndarray] = []  # 收集各尺度的得分。
-        proposal_coverages: list[np.ndarray] = []  # 收集各尺度的覆盖率。
-        proposal_scales: list[np.ndarray] = []  # 收集各候选对应的尺度值。
-        for factor in scale_factors:  # 遍历三个尺度。
-            candidate_scale = float(np.clip(factor, 0.86, 1.16))  # 尺度限在合法区间内。
-            result = score_shape_contours(  # 对全部精扫候选打分。
-                temporal_map,  # 证据图。
-                proposals,  # 候选状态。
-                self.template,  # 模板。
-                candidate_scale,  # 当前尺度。
-                self.play_height,  # 有效高度。
-            )
-            proposal_states.append(proposals)  # 同一批状态在三个尺度下各记一次。
-            proposal_scores.append(result.scores)  # 记录得分。
-            proposal_coverages.append(result.coverage)  # 记录覆盖率。
-            proposal_scales.append(  # 记录尺度。
-                np.full(len(proposals), candidate_scale, dtype=np.float32)  # 每个候选共用当前尺度。
-            )
-        all_states = np.concatenate(proposal_states)  # 拼成 (3*精扫候选数, 6)。
-        all_scores = np.concatenate(proposal_scores)  # 拼成得分。
-        all_coverages = np.concatenate(proposal_coverages)  # 拼成覆盖率。
-        all_scales = np.concatenate(proposal_scales)  # 拼成尺度。
+        # 三个尺度的精扫合并成一次打分：候选按「尺度段 × 候选」排列，与旧版逐尺度拼接顺序一致，
+        # 后续 ranking/selected 索引到 all_states 的映射语义不变。
+        all_states = np.concatenate([proposals] * len(scale_factors)).astype(np.float32)  # 同一批候选在三个尺度下各记一次。
+        all_scales = np.concatenate(  # 逐候选尺度：每段 proposals 对应一个尺度因子。
+            [np.full(len(proposals), float(np.clip(factor, 0.86, 1.16)), dtype=np.float32) for factor in scale_factors]  # 尺度限在合法区间内。
+        )
+        refine_evidence = score_shape_contours(  # 一次合批对全部尺度候选打分。
+            temporal_map,  # 证据图。
+            all_states,  # 三尺度合并候选。
+            self.template,  # 模板。
+            all_scales,  # 逐假设尺度。
+            self.play_height,  # 有效高度。
+            self.backend,  # 打分后端。
+        )
+        all_scores = refine_evidence.scores  # 全部候选得分。
+        all_coverages = refine_evidence.coverage  # 全部候选覆盖率。
         top_count = min(self.count, max(42, self.count // 5))  # 要拉回的候选数，至少 42 个，但不超过粒子总数。
         # 重定位候选的排序要围绕当前运动预测，而不是围绕一个陈旧的已确认点。
         # 这样既能保持运动平滑，又能让远处的背景轮廓付出很高代价。
@@ -1029,7 +858,7 @@ class ParticleShapeTracker:
         predicted_scale = self.scale  # 回滚用尺度快照。
         predicted_center, _, _ = self.estimate()  # 推进后的预测中心，作为运动先验的参考点。
         particle_evidence = score_shape_contours(  # 给当前全部粒子打分。
-            temporal_map, self.states, self.template, self.scale, self.play_height  # 证据图、状态、模板、尺度、有效高度。
+            temporal_map, self.states, self.template, self.scale, self.play_height, self.backend  # 证据图、状态、模板、尺度、有效高度与打分后端。
         )
         control_count = self.control_count  # 对照组数量：随机位姿，用于估计背景得分分布。
         controls = np.zeros((control_count, 6), dtype=np.float32)  # 对照组状态矩阵。
@@ -1040,14 +869,22 @@ class ParticleShapeTracker:
             0.0, self.template.symmetry_period, control_count  # 角度上下限。
         )
         scale_factors = (0.90, 1.0, 1.10)  # 对照组与重定位都跑三个尺度。
-        control_scores = np.concatenate(  # 拼接三个尺度下的对照组得分。
-            [
-                score_shape_contours(  # 对随机位姿打分。
-                    temporal_map, controls, self.template, factor, self.play_height  # 当前尺度的对照组评分。
-                ).scores  # 只取得分。
-                for factor in scale_factors  # 遍历三个尺度。
-            ]
+        # 粒子 + 对照组×3 尺度合并成一次打分：显卡上加大 batch 几乎免费，CPU 上也省掉多次函数调用与证据图重复处理。
+        batch_states = np.concatenate(  # 合并状态：粒子在前、对照组按尺度重复三次在后。
+            [self.states] + [controls] * len(scale_factors)
+        ).astype(np.float32)  # 统一精度。
+        batch_scales = np.concatenate(  # 合并尺度：粒子段用当前估计尺度，对照组三段逐尺度铺开。
+            [np.full(len(self.states), self.scale, dtype=np.float32)]  # 粒子段。
+            + [np.full(control_count, factor, dtype=np.float32) for factor in scale_factors]  # 对照组三段。
         )
+        batch_evidence = score_shape_contours(  # 一次合批打分。
+            temporal_map, batch_states, self.template, batch_scales, self.play_height, self.backend  # 合并后的状态与逐假设尺度。
+        )
+        particle_evidence = ShapeEvidence(  # 拆回粒子段得分，保持原有变量语义。
+            batch_evidence.scores[: len(self.states)],  # 前 count 个是粒子。
+            batch_evidence.coverage[: len(self.states)],  # 覆盖率同段。
+        )
+        control_scores = batch_evidence.scores[len(self.states):]  # 其余是三个尺度段的对照组得分（拼接顺序与旧版一致）。
         control_median = float(np.median(control_scores))  # 对照组得分中位数，作为背景基线。
         control_mad = float(np.median(np.abs(control_scores - control_median)))  # 中位数绝对偏差。
         control_sigma = max(0.12, 1.4826 * control_mad)  # 鲁棒标准差，下限 0.12 避免除零放大。

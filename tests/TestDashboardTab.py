@@ -125,43 +125,57 @@ class TestDashboardTabWiring(unittest.TestCase):
             tab.timer.stop()  # 同样停掉定时器。
 
     def test_precision_combo_gpu_populated_and_persisted(self):
-        # GPU（cupy_available=True）下精度下拉四档齐全，save/load 往返 Lie Detector Precision。
+        # GPU（gpu_backend_available=True）下精度下拉五档齐全，save/load 往返 Lie Detector Precision。
         from unittest.mock import MagicMock, patch
         from src.ui.DashboardTab import DashboardTab
-        with patch('src.ui.DashboardTab.cupy_available', return_value=True):
+        with patch('src.ui.DashboardTab.gpu_backend_available', return_value=True):
             tab = DashboardTab()
             try:
                 keys = [tab.lie_precision_combo.itemData(i) for i in range(tab.lie_precision_combo.count())]
-                self.assertEqual(['low', 'medium', 'high', 'ultra'], keys)  # GPU 四档齐全，顺序由低到高。
+                self.assertEqual(['low', 'medium', 'high', 'ultra', 'extreme'], keys)  # GPU 五档齐全，顺序由低到高。
+                self.assertEqual('最强', tab.lie_precision_combo.itemText(4))  # 顶级档中文标签为「最强」。
                 self.assertIn('GPU', tab.lie_backend_label.text())  # 运算后端显示 GPU。
                 tab._set_precision_value('ultra')  # 选极高。
                 self.assertEqual('ultra', tab.lie_precision_combo.currentData())
                 with patch('src.ui.DashboardTab.save_dashboard_config', MagicMock()) as save:
                     tab.save()
                 self.assertEqual('ultra', save.call_args[0][0]['Lie Detector Precision'])  # 保存写入所选精度档。
+                tab._set_precision_value('extreme')  # 选最强。
+                self.assertEqual('extreme', tab.lie_precision_combo.currentData())
+                with patch('src.ui.DashboardTab.save_dashboard_config', MagicMock()) as save:
+                    tab.save()
+                self.assertEqual('extreme', save.call_args[0][0]['Lie Detector Precision'])  # 最强档同样能落盘。
                 with patch('src.ui.DashboardTab.load_dashboard_config', return_value={'Lie Detector Precision': 'medium'}):
                     tab.load_config()  # 配置里写 medium，加载后下拉应选中 medium。
                 self.assertEqual('medium', tab.lie_precision_combo.currentData())
+                with patch('src.ui.DashboardTab.load_dashboard_config', return_value={}):
+                    tab.load_config()  # 配置缺键时应回填算法层默认档（最强）。
+                self.assertEqual('extreme', tab.lie_precision_combo.currentData())
             finally:
                 tab.timer.stop()
 
     def test_precision_combo_cpu_only_clamps_high_tiers(self):
-        # CPU（cupy_available=False）下精度下拉只剩低/中等，请求高/极高被 clamp 到中等，后端显示 CPU。
+        # CPU（gpu_backend_available=False）下精度下拉只剩低/中等，请求高/极高/最强被 clamp 到中等，后端显示 CPU。
         from unittest.mock import patch
         from src.ui.DashboardTab import DashboardTab
-        with patch('src.ui.DashboardTab.cupy_available', return_value=False):
+        with patch('src.ui.DashboardTab.gpu_backend_available', return_value=False):
             tab = DashboardTab()
             try:
                 tab._refresh_precision_availability()  # 显式再刷新一次（构造时 load_config 已刷过）。
                 keys = [tab.lie_precision_combo.itemData(i) for i in range(tab.lie_precision_combo.count())]
-                self.assertEqual(['low', 'medium'], keys)  # CPU 移除高/极高。
+                self.assertEqual(['low', 'medium'], keys)  # CPU 移除高/极高/最强。
                 self.assertIn('CPU', tab.lie_backend_label.text())  # 运算后端显示 CPU。
                 tab._set_precision_value('high')  # 请求不可用的高档。
                 self.assertEqual('medium', tab.lie_precision_combo.currentData())  # 回落中等。
                 tab._set_precision_value('ultra')  # 请求不可用的极高档。
                 self.assertEqual('medium', tab.lie_precision_combo.currentData())  # 同样回落中等。
+                tab._set_precision_value('extreme')  # 请求不可用的最强档。
+                self.assertEqual('medium', tab.lie_precision_combo.currentData())  # 同样回落中等。
                 with patch('src.ui.DashboardTab.load_dashboard_config', return_value={'Lie Detector Precision': 'high'}):
                     tab.load_config()  # CPU 下加载 high 配置也应被 clamp 到 medium。
+                self.assertEqual('medium', tab.lie_precision_combo.currentData())
+                with patch('src.ui.DashboardTab.load_dashboard_config', return_value={}):
+                    tab.load_config()  # CPU 下配置缺键时，默认档（最强）同样必须 clamp 到 medium，不能选中不存在的项。
                 self.assertEqual('medium', tab.lie_precision_combo.currentData())
             finally:
                 tab.timer.stop()

@@ -15,7 +15,7 @@ from unittest.mock import patch
 import numpy as np
 
 from src.liedetector import recorder as recorder_module  # 被测模块：patch 其 LIE_RECORD_DIR / LIE_RECORD_KEEP。
-from src.liedetector.recorder import LieRecorder, list_records, LIE_RECORD_FPS  # 录像器、历史列举与帧率常量。
+from src.liedetector.recorder import LieRecorder, delete_record, list_records, LIE_RECORD_FPS  # 录像器、历史列举/删除与帧率常量。
 
 
 def _frame(value, height=120, width=160):
@@ -255,6 +255,30 @@ class TestLieRecorder(unittest.TestCase):
     def test_list_records_missing_dir_returns_empty(self):
         # 目录不存在时返回空列表，供 UI 下拉安全兜底。
         self.assertEqual([], list_records(folder=os.path.join(self.tmp, "not_exist")))
+
+    # ------------------------------------------------------------------ 历史删除
+
+    def test_delete_record_removes_mp4_and_json_pair(self):
+        # delete_record 按 mp4 路径成对删除同名 mp4+json，返回 True，其余记录不受影响。
+        _touch_pair(self.tmp, "keep", time.time())
+        mp4, json_path = _touch_pair(self.tmp, "drop", time.time())
+        removed = delete_record(mp4, folder=self.tmp)  # 传入 mp4 路径与临时目录。
+        self.assertTrue(removed, "删掉 mp4 应返回 True")
+        self.assertFalse(os.path.exists(mp4), "mp4 应被删除")
+        self.assertFalse(os.path.exists(json_path), "同名 json 边车应一并删除")
+        self.assertEqual(["keep.json", "keep.mp4"], sorted(os.listdir(self.tmp)), "只删选中那组，其余保留")
+
+    def test_delete_record_by_json_path_also_works(self):
+        # 传入 json 路径也能按同名 stem 成对删除（UI 传 mp4 路径，此处验证口径健壮性）。
+        mp4, json_path = _touch_pair(self.tmp, "rec", time.time())
+        self.assertTrue(delete_record(json_path, folder=self.tmp), "按 json 路径也应删掉 mp4 并返回 True")
+        self.assertFalse(os.path.exists(mp4) or os.path.exists(json_path), "mp4+json 都应被删除")
+
+    def test_delete_record_missing_returns_false_without_raise(self):
+        # 删除不存在的记录（或空基名）返回 False，不抛异常。
+        self.assertFalse(delete_record(os.path.join(self.tmp, "ghost.mp4"), folder=self.tmp), "mp4 不存在应返回 False")
+        self.assertFalse(delete_record("", folder=self.tmp), "空路径应返回 False")
+        self.assertFalse(delete_record(os.path.join(self.tmp, "x.mp4"), folder=os.path.join(self.tmp, "not_exist")), "目录不存在应返回 False")
 
 
 if __name__ == "__main__":

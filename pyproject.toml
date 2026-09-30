@@ -51,3 +51,16 @@ yolo = [
     "torchvision",
     "ultralytics>=8.4",
 ]
+# Optional: the LieDetector (解测谎) GPU pipeline -- dense optical flow plus the
+# particle filter -- reuses torch CUDA (src/liedetector/torch_flow.py,
+# torch_array.py, tensor_evidence.py). It needs torch only, NOT torchvision:
+# the Farneback-equivalent flow is implemented with plain tensor operators, so
+# no pretrained weights are downloaded. Same CUDA-build caveat as `yolo` above;
+# for Blackwell (RTX 50xx, sm_120) install from the cu128 index:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+# Without it the detector falls back to the CPU path (cv2 DIS flow + numpy
+# scoring), which is also what the packaged exe uses since build_exe.spec
+# excludes torch.
+liegpu = [
+    "torch",
+]

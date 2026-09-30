@@ -16,12 +16,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field  # 数据类：参数集中与单帧输出。
 from typing import Callable, Optional  # 类型标注：可选的日志回调。
 
-import cv2  # OpenCV：DIS 光流档位常量。
+import cv2  # OpenCV：DIS 光流档位常量（CPU 引擎用）。
 import numpy as np  # 数值计算：随机数发生器与坐标数组。
 
-from src.liedetector.gpu_shape_backend import numpy_backend, require_gpu_backend  # 打分后端探测：有 N 卡走 CuPy，没有/关闭则 NumPy。
+from src.liedetector.gpu_shape_backend import numpy_backend, require_gpu_backend  # 打分后端探测：有 N 卡走 torch CUDA，没有/关闭则 NumPy。
 from src.liedetector.shape_tracking import (  # 算法内核，纯计算无 I/O。
-    DenseTemporalAligner,  # 多 lag 稠密光流时序残差对齐器。
+    DenseTemporalAligner,  # 多 lag 稠密光流时序残差对齐器（按后端装配的薄工厂）。
     ParticleShapeTracker,  # 6 维状态粒子跟踪器。
     ShapeTemplate,  # 学习到的形状模板。
     build_shape_template,  # 从白色轮廓构建模板。
@@ -30,6 +30,7 @@ from src.liedetector.shape_tracking import (  # 算法内核，纯计算无 I/O�
     resize_for_processing,  # 缩放到处理尺度。
     transformed_contour,  # 按当前姿态还原轮廓点集。
 )
+from src.liedetector.torch_flow import flow_engine_name  # 光流引擎名（日志用，与装配判据同源）。
 
 # source 字段的全部合法取值，与外部脚本保持一致，便于回归对照。
 SOURCE_WAITING = "waiting"  # 还没学到模板，本帧没有任何输出。
@@ -39,80 +40,154 @@ SOURCE_PREDICTION = "prediction"  # 证据不足，仅靠粒子运动预测外�
 SOURCE_SCENE_ENDED = "scene-ended"  # 场景结束（切场景或出现结算文字）。
 SOURCE_INTERPOLATED = "interpolated"  # Pass 2 回看插值回填的帧。
 
-# 精度档预设：把「低/中等/高/极高」映射到一组跟踪参数。GPU 只决定打分走 cupy 还是 numpy，
-# 精度档由用户显式选择；无 N 卡（或运行期降级）时 high/ultra 会被 _resolve_scoring_backend 门控回落到 medium。
-PRECISION_TIER_KEYS = ("low", "medium", "high", "ultra")  # 合法精度档 key，顺序即由低到高。
-PRECISION_TIER_DEFAULT = "high"  # 默认精度档：GPU 机直接生效，CPU 机运行时回落 medium。
+# 精度档预设：把「低/中等/高/极高/最强」映射到一组跟踪参数。GPU 只决定打分走 torch CUDA 还是 numpy，
+# 精度档由用户显式选择；无 N 卡（或运行期降级）时重载档会被 _resolve_scoring_backend 门控回落 medium。
+# 光流参数分两套：dis_preset 给 CPU 引擎（cv2 DIS），flow_* 给显卡引擎（torch Farneback）。
+# poly_n/poly_sigma/pyr_scale 全档统一（= dataclass 默认值），故不入档。
+#
+# 分档思路（纯 GPU CUDA 路径，CUDA Graph 已把证据链的 kernel launch 开销摊平）：
+# - 图形重叠遮挡时，四个杠杆按收益排序是：处理分辨率 > 对照组 > 重定位漏斗宽度 > 粒子数。
+#   分辨率把粘连成一个连通域的相邻图形真正分开；对照组决定背景得分分布会不会被邻近图形污染；
+#   漏斗（coarse_top × refine_per_top）决定目标被完全遮住后能否在全局重定位里被重新捞回；
+#   粒子数只是让状态空间覆盖更密。所以最高档同时抬分辨率与漏斗，而不是只堆粒子。
+# - 实测打分 batch（= 粒子 + 3×对照）从 1200 涨到 1960 时 observe 耗时不升反降，说明打分在显卡上
+#   由每帧固定开销主导，加大粒子/对照近乎免费；真正随粒子数线性增长的是 propagate/estimate 里的
+#   NumPy 随机数与逐列运算（CPU 侧），故最高档把粒子压在 1400 以内以守住 30fps（33ms）预算。
+PRECISION_TIER_KEYS = ("low", "medium", "high", "ultra", "extreme")  # 合法精度档 key，顺序即由低到高。
+PRECISION_TIER_DEFAULT = "extreme"  # 默认精度档：GPU 机直接生效（最强），CPU 机运行时回落 medium。
+PRECISION_TIER_GPU_ONLY = ("high", "ultra", "extreme")  # 仅显卡可选的重载档：算法层与 UI 下拉共用这一份名单，避免两侧漂移。
+PRECISION_TIER_CPU_FALLBACK = "medium"  # CPU 机（或运行期永久降级）时重载档的回落目标。
 PRECISION_TIERS = {  # 各档参数：dataclass 默认值即 medium 档，故 medium 应用时为空操作。
-    "low": {  # 低：弱机保底，降分辨率到 256 并压缩粒子/对照/粗扫，最省 CPU。
+    "low": {  # 低：弱机保底，降分辨率到 256 并压缩粒子/对照/粗扫，最省算力。
         "dis_preset": cv2.DISOPTICAL_FLOW_PRESET_FAST,
         "temporal_lags": (1, 2),
-        "particle_count": 180,
-        "control_count": 90,
-        "global_proposals": 250,
-        "max_process_side": 256.0,
-    },
-    "medium": {  # 中等：旧 CPU 实时档（30fps 逐帧处理基线）。
-        "dis_preset": cv2.DISOPTICAL_FLOW_PRESET_FAST,
-        "temporal_lags": (1, 2),
-        "particle_count": 280,
-        "control_count": 130,
+        "particle_count": 220,
+        "control_count": 110,
         "global_proposals": 400,
-        "max_process_side": 320.0,
+        "coarse_top": 30,
+        "refine_per_top": 8,
+        "max_process_side": 256.0,
+        "flow_levels": 2,  # 显卡光流：金字塔只建 2 层，最省显存与 kernel 启动。
+        "flow_iterations": 2,
+        "flow_winsize": 9,
     },
-    "high": {  # 高：上一轮 GPU 精度档，DIS 恢复 MEDIUM + 第三个 lag，边界证据更锐利。
+    "medium": {  # 中等：CPU 实时档（30fps 逐帧处理基线），也是 dataclass 默认值；重载档在 CPU 机上回落到此。
+        "dis_preset": cv2.DISOPTICAL_FLOW_PRESET_FAST,
+        "temporal_lags": (1, 2),
+        "particle_count": 320,
+        "control_count": 140,  # 对照组要按 3 个尺度重复计入 batch，是 CPU 上最贵的一项，故本档只温和上调。
+        "global_proposals": 600,
+        "coarse_top": 30,
+        "refine_per_top": 8,
+        "max_process_side": 320.0,
+        "flow_levels": 3,  # 显卡光流：与 dataclass 默认值一致，应用本档为空操作。
+        "flow_iterations": 2,
+        "flow_winsize": 11,
+    },
+    "high": {  # 高：显卡常规档，光流 MEDIUM 级参数 + 第三个 lag，并首次加宽重定位漏斗。
         "dis_preset": cv2.DISOPTICAL_FLOW_PRESET_MEDIUM,
         "temporal_lags": (1, 2, 4),
-        "particle_count": 420,
-        "control_count": 260,
-        "global_proposals": 1200,
+        "particle_count": 600,
+        "control_count": 300,
+        "global_proposals": 1500,
+        "coarse_top": 36,  # 粗扫进精扫的邻域数：遮挡场景下放宽，免得真目标在粗排就被相似邻居挤掉。
+        "refine_per_top": 10,
         "max_process_side": 320.0,
+        "flow_levels": 3,  # 显卡光流：= cv2 Farneback 默认档（iterations=3, winsize=15）。
+        "flow_iterations": 3,
+        "flow_winsize": 15,
     },
-    "ultra": {  # 极高：在高基础上加大粒子/对照/粗扫（打分在 GPU 上近乎免费），不升分辨率（320≡400 无收益且 DIS 成本随分辨率上升）。
+    "ultra": {  # 极高：显卡重载档，在高基础上大幅加粒子/对照/粗扫与光流金字塔层数，仍不升分辨率。
         "dis_preset": cv2.DISOPTICAL_FLOW_PRESET_MEDIUM,
         "temporal_lags": (1, 2, 4),
-        "particle_count": 700,
-        "control_count": 420,
-        "global_proposals": 2000,
+        "particle_count": 1000,
+        "control_count": 500,
+        "global_proposals": 2400,
+        "coarse_top": 44,
+        "refine_per_top": 10,
         "max_process_side": 320.0,
+        "flow_levels": 4,  # 显卡光流：多一层金字塔 + 四次迭代，大位移与弱纹理更稳。
+        "flow_iterations": 4,
+        "flow_winsize": 15,
+    },
+    "extreme": {  # 最强：唯一升分辨率的档，专治图形重叠遮挡；粒子/对照/漏斗全部拉满。
+        # dis_preset 只服务 CPU 引擎，而本档在 CPU 机上会被门控回落 medium，因此它实际不生效；
+        # 仍填 cv2 最高可用预设 MEDIUM（本 build 只有 ULTRAFAST/FAST/MEDIUM，没有 ULTRA），
+        # 保证万一被直接拿去跑 CPU 引擎也是最高精度。
+        "dis_preset": cv2.DISOPTICAL_FLOW_PRESET_MEDIUM,
+        "temporal_lags": (1, 2, 4),
+        "particle_count": 1400,  # 再往上加就顶到 propagate/estimate 的 NumPy 侧线性开销，收益不抵 30fps 预算。
+        "control_count": 720,
+        "global_proposals": 3600,
+        "coarse_top": 56,  # 最宽漏斗：目标被完全遮住后，重定位要能在多个相似邻居中间把它捞回来。
+        "refine_per_top": 12,
+        # 分辨率是分离粘连图形最根本的杠杆，但必须连 process_scale 一起抬：
+        # effective_scale = min(process_scale, max_process_side / 区域长边)，
+        # 实测测谎区域是 728x486，只把 max_process_side 提到 384 会被 process_scale=0.5 卡死在 364，
+        # 等于白改一档；0.55 才能让 384 真正生效（处理尺度 384x256，面积是 320x214 的 1.44 倍）。
+        "process_scale": 0.55,
+        "max_process_side": 384.0,
+        "flow_levels": 5,  # 显卡光流：384 尺度下多建一层金字塔（最粗 24px），大位移更稳。
+        "flow_iterations": 4,
+        "flow_winsize": 15,
     },
 }
 
 
 @dataclass
 class ShapeTrackParams:
-    """一局跟踪的全部参数。默认值 = 「中等」精度档（目标 30fps 逐帧处理）。
+    """一局跟踪的全部参数。默认值 = 「中等」精度档（CPU 也能跑满 30fps 的保守基线）。
 
     本项目不新增任何任务配置项，参数一律以模块常量形式集中在这里。
-    精度由 precision_tier 显式选择（低/中等/高/极高，见 PRECISION_TIERS）：GPU 只决定打分走
-    cupy 还是 numpy，精度档由用户选定；无 N 卡时 high/ultra 会被门控回落到 medium。
+    精度由 precision_tier 显式选择（低/中等/高/极高/最强，见 PRECISION_TIERS）：GPU 只决定打分与光流
+    走 torch CUDA 还是 numpy/cv2，精度档由用户选定；无 N 卡时 high/ultra/extreme 会被门控回落到 medium。
     dataclass 默认值即 medium 档，_apply_precision_tier 只覆盖仍停在默认值的字段，尊重调用方显式自定义。
     """
 
-    process_scale: float = 0.5  # 处理尺度上限：先把裁剪区域缩小再算，坐标输出时换算回全尺度。
-    max_process_side: float = 320.0  # 处理分辨率上限（最长边像素）：大区域自动降低实际 scale；320 档实测三个参考视频跟踪结果与 400 档完全一致。
-    dis_preset: int = cv2.DISOPTICAL_FLOW_PRESET_FAST  # DIS 光流精度档位（medium 档用 FAST；high/ultra 由档位升到 MEDIUM）。
-    temporal_lags: tuple[int, ...] = (1, 2)  # 时序残差使用的时间基线（medium 档 2 个；high/ultra 升到 (1,2,4)）。
+    process_scale: float = 0.5  # 处理尺度上限：先把裁剪区域缩小再算，坐标输出时换算回全尺度（extreme 档升到 0.55 才能真正吃到 384 分辨率）。
+    max_process_side: float = 320.0  # 处理分辨率上限（最长边像素）：大区域自动降低实际 scale；320 档实测三个参考视频跟踪结果与 400 档完全一致，但图形重叠粘连时更高分辨率才能把连通域分开。
+    dis_preset: int = cv2.DISOPTICAL_FLOW_PRESET_FAST  # CPU 光流引擎的 DIS 精度档位（medium 档用 FAST；high 及以上由档位升到 MEDIUM）。
+    temporal_lags: tuple[int, ...] = (1, 2)  # 时序残差使用的时间基线（medium 档 2 个；high 及以上升到 (1,2,4)）。
     play_height_ratio: float = 1.0  # 有效高度比例。偏离脚本的 0.89：页签处理的是裁出的图形区域，内部没有 UI 需要排除。
-    particle_count: int = 280  # 粒子数量（medium 档）。
-    global_proposals: int = 400  # 重定位第一级粗扫候选数（两级粗到细，替代旧版 2400 一次性打分）。
-    control_count: int = 130  # 对照组数量：只需中位数/ MAD 两个鲁棒统计量，130 足够稳定（实测跟踪结果与 260 一致，耗时减半）。
-    coarse_top: int = 30  # 粗扫后进入精扫的 top-K 邻域数。
-    refine_per_top: int = 8  # 每个粗扫邻域生成的精扫拖尾候选数。
+    particle_count: int = 320  # 粒子数量（medium 档）。
+    global_proposals: int = 600  # 重定位第一级粗扫候选数（两级粗到细，替代旧版 2400 一次性打分）。
+    control_count: int = 140  # 对照组数量：估计背景得分分布的中位数/MAD；图形重叠时随机位姿常压在别的图形上，对照组越大背景基线越不被污染。
+    coarse_top: int = 30  # 粗扫后进入精扫的 top-K 邻域数（medium 档；high 及以上加宽漏斗以扛住完全遮挡后的重定位）。
+    refine_per_top: int = 8  # 每个粗扫邻域生成的精扫拖尾候选数（medium 档）。
     relocation_cooldown_frames: int = 15  # 两次全局重定位之间的最小间隔帧数（限频，约 0.5 秒@30fps）。
     confidence_threshold: float = 0.75  # Pass 2 回看的低置信阈值，低于它才考虑插值。
     max_gap_seconds: float = 1.25  # 允许回看修正的最长低置信区间（秒）。
     max_correction_ratio: float = 0.24  # 单帧证据修正上限（相对形状尺寸的比例），超限整体回滚。
     max_speed_ratio: float = 0.16  # 单帧中心移动速度上限（相对形状尺寸的比例）。
     random_seed: int = 20260902  # 随机种子，保证同一局录像结果可复现。
-    gpu_scoring: bool = True  # 打分后端开关：True 时探测 CuPy + N 卡，可用则打分跑显卡，否则自动回落 NumPy（双编译结构）。仅决定打分后端，不改精度档。
-    precision_tier: str = PRECISION_TIER_DEFAULT  # 精度档 key（low/medium/high/ultra）：由 GUI 精度下拉选定，无 N 卡时 high/ultra 运行时回落 medium。
+    gpu_scoring: bool = True  # 显卡开关：True 时探测 torch CUDA，可用则打分与光流都跑显卡，否则自动回落 NumPy + cv2 DIS（双编译结构）。仅决定后端，不改精度档。
+    precision_tier: str = PRECISION_TIER_DEFAULT  # 精度档 key（low/medium/high/ultra/extreme）：由 GUI 精度下拉选定，无 N 卡时重载档运行时回落 medium。
+    # 显卡光流（torch Farneback）参数；CPU 引擎用的是上面的 dis_preset，不看这几个字段。
+    flow_levels: int = 3  # 金字塔层数（medium 档）。
+    flow_iterations: int = 2  # 每层的迭代求解次数（medium 档）。
+    flow_winsize: int = 11  # 位移场盒式平滑窗口边长（medium 档）。
+    flow_poly_n: int = 5  # 多项式展开的窗口半径，全档统一。
+    flow_poly_sigma: float = 1.2  # 多项式展开的高斯权重 sigma，全档统一。
+    flow_pyr_scale: float = 0.5  # 相邻金字塔层的尺度比，全档统一。
 
     @property
     def max_gap_frames(self) -> int:
         """把回看窗口换算成帧数，至少 1 帧。"""
 
         return max(1, int(round(self.max_gap_seconds * 30)))  # 页签固定 30fps 节拍，直接按 30 换算。
+
+    @property
+    def gpu_flow_params(self) -> dict:
+        """显卡 Farneback 引擎的参数字典，直接展开给 ``TorchFarnebackFlow``。"""
+
+        return {  # 键名与 TorchFarnebackFlow 的构造参数一一对应。
+            "levels": self.flow_levels,
+            "iterations": self.flow_iterations,
+            "winsize": self.flow_winsize,
+            "poly_n": self.flow_poly_n,
+            "poly_sigma": self.flow_poly_sigma,
+            "pyr_scale": self.flow_pyr_scale,
+        }
 
 
 @dataclass
@@ -148,12 +223,14 @@ class ShapeTrackSession:
     def __post_init__(self) -> None:
         """构造内部组件与状态；dataclass 的 __init__ 之后自动调用。"""
 
-        self.backend = None  # 本局打分后端（CuPy 或 NumPy），创建跟踪器时注入。
-        self._resolve_scoring_backend()  # 先装配打分后端：显卡可用时同步恢复精度档参数（含 DIS 档位/时间基线），对齐器据此创建。
+        self.backend = None  # 本局打分后端（torch CUDA 或 NumPy），创建跟踪器与对齐器时注入。
+        self._resolve_scoring_backend()  # 先装配打分后端：显卡可用时同步恢复精度档参数（含光流档位/时间基线），对齐器据此创建。
         self.aligner = DenseTemporalAligner(  # 建时序残差对齐器（用已按后端恢复精度档的参数）。
             self.params.temporal_lags,  # 时间基线。
             self.params.play_height_ratio,  # 有效高度比例。
-            self.params.dis_preset,  # DIS 精度档位。
+            self.params.dis_preset,  # CPU 引擎的 DIS 精度档位。
+            backend=self.backend,  # 本局后端：显卡走 torch Farneback，CPU 走 cv2 DIS。
+            flow_params=self.params.gpu_flow_params,  # 显卡 Farneback 的光流参数。
         )
         self.rng = np.random.default_rng(self.params.random_seed)  # 每局独立的随机数发生器，代替脚本里的全局 cv2.setRNGSeed。
         self.template: Optional[ShapeTemplate] = None  # 学习到的形状模板，未学习时为 None。
@@ -175,20 +252,28 @@ class ShapeTrackSession:
             self.logger(message)  # 转发消息。
 
     def _resolve_scoring_backend(self) -> None:
-        """装配打分后端并按精度档设参：GPU 只决定打分走 cupy/numpy，精度档由 precision_tier 显式决定。
+        """装配打分后端并按精度档设参：GPU 只决定走 torch CUDA/numpy，精度档由 precision_tier 显式决定。
 
-        无 N 卡（或运行期永久降级）时 high/ultra 门控回落到 medium，避免 CPU 机负担不起高精度档；
-        这里用真实 backend 判定（含降级），是权威 clamp，GUI 侧的后端显示仅为最佳努力。
+        无 N 卡（或运行期永久降级）时重载档（PRECISION_TIER_GPU_ONLY）门控回落到 medium，
+        避免 CPU 机负担不起高分辨率/大粒子档；这里用真实 backend 判定（含降级），是权威 clamp，
+        GUI 侧的后端显示仅为最佳努力。
         """
 
         backend = require_gpu_backend() if self.params.gpu_scoring else numpy_backend()  # 开关关闭时显式走 NumPy。
         tier = self.params.precision_tier if self.params.precision_tier in PRECISION_TIERS else PRECISION_TIER_DEFAULT  # 非法档位回退默认。
-        if not backend.is_gpu and tier in ("high", "ultra"):  # CPU 机禁用高/极高。
-            tier = "medium"  # 回落中等（旧 CPU 实时档）。
+        if not backend.is_gpu and tier in PRECISION_TIER_GPU_ONLY:  # CPU 机禁用高/极高/最强。
+            tier = PRECISION_TIER_CPU_FALLBACK  # 回落中等（CPU 实时档）。
         self.params.precision_tier = tier  # 记录生效档位。
         self._apply_precision_tier(tier)  # 按档位设参（仅覆盖仍停在默认值的字段）。
-        self.backend = backend  # 记录本局后端，创建跟踪器时注入。
-        self._log(f"SHAPE backend={backend.name} tier={tier} particles={self.params.particle_count} controls={self.params.control_count} dis_preset={self.params.dis_preset} lags={self.params.temporal_lags} 打分后端与精度档已装配")  # 日志记录后端、生效档位与关键参数。
+        self.backend = backend  # 记录本局后端，创建跟踪器与对齐器时注入。
+        flow = self.params.gpu_flow_params  # 显卡光流参数（CPU 引擎不用，但一并入日志便于排查）。
+        self._log(
+            f"SHAPE backend={backend.name} engine={flow_engine_name(backend.is_gpu)} tier={tier} "
+            f"particles={self.params.particle_count} controls={self.params.control_count} "
+            f"dis_preset={self.params.dis_preset} lags={self.params.temporal_lags} "
+            f"flow(levels={flow['levels']},iterations={flow['iterations']},winsize={flow['winsize']}) "
+            f"打分后端与精度档已装配"
+        )  # 日志记录后端、光流引擎、生效档位与关键参数。
 
     def _apply_precision_tier(self, tier: str) -> None:
         """把 PRECISION_TIERS[tier] 应用到 params：仅覆盖仍等于 dataclass 默认值的字段，尊重调用方显式自定义。"""
@@ -289,7 +374,7 @@ class ShapeTrackSession:
                 coarse_top=self.params.coarse_top,  # 精扫 top-K 邻域数。
                 refine_per_top=self.params.refine_per_top,  # 每邻域精扫候选数。
                 relocation_cooldown=self.params.relocation_cooldown_frames,  # 重定位限频间隔。
-                backend=self.backend,  # 打分后端（CuPy 或 NumPy）。
+                backend=self.backend,  # 打分后端（torch CUDA 或 NumPy）。
             )
             source = SOURCE_COLOR  # 本帧来源为白色强测量。
             self.last_color_frame = self.frame_index  # 记录测到颜色的帧号。

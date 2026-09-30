@@ -197,6 +197,12 @@
       "file_name": "32.png",
       "width": 1366,
       "height": 768
+    },
+    {
+      "id": 39,
+      "file_name": "33.png",
+      "width": 1366,
+      "height": 768
     }
   ],
   "annotations": [
@@ -810,6 +816,32 @@
       ],
       "area": 1166,
       "iscrowd": 0
+    },
+    {
+      "id": 48,
+      "image_id": 39,
+      "category_id": 48,
+      "bbox": [
+        541,
+        312,
+        282,
+        144
+      ],
+      "area": 40608,
+      "iscrowd": 0
+    },
+    {
+      "id": 49,
+      "image_id": 39,
+      "category_id": 49,
+      "bbox": [
+        784,
+        436,
+        34,
+        16
+      ],
+      "area": 544,
+      "iscrowd": 0
     }
   ],
   "categories": [
@@ -1047,6 +1079,16 @@
       "id": 47,
       "name": "蘑菇",
       "supercategory": "怪物"
+    },
+    {
+      "id": 48,
+      "name": "测谎成功",
+      "supercategory": ""
+    },
+    {
+      "id": 49,
+      "name": "测谎成功确定",
+      "supercategory": ""
     }
   ]
 }

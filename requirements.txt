@@ -63,6 +63,9 @@ scipy==1.18.1
 # index, so they are installed separately and NOT pinned here (keeps CI/exe build lean):
 #   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
 #   pip install ultralytics
+# torch is ALSO used by the LieDetector GPU pipeline -- dense optical flow plus
+# the particle filter -- via the `liegpu` extra (pip install -e ".[liegpu]", torch only,
+# no torchvision). Without torch the detector runs the CPU path (cv2 DIS + numpy).
 opencc==1.2.0
     # via ok-script
 opencv-python==5.0.0.93

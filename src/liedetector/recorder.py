@@ -208,7 +208,7 @@ class LieRecorder:
             finally:
                 self._queue.task_done()  # 无论成败都标记该帧处理完成。
 
-    def stop(self, outcome="solved"):  # 收尾：排空写线程 -> 关流 -> 写边车 JSON -> 滚动保留。outcome ∈ solved/timeout/gone/abandoned。
+    def stop(self, outcome="solved"):  # 收尾：排空写线程 -> 关流 -> 写边车 JSON -> 滚动保留。outcome ∈ success/failure/solved/timeout/gone/abandoned/aborted。
         with self._lock:
             if not self._running and self._writer is None:  # 从未起流或已收尾。
                 return
@@ -314,3 +314,24 @@ def list_records(folder=LIE_RECORD_DIR):  # 扫描目录下的 .json 边车，�
         logger.warning(f"Lie record list failed: {e}. 测谎录像历史列举失败。")
     records.sort(key=lambda item: item.get("_mtime", 0.0), reverse=True)  # 按时间倒序，最新录像排最前。
     return records
+
+
+def delete_record(path, folder=LIE_RECORD_DIR):  # 删除一条历史录像：按 mp4 路径取同名 stem，成对删除 folder 下的 mp4+json，返回是否删掉了 mp4。
+    try:
+        stem = os.path.splitext(os.path.basename(str(path)))[0]  # 取录像基名（与 _prune/list_records 同口径，兼容传入临时目录）。
+        if not stem:  # 空基名（非法路径）不删。
+            return False
+        removed_mp4 = False  # 是否成功删掉 mp4（作为返回值）。
+        for ext in (".mp4", ".json"):  # mp4 与边车 json 一并删，与滚动保留一致。
+            target = os.path.join(folder, stem + ext)
+            try:
+                if os.path.exists(target):
+                    os.remove(target)  # 删除该文件。
+                    if ext == ".mp4":
+                        removed_mp4 = True  # 标记 mp4 已删。
+            except OSError as e:  # 单个文件删除失败不影响其余。
+                logger.warning(f"Lie record delete failed for {target}: {e}. 测谎录像删除文件失败。")
+        return removed_mp4
+    except Exception as e:  # 删除整体异常不抛给 UI。
+        logger.warning(f"Lie record delete error: {e}. 测谎录像删除异常。")
+        return False

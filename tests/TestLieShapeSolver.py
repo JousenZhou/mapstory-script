@@ -33,6 +33,40 @@ def _make_white_square_frame(size: int, x1: int, y1: int, side: int,
     return frame
 
 
+def _halo_bgr() -> tuple:
+    """倒计时蓝灰阴影的合成色（HSV H=100,S=60,V=160 转 BGR），保证落在光环阈值区间内。"""
+
+    bgr = cv2.cvtColor(np.uint8([[[100, 60, 160]]]), cv2.COLOR_HSV2BGR)[0, 0]  # 单像素转换。
+    return int(bgr[0]), int(bgr[1]), int(bgr[2])  # 解包成 BGR 三元组。
+
+
+def _make_countdown_frame(size: int = 320, with_square: bool = True,
+                          with_halo: bool = True, touch: bool = False) -> np.ndarray:
+    """合成模拟测谎弹窗画面：tan 底 + 白色方块（可选）+ 白色倒计时数字（可选冷色光环）。
+
+    数字先画成 glyph 掩码，膨胀一圈涂冷色光环再盖白色本体，光环宽度确定可控，与生产录像一致；
+    touch=True 时把数字下移到光环压住方块上边，模拟录像里数字与图形粘连的帧。
+    """
+
+    frame = np.full((size, size, 3), 95, dtype=np.uint8)  # tan 底 BGR 初值。
+    frame[:, :] = (95, 151, 172)  # 录像实测的 tan 底色。
+    square_center = (size // 2, int(size * 0.625))  # 方块中心。
+    side = 60  # 方块边长。
+    if with_square:  # 画白色目标方块。
+        cv2.rectangle(frame, (square_center[0] - side // 2, square_center[1] - side // 2),
+                      (square_center[0] + side // 2, square_center[1] + side // 2),
+                      (255, 255, 255), -1)
+    baseline_y = (square_center[1] - side // 2 - 4) if touch else int(size * 0.31)  # 数字基线 y。
+    origin = (size // 2 - 20, baseline_y)  # putText 左下角原点。
+    glyph = np.zeros((size, size), np.uint8)  # 数字 glyph 掩码。
+    cv2.putText(glyph, "5", origin, cv2.FONT_HERSHEY_SIMPLEX, 3.0, 255, 10)
+    if with_halo:  # glyph 外胀 6px 涂冷色光环，本体白色盖回中间后露出一圈阴影。
+        halo_mask = cv2.dilate(glyph, np.ones((13, 13), np.uint8))
+        frame[halo_mask > 0] = _halo_bgr()
+    frame[glyph > 0] = (255, 255, 255)  # 白色数字本体。
+    return frame
+
+
 class TestLieShapeSolver(unittest.TestCase):
     """六项合成帧测试，覆盖学习、矩形模型、检测过滤、区域重置、回看插值与场景结束。"""
 
@@ -118,6 +152,38 @@ class TestLieShapeSolver(unittest.TestCase):
         frame_ok = _make_white_circle_frame(200, 100, 100, 30, bg=60, fg=255)
         dets_ok = detect_white_shapes(frame_ok, 1.0)
         self.assertGreater(len(dets_ok), 0, "正常白色圆应被检测到")
+
+    def test_countdown_digit_with_halo_rejected(self):
+        """倒计时剔除：带冷色光环的白色数字与方块同帧时，只返回方块一个候选且中心不偏。"""
+
+        frame = _make_countdown_frame(with_square=True, with_halo=True)
+        dets = detect_white_shapes(frame, 1.0)
+        self.assertEqual(len(dets), 1, "带光环倒计时数字应被剔除，只剩方块候选")
+        np.testing.assert_allclose(dets[0].center, [160.0, 200.0], atol=2.0,
+                                   err_msg="唯一候选应是方块且中心不偏")
+
+    def test_countdown_digit_with_halo_alone_rejected(self):
+        """倒计时剔除：只有带光环数字的帧应零候选（防开局把模板学成数字）。"""
+
+        frame = _make_countdown_frame(with_square=False, with_halo=True)
+        self.assertEqual(len(detect_white_shapes(frame, 1.0)), 0,
+                         "带光环倒计时数字单独出现时不应产生任何候选")
+
+    def test_countdown_digit_without_halo_still_detected(self):
+        """判别守卫：无光环的白色数字仍是普通白色候选，证明剔除凭据是光环而非字形。"""
+
+        frame = _make_countdown_frame(with_square=False, with_halo=False)
+        self.assertGreater(len(detect_white_shapes(frame, 1.0)), 0,
+                           "无光环白色数字应照常检成候选")
+
+    def test_halo_touching_square_keeps_center(self):
+        """粘连帧：光环压住方块上边时，方块候选中心仍不偏（防线一切断粘连桥）。"""
+
+        frame = _make_countdown_frame(with_square=True, with_halo=True, touch=True)
+        dets = detect_white_shapes(frame, 1.0)
+        self.assertEqual(len(dets), 1, "粘连帧应只返回方块一个候选")
+        np.testing.assert_allclose(dets[0].center, [160.0, 200.0], atol=3.0,
+                                   err_msg="粘连帧方块中心偏移应 ≤3px")
 
     def test_region_reset(self):
         """区域重置：连续喂帧后调用 reset，断言光流历史被清空（下一次 update 因历史不足返回 waiting）。"""

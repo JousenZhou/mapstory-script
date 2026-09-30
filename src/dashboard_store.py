@@ -31,7 +31,7 @@ DASHBOARD_DEFAULTS = {  # 看板共享配置默认值：键名与任务原配置
     'Lie Detector Region Feature': '测谎坐标框',  # 测谎区域标注：类别为「测谎」的标注分类名，直接采集坐标作为解测谎输入区域。
     'Lie Detector Trigger Feature': '测谎触发',  # 测谎触发标注：类别为「测谎触发」的标注分类名，画面匹配到即触发解测谎。
     'Lie Detector Threshold': 0.75,  # 测谎触发匹配阈值，越高越严格。
-    'Lie Detector Precision': 'high',  # 解测谎精度档（low/medium/high/ultra）：GPU 默认高，无 N 卡时 high/ultra 运行时回落 medium。
+    'Lie Detector Precision': 'extreme',  # 解测谎精度档（low/medium/high/ultra/extreme）：GPU 默认最强，无 N 卡时高/极高/最强运行时回落 medium。与 shape_session.PRECISION_TIER_DEFAULT 同步（此处故意用字面量，不让配置层反向依赖算法层）。
     'Lie Detector Trigger Delay': 5.0,  # 匹配到测谎触发后延迟多少秒才开始解测谎（等弹窗完全展开、图形动画起势），0 表示立即解题。
     'Lie Detector Abort Key': '',  # 解测谎急停按键（键盘按键名，如 f8）：敲击即中止本次解测谎并把「自动解测谎」开关同步关掉，留空不启用（不装全局键盘监听）。
     'Lie Alarm Sound': 'alarm.mp3',  # 测谎报警音频（支持 wav/mp3，相对路径相对项目根目录），留空不报警。

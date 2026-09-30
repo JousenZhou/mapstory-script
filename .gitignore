@@ -26,6 +26,7 @@ click_screenshots/
 test_scripts/
 screenshots/
 lie_records/
+_diag_out/
 *.log
 thread_dumps.txt
 site/

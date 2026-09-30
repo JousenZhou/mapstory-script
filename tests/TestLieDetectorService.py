@@ -75,16 +75,18 @@ class TestLieDetectorService(unittest.TestCase):
         self.assertEqual(service_module.LIE_TRIGGER_DELAY_MAX, huge)  # 误填过大值被截断，不会长时间卡在等待。
 
     def test_read_config_precision_defaults_and_validates(self):
-        # 精度档：未配置或非法值都回退默认 high，合法档位原样返回（避免把未知 key 传给 ShapeTrackParams）。
+        # 精度档：未配置或非法值都回退算法层默认档（最强），合法档位原样返回（避免把未知 key 传给 ShapeTrackParams）。
+        default_tier = service_module.PRECISION_TIER_DEFAULT  # 默认档取算法层常量，不写死字面量，换默认档时本用例无需跟着改。
         with patch.object(self.service, "_get_config", return_value={}):
             *_, missing = self.service._read_config()
-        self.assertEqual("high", missing)  # 看板未配该键时用默认档。
+        self.assertEqual(default_tier, missing)  # 看板未配该键时用默认档。
         with patch.object(self.service, "_get_config", return_value={"Lie Detector Precision": "not_a_tier"}):
             *_, bad = self.service._read_config()
-        self.assertEqual("high", bad)  # 非法档位回退默认。
-        with patch.object(self.service, "_get_config", return_value={"Lie Detector Precision": "low"}):
-            *_, low = self.service._read_config()
-        self.assertEqual("low", low)  # 合法档位原样返回。
+        self.assertEqual(default_tier, bad)  # 非法档位回退默认。
+        for tier in service_module.PRECISION_TIER_KEYS:  # 五个合法档（含新增的最强）都应原样返回。
+            with patch.object(self.service, "_get_config", return_value={"Lie Detector Precision": tier}):
+                *_, legal = self.service._read_config()
+            self.assertEqual(tier, legal)  # 合法档位原样返回。
 
     def test_reload_config_forces_refresh(self):
         # reload_config 把刷新时间戳清零，主循环下一轮立即重读看板配置（看板保存时调用）。
@@ -402,6 +404,11 @@ class TestLieDetectorService(unittest.TestCase):
         fresh = np.full((300, 400, 3), 90, dtype=np.uint8)
         trigger = SimpleNamespace(x=10, y=10, width=50, height=20)
         seen = {}
+
+        def fake_solve(f, *a):  # 记录解题拿到的帧；返回 timeout 让本用例只验证“帧刷新”，不进结算分支。
+            seen["frame"] = f
+            return "timeout"
+
         with patch.object(self.service, "_pause_current_task", return_value=None), \
                 patch.object(self.service, "_resume_task"), \
                 patch.object(self.service, "_play_alarm"), \
@@ -411,7 +418,7 @@ class TestLieDetectorService(unittest.TestCase):
                 patch.object(self.service, "_update_vision"), \
                 patch.object(self.service, "_wait_trigger_delay", return_value=True), \
                 patch.object(self.service, "_capture", return_value=fresh), \
-                patch.object(self.service, "_solve", side_effect=lambda f, *a: seen.setdefault("frame", f)), \
+                patch.object(self.service, "_solve", side_effect=fake_solve), \
                 patch.object(self.service, "_idle_sleep"):
             self.service._handle_trigger(stale, trigger, "测谎触发", "测谎坐标框", 0.7, 5.0, "", "high")
         self.assertIs(fresh, seen["frame"])  # 解题拿到的是延迟后重新采集的帧。
@@ -602,6 +609,129 @@ class TestLieDetectorService(unittest.TestCase):
         recorder.write.assert_called_once()  # 写了一帧。
         self.assertIs(frame, recorder.write.call_args[0][0])  # 写入的是未裁剪的原始整帧（与触发帧同一对象）。
 
+    # ------------------------------------------------------------------ 解测谎结算
+
+    def test_settle_lie_result_success_confirms_until_gone(self):
+        # 结算：5s 内出现【测谎成功】-> 点【测谎成功确定】-> 成功标注消失后返回 success。
+        frame = np.full((120, 160, 3), 20, dtype=np.uint8)
+        success_box = SimpleNamespace(x=10, y=10, width=40, height=20)
+        ok_box = SimpleNamespace(x=60, y=60, width=20, height=10)
+        state = {"success_calls": 0, "clicks": 0}
+
+        def fake_find(f, name, threshold, handle=None):
+            if name == service_module.LIE_SUCCESS_TEMPLATE:  # 【测谎成功】：结算窗口首拍与确认首拍仍在，第二拍消失。
+                state["success_calls"] += 1
+                return success_box if state["success_calls"] <= 2 else None
+            if name == service_module.LIE_SUCCESS_OK_TEMPLATE:  # 【测谎成功确定】始终在，供点击。
+                return ok_box
+            return None
+
+        def fake_click(x, y, clicks=1):
+            state["clicks"] += 1
+
+        with patch.object(self.service, "_capture", return_value=frame), \
+                patch.object(self.service, "_find_trigger", side_effect=fake_find), \
+                patch.object(self.service, "_click_in_window", side_effect=fake_click), \
+                patch.object(self.service, "_ensure_in_front"), \
+                patch.object(self.service, "_update_vision"), \
+                patch.object(self.service, "draw_lie_annotations", return_value=frame), \
+                patch.object(self.service, "_idle_sleep"):
+            outcome = self.service._settle_lie_result(0.75)
+        self.assertEqual("success", outcome)  # 成功标注消失 -> 成功。
+        self.assertEqual(1, state["clicks"])  # 成功标注消失前点了一次确定。
+
+    def test_confirm_lie_success_retries_click_while_present(self):
+        # 点确定后【测谎成功】仍在则重试点击，直到成功标注消失才结束（共点两次）。
+        frame = np.full((120, 160, 3), 20, dtype=np.uint8)
+        success_box = SimpleNamespace(x=10, y=10, width=40, height=20)
+        ok_box = SimpleNamespace(x=60, y=60, width=20, height=10)
+        state = {"success_calls": 0, "clicks": 0}
+
+        def fake_find(f, name, threshold, handle=None):
+            if name == service_module.LIE_SUCCESS_TEMPLATE:
+                state["success_calls"] += 1
+                return success_box if state["success_calls"] <= 3 else None  # 结算1拍+确认2拍仍在，第4拍消失。
+            if name == service_module.LIE_SUCCESS_OK_TEMPLATE:
+                return ok_box
+            return None
+
+        def fake_click(x, y, clicks=1):
+            state["clicks"] += 1
+
+        with patch.object(self.service, "_capture", return_value=frame), \
+                patch.object(self.service, "_find_trigger", side_effect=fake_find), \
+                patch.object(self.service, "_click_in_window", side_effect=fake_click), \
+                patch.object(self.service, "_ensure_in_front"), \
+                patch.object(self.service, "_update_vision"), \
+                patch.object(self.service, "draw_lie_annotations", return_value=frame), \
+                patch.object(self.service, "_idle_sleep"):
+            outcome = self.service._settle_lie_result(0.75)
+        self.assertEqual("success", outcome)
+        self.assertEqual(2, state["clicks"])  # 成功标注仍在时重试点击，共点两次后消失。
+
+    def test_settle_lie_result_failure_when_success_absent(self):
+        # 窗口内始终未出现【测谎成功】-> 判定失败（LIE_SETTLE_WAIT 置 0 使窗口立即到期，避免真等 5 秒）。
+        frame = np.full((120, 160, 3), 20, dtype=np.uint8)
+        with patch.object(service_module, "LIE_SETTLE_WAIT", 0.0), \
+                patch.object(self.service, "_capture", return_value=frame), \
+                patch.object(self.service, "_find_trigger", return_value=None), \
+                patch.object(self.service, "_update_vision"), \
+                patch.object(self.service, "draw_lie_annotations", return_value=frame), \
+                patch.object(self.service, "_idle_sleep"):
+            outcome = self.service._settle_lie_result(0.75)
+        self.assertEqual("failure", outcome)  # 5s 内无【测谎成功】-> 失败。
+
+    def test_settle_lie_result_aborts_on_hotkey(self):
+        # 结算循环开头检查急停标志：置位则立即返回 aborted，不再取帧/点击。
+        self.service._abort_event.set()
+        with patch.object(self.service, "_capture", return_value=None) as capture, \
+                patch.object(self.service, "_idle_sleep"):
+            outcome = self.service._settle_lie_result(0.75)
+        self.assertEqual("aborted", outcome)
+        capture.assert_not_called()  # 急停在循环开头，未取帧。
+
+    def test_handle_trigger_runs_settlement_after_solve_gone(self):
+        # 集成：_solve 返回 gone 且【测谎成功】已标注时，_handle_trigger 进结算并用结算结果收尾录像。
+        frame = np.full((300, 400, 3), 20, dtype=np.uint8)
+        trigger = SimpleNamespace(x=10, y=10, width=50, height=20, confidence=0.9)
+        with patch.object(self.service, "_pause_current_task", return_value=None), \
+                patch.object(self.service, "_resume_task"), \
+                patch.object(self.service, "_play_alarm"), \
+                patch.object(self.service, "_start_recorder"), \
+                patch.object(self.service, "_stop_recorder") as stop_rec, \
+                patch.object(self.service, "_get_region_box", return_value=None), \
+                patch.object(self.service, "_update_vision"), \
+                patch.object(self.service, "_wait_trigger_delay", return_value=True), \
+                patch.object(self.service, "_capture", return_value=None), \
+                patch.object(self.service, "_solve", return_value="gone"), \
+                patch.object(self.service, "_feature_ready", return_value=True), \
+                patch.object(self.service, "_settle_lie_result", return_value="success") as settle, \
+                patch.object(self.service, "_idle_sleep"):
+            self.service._handle_trigger(frame, trigger, "测谎触发", "测谎坐标框", 0.7, 0.0, "", "high")
+        settle.assert_called_once_with(0.7)  # 结算用触发阈值。
+        stop_rec.assert_called_once_with("success")  # 收尾用结算结果。
+
+    def test_handle_trigger_skips_settlement_when_success_not_annotated(self):
+        # 【测谎成功】未标注（_feature_ready=False）时不结算，沿用 _solve 原 outcome。
+        frame = np.full((300, 400, 3), 20, dtype=np.uint8)
+        trigger = SimpleNamespace(x=10, y=10, width=50, height=20, confidence=0.9)
+        with patch.object(self.service, "_pause_current_task", return_value=None), \
+                patch.object(self.service, "_resume_task"), \
+                patch.object(self.service, "_play_alarm"), \
+                patch.object(self.service, "_start_recorder"), \
+                patch.object(self.service, "_stop_recorder") as stop_rec, \
+                patch.object(self.service, "_get_region_box", return_value=None), \
+                patch.object(self.service, "_update_vision"), \
+                patch.object(self.service, "_wait_trigger_delay", return_value=True), \
+                patch.object(self.service, "_capture", return_value=None), \
+                patch.object(self.service, "_solve", return_value="gone"), \
+                patch.object(self.service, "_feature_ready", return_value=False), \
+                patch.object(self.service, "_settle_lie_result") as settle, \
+                patch.object(self.service, "_idle_sleep"):
+            self.service._handle_trigger(frame, trigger, "测谎触发", "测谎坐标框", 0.7, 0.0, "", "high")
+        settle.assert_not_called()  # 未标注【测谎成功】不结算。
+        stop_rec.assert_called_once_with("gone")  # 沿用解题原 outcome。
+
     # ------------------------------------------------------------------ 录像集成
 
     def test_handle_trigger_starts_and_stops_recorder_with_solve_outcome(self):
@@ -618,6 +748,7 @@ class TestLieDetectorService(unittest.TestCase):
                 patch.object(self.service, "_wait_trigger_delay", return_value=True), \
                 patch.object(self.service, "_capture", return_value=None), \
                 patch.object(self.service, "_solve", return_value="solved"), \
+                patch.object(self.service, "_feature_ready", return_value=False), \
                 patch.object(self.service, "_idle_sleep"):
             self.service._handle_trigger(frame, trigger, "测谎触发", "测谎坐标框", 0.7, 0.0, "", "ultra")
         self.assertEqual(1, start_rec.call_count)  # 起录一次。
@@ -626,7 +757,7 @@ class TestLieDetectorService(unittest.TestCase):
         self.assertIs(trigger, called_box)  # 带上触发框（取置信度写入录像名）。
         self.assertIsNone(called_region)  # 本用例 _get_region_box 返回 None，无坐标框则录整帧。
         self.assertEqual("ultra", called_tier)  # 带上精度档。
-        stop_rec.assert_called_once_with("solved")  # 收尾用 _solve 返回的 outcome。
+        stop_rec.assert_called_once_with("solved")  # 【测谎成功】未标注（_feature_ready=False）不结算，收尾沿用 _solve 返回的 outcome。
 
     def test_start_recorder_swallows_exception(self):
         # 录像器构造/起流抛异常时 _start_recorder 吞掉不外溢，self._recorder 保持 None，解题照常。

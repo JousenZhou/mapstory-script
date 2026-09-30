@@ -1,5 +1,6 @@
 # 独立测谎监控服务：脱离脚本任务单独运行，值守看板配置的【测谎触发】标注。
-# 命中触发即：暂停当前脚本任务 -> 自动解测谎（DIS 稠密光流+粒子滤波，与测谎检验页签同一套解法，无神经网络）-> 结束后恢复任务；
+# 命中触发即：暂停当前脚本任务 -> 自动解测谎（稠密光流+粒子滤波，有 N 卡走 torch CUDA、否则走 CPU，
+# 与测谎检验页签同一套解法，无神经网络）-> 结束后恢复任务；
 # 无脚本任务运行时也能独立监控与求解。
 #
 # 扩展：掉线自动重登——复用同一监控循环与截图/模板匹配资源，检测【掉线2】模板命中后
@@ -32,7 +33,7 @@ import os  # 导入标准库 os，用于测谎报警音频的路径解析与存�
 import threading  # 导入标准库 threading，用于后台守护线程。
 import time  # 导入标准库 time，用于监控节拍、解题计时与配置刷新计时。
 
-import cv2  # 导入 OpenCV，用于实时画面标注绘制与 DIS 光流可用性探测。
+import cv2  # 导入 OpenCV，用于实时画面标注绘制与 CPU 光流引擎可用性探测。
 import numpy as np  # 导入 NumPy，用于光流轮廓点集的坐标偏移。
 
 from ok import Logger, TriggerTask, og  # 导入日志器、触发任务类型（暂停时需排除）与全局对象（executor/device_manager/my_app）。
@@ -41,14 +42,15 @@ from src.dashboard_store import load_dashboard_config, save_dashboard_config  # 
 from src.liedetector.recorder import LieRecorder  # 测谎触发录像器：触发->解除全过程录原始帧 + 边车记录，供验证页签复算。
 from src.autologin.flow import DOUBLE_CLICK_GAP, AutoLoginFlow  # 导入自动重登流程状态机与双击间隔常量（掉线触发后执行全桌面重登序列）。
 
-try:  # 解测谎依赖可选：DIS 稠密光流 + 粒子滤波在线编排，缺失时服务照常运行，仅禁用自动解测谎。
+try:  # 解测谎依赖可选：稠密光流 + 粒子滤波在线编排，缺失时服务照常运行，仅禁用自动解测谎。
     from src.liedetector.shape_session import (  # 与测谎检验页签同一套光流解法（无神经网络）。
-        ShapeTrackParams, ShapeTrackSession, PRECISION_TIER_KEYS,
+        ShapeTrackParams, ShapeTrackSession, PRECISION_TIER_DEFAULT, PRECISION_TIER_KEYS,
         SOURCE_COLOR, SOURCE_BORDER, SOURCE_INTERPOLATED, SOURCE_PREDICTION, SOURCE_SCENE_ENDED)
-    LIE_SOLVER_AVAILABLE = hasattr(cv2, "DISOpticalFlow_create")  # 光流解法依赖 OpenCV DIS 稠密光流。
+    LIE_SOLVER_AVAILABLE = hasattr(cv2, "DISOpticalFlow_create")  # CPU 回退引擎依赖 OpenCV DIS；显卡引擎（torch Farneback）不需要，但降级路径必须可用。
 except Exception:  # liedetector 模块缺失或依赖损坏。
     LIE_SOLVER_AVAILABLE = False  # 禁用自动解测谎，运行时日志提示。
-    PRECISION_TIER_KEYS = ("low", "medium", "high", "ultra")  # 兜底精度档名单：模块缺失时 _read_config 仍能校验配置值不报错。
+    PRECISION_TIER_KEYS = ("low", "medium", "high", "ultra", "extreme")  # 兜底精度档名单：模块缺失时 _read_config 仍能校验配置值不报错。
+    PRECISION_TIER_DEFAULT = "extreme"  # 兜底默认档，与 shape_session.PRECISION_TIER_DEFAULT 保持一致。
 
 logger = Logger.get_logger(__name__)  # 服务日志器。
 
@@ -78,6 +80,13 @@ DISCONNECT_OK_WAIT = 2.0  # 点击掉线确定后等待弹窗关闭的秒数。
 DISCONNECT_GAME_EXIT_TIMEOUT = 15.0  # 点了【掉线确定】后等待游戏窗口关闭的超时秒数（弹窗关闭到窗口退出确实需要几秒）。
 DISCONNECT_GAME_EXIT_TIMEOUT_NO_DIALOG = 3.0  # 跳过【掉线】弹窗（场景2）时的短等待秒数：没有确定可点，游戏窗口不会因此关闭，
 # 实测这种情况掉线2 会一直挂在画面上，等满 15 秒纯属浪费，只需短等几秒确认窗口状态就进重登。
+
+# —— 解测谎结算常量（仅用于游戏真实触发链路，测谎检验页签的复算验证不走结算）——
+LIE_SUCCESS_TEMPLATE = "测谎成功"  # 解测谎结算成功标志模板：触发消失后出现即代表成功。
+LIE_SUCCESS_OK_TEMPLATE = "测谎成功确定"  # 【测谎成功】弹窗的确定按钮模板：反复点击直到【测谎成功】消失。
+LIE_SETTLE_WAIT = 5.0  # 触发标注消失后，等待【测谎成功】出现的窗口秒数；窗口内未出现即判定失败。
+LIE_SETTLE_CONFIRM_TIMEOUT = 15.0  # 点击【测谎成功确定】后等待【测谎成功】消失的安全超时秒数，防死循环。
+LIE_SETTLE_CLICK_INTERVAL = 0.4  # 两次点击【测谎成功确定】之间的间隔秒数。
 
 STATE_IDLE = "idle"  # 服务空闲监控态。
 STATE_SOLVING = "solving"  # 服务正在解测谎态。
@@ -129,6 +138,7 @@ class LieDetectorService:  # 独立测谎监控服务：后台守护线程值守
         self._abort_key = ''  # 规范化后的急停按键名，空字符串表示未启用急停（也不装全局键盘钩子）。
         self._abort_listener = None  # pynput 全局键盘监听器，仅在配置了急停键时启动。
         self._abort_notice = False  # 急停已发生、等待看板 UI 把「自动解测谎」开关同步为关的一次性标志。
+        self._logged_precision = None  # 上次打过日志的精度档：仅在档位变化时记一次，让日志能直接核对服务当前生效的档位（无需等触发解题）。
 
     def start(self):  # 启动后台守护线程；重复调用只启动一次。
         if self._thread is not None:  # 已启动过。
@@ -155,9 +165,12 @@ class LieDetectorService:  # 独立测谎监控服务：后台守护线程值守
             trigger_delay = LIE_TRIGGER_DELAY_DEFAULT  # 回退默认延迟。
         trigger_delay = min(max(trigger_delay, 0.0), LIE_TRIGGER_DELAY_MAX)  # 夹到 [0, 上限]：负数按不延迟处理，过大值截断。
         alarm_sound = str(config.get("Lie Alarm Sound") or '').strip()  # 报警音频路径，留空表示不报警。
-        precision = str(config.get("Lie Detector Precision") or 'high').strip()  # 解测谎精度档 key，缺省按高。
+        precision = str(config.get("Lie Detector Precision") or PRECISION_TIER_DEFAULT).strip()  # 解测谎精度档 key，缺省按算法层默认档。
         if precision not in PRECISION_TIER_KEYS:  # 非法档位（配置被手改成未知值）。
-            precision = 'high'  # 回退默认精度档，与 DASHBOARD_DEFAULTS 一致。
+            precision = PRECISION_TIER_DEFAULT  # 回退默认精度档，与 DASHBOARD_DEFAULTS 一致。
+        if precision != self._logged_precision:  # 档位变化（含启动后首次读取）：记一次日志。
+            self._logged_precision = precision  # 更新已记录档位。
+            logger.info(f"Lie detector precision tier: {precision}. 解测谎精度档生效：{precision}（看板可改；无 N 卡时 high/ultra/extreme 会在装配时回落 medium）。")
         return auto_solve, trigger_name, region_name, threshold, trigger_delay, alarm_sound, precision  # 返回解析后的配置元组。
 
     def _get_config(self):  # 取看板配置缓存，超过刷新间隔时重读文件。
@@ -170,18 +183,18 @@ class LieDetectorService:  # 独立测谎监控服务：后台守护线程值守
             self._config_time = now  # 记录本次刷新时间。
         return self._config  # 返回配置缓存。
 
-    def _warmup_scoring_backend(self):  # 预热测谎打分后端：在守护线程里触发 CuPy 初始化与显存池分配，避免解测谎首帧冷启动卡顿（约 1~3 秒）。
+    def _warmup_scoring_backend(self):  # 预热测谎后端：在守护线程里触发 torch CUDA 初始化、显存池分配与 cudnn 卷积算法调优，避免解测谎首帧冷启动卡顿（约 1~3 秒）。
         if not LIE_SOLVER_AVAILABLE:  # 光流解法不可用时不会有打分调用，无需预热。
             return  # 跳过。
         try:  # 预热失败不影响正常路径，正式求解时会再走一次后端装配与降级链路。
-            from src.liedetector.gpu_shape_backend import warmup_shape_backend  # 延迟导入：无显卡环境不应影响服务启动，CuPy 初始化也较重。
-            backend_name = warmup_shape_backend()  # 触发探测、单例创建与一次假数据打分，返回 "cupy" 或 "numpy"。
-            logger.info(f"Lie solve scoring backend ready: {backend_name}. 测谎打分后端预热完成：{backend_name}（有 N 卡走 CuPy，否则 NumPy）。")  # 记录实际生效的后端，便于核对走的是显卡还是 CPU。
+            from src.liedetector.gpu_shape_backend import warmup_shape_backend  # 延迟导入：无显卡环境不应影响服务启动，torch CUDA 初始化也较重。
+            backend_name = warmup_shape_backend()  # 跑一次假数据打分 + 一次证据链，返回 "torch(cuda)/farneback" 或 "numpy/dis"。
+            logger.info(f"Lie solve scoring backend ready: {backend_name}. 测谎后端预热完成：{backend_name}（有 N 卡走 torch CUDA + Farneback 光流，否则 NumPy + cv2 DIS）。")  # 记录实际生效的后端与光流引擎，便于核对走的是显卡还是 CPU。
         except Exception as e:  # 预热异常不能拖垮服务。
             logger.warning(f"Lie solve scoring backend warmup failed: {e}. 测谎打分后端预热失败，将在首次求解时重试。")  # 记录异常。
 
     def _run(self):  # 服务主循环：空闲监控掉线触发与测谎触发，命中则暂停任务并处理，直到进程退出。
-        self._warmup_scoring_backend()  # 主循环前预热打分后端：已在守护线程内，1~3 秒的 CuPy 初始化不会阻塞 app 启动。
+        self._warmup_scoring_backend()  # 主循环前预热后端：已在守护线程内，1~3 秒的 torch CUDA 初始化不会阻塞 app 启动。
         while not self._exit_event.is_set():  # 主循环，退出事件置位时结束。
             try:  # 单轮异常不能拖垮服务，捕获后记录并继续下一轮。
                 auto_solve, trigger_name, region_name, threshold, trigger_delay, alarm_sound, precision = self._read_config()  # 读取测谎配置。
@@ -273,6 +286,8 @@ class LieDetectorService:  # 独立测谎监控服务：后台守护线程值守
                 frame = fresh  # 更新为最新画面。
             self._set_status("solving")  # 延迟倒计时状态改回解题态，避免日志停在 delaying。
             outcome = self._solve(frame, trigger_name, region_name, threshold, precision)  # 进入解测谎子循环，返回 solved/timeout/gone。
+            if outcome in ("gone", "solved") and self._feature_ready(LIE_SUCCESS_TEMPLATE):  # 正常解出（触发消失/场景结束）且【测谎成功】已标注才结算；timeout/aborted 保留原 outcome。
+                outcome = self._settle_lie_result(threshold)  # 结算：5s 内看【测谎成功】判成功/失败，成功则点【测谎成功确定】直到成功标注消失。
         finally:  # 解题结束（正常/异常/退出）都要收尾录像、恢复任务与状态。
             self._stop_recorder(outcome)  # 收尾录像并写边车记录（未起录则空转）。
             if paused_task is not None:  # 本服务暂停了任务。
@@ -581,7 +596,7 @@ class LieDetectorService:  # 独立测谎监控服务：后台守护线程值守
             return None  # 排除。
         return task  # 返回可暂停的脚本任务。
 
-    def _solve(self, first_frame, trigger_name, region_name, threshold, precision_tier="high"):  # 解测谎子循环：DIS 光流+粒子滤波跟踪透明图形并移动光标，直到【测谎触发】标注消失或场景结束。
+    def _solve(self, first_frame, trigger_name, region_name, threshold, precision_tier=PRECISION_TIER_DEFAULT):  # 解测谎子循环：稠密光流+粒子滤波跟踪透明图形并移动光标，直到【测谎触发】标注消失或场景结束。
         self._ensure_in_front()  # 游戏窗口置顶：鼠标追踪依赖前台窗口接收鼠标事件。
         session = ShapeTrackSession(params=ShapeTrackParams(precision_tier=precision_tier), logger=None)  # 光流粒子滤波在线会话，与测谎检验页签同一套算法（无神经网络）；按看板精度档装配。
         fps = float(CAPTURE_FPS)  # 采集帧率，喂给会话换算时间阈值（场景结束/淡出判定）。
@@ -651,6 +666,62 @@ class LieDetectorService:  # 独立测谎监控服务：后台守护线程值守
             if new_frame is not None:  # 取到新帧才替换，取不到沿用上一帧继续求解。
                 frame = new_frame  # 更新当前帧。
         return outcome  # 返回结束原因（solved/timeout/gone），供录像边车记录。
+
+    def _settle_lie_result(self, threshold):  # 解测谎结算：触发标注消失后开 LIE_SETTLE_WAIT 秒窗口，出现【测谎成功】则成功并点确定收尾，窗口内未出现则失败。
+        self._set_status("settling")  # 结算态，供日志/诊断区分于解题态。
+        logger.info(f"Lie solve done, wait up to {LIE_SETTLE_WAIT}s for success mark. 解测谎完成，等待最多 {LIE_SETTLE_WAIT} 秒看【测谎成功】是否出现。")  # 记录结算起点。
+        deadline = time.time() + LIE_SETTLE_WAIT  # 成功标注出现的截止时刻。
+        while not self._exit_event.is_set():  # 循环直到出现成功标注/超时/急停/进程退出。
+            if self._abort_event.is_set():  # 结算期收到急停按键。
+                logger.info("Lie settle aborted by hotkey. 结算期收到急停按键，已中止结算。")
+                return "aborted"  # 录像标记为急停。
+            frame = self._capture()  # 取一帧画面。
+            if frame is not None:  # 取到画面才做匹配与推送。
+                if self._recorder is not None:  # 结算期也录进“触发->解除->结算”全过程。
+                    self._recorder.write(frame)  # 非阻塞入队，队列满即丢帧。
+                success_box = self._find_trigger(frame, LIE_SUCCESS_TEMPLATE, threshold)  # 全屏匹配【测谎成功】。
+                self._update_vision(self.draw_lie_annotations(frame, success_box, None))  # 把成功标注框选推送到实时画面（未命中不画）。
+                if success_box is not None:  # 5s 内出现【测谎成功】：判定成功，进点击确定收尾。
+                    logger.info("Lie success mark detected, confirming. 已检测到【测谎成功】，开始点击【测谎成功确定】收尾。")
+                    return self._confirm_lie_success(threshold)  # 返回 success/aborted。
+            remaining = deadline - time.time()  # 剩余等待秒数。
+            if remaining <= 0:  # 窗口已到仍未出现成功标注。
+                break  # 退出循环，下方判失败。
+            self._idle_sleep(min(MONITOR_INTERVAL, remaining))  # 按监控节拍短等，不超过剩余窗口，保证退出可及时响应。
+        logger.warning(f"Lie success not shown within {LIE_SETTLE_WAIT}s, mark FAILURE. {LIE_SETTLE_WAIT} 秒内未出现【测谎成功】，判定测谎失败。")  # 记录失败。
+        return "failure"  # 录像标记为失败。
+
+    def _confirm_lie_success(self, threshold):  # 出现【测谎成功】后：反复点击【测谎成功确定】直到【测谎成功】消失，代表结算完成（成功）。
+        self._ensure_in_front()  # 游戏窗口置顶，点击才能落到前台窗口。
+        deadline = time.time() + LIE_SETTLE_CONFIRM_TIMEOUT  # 安全超时截止时刻，防止成功标注始终不消失时无限点击。
+        while not self._exit_event.is_set():  # 循环直到成功标注消失/急停/超时/进程退出。
+            if self._abort_event.is_set():  # 确认期收到急停按键。
+                logger.info("Lie success confirm aborted by hotkey. 确认期收到急停按键，已中止结算。")
+                return "aborted"  # 录像标记为急停。
+            frame = self._capture()  # 取一帧画面。
+            if frame is None:  # 取不到画面：短等重试。
+                self._idle_sleep(MONITOR_INTERVAL)
+                if time.time() >= deadline:  # 超时兜底。
+                    break
+                continue  # 下一拍。
+            if self._recorder is not None:  # 确认期也录进全过程。
+                self._recorder.write(frame)  # 非阻塞入队。
+            success_box = self._find_trigger(frame, LIE_SUCCESS_TEMPLATE, threshold)  # 重新匹配【测谎成功】。
+            if success_box is None:  # 【测谎成功】已消失：测谎流程结束（成功）。
+                logger.info("Lie success mark gone, settle done (SUCCESS). 【测谎成功】已消失，测谎流程结束（成功）。")
+                return "success"  # 录像标记为成功。
+            ok_box = self._find_trigger(frame, LIE_SUCCESS_OK_TEMPLATE, threshold)  # 匹配【测谎成功确定】按钮。
+            self._update_vision(self.draw_lie_annotations(frame, success_box, ok_box))  # 把成功框与确定框推送到实时画面。
+            if ok_box is not None:  # 确定按钮在画面上：点击它（点后成功标注还在则下一拍继续点，即“重试”）。
+                cx = ok_box.x + ok_box.width // 2  # 确定按钮中心横坐标。
+                cy = ok_box.y + ok_box.height // 2  # 确定按钮中心纵坐标。
+                logger.info(f"Clicking lie success OK at ({cx},{cy}). 点击【测谎成功确定】({cx},{cy})。")  # 记录点击。
+                self._click_in_window(cx, cy)  # 通过框架输入接口点击窗口内坐标。
+            self._idle_sleep(LIE_SETTLE_CLICK_INTERVAL)  # 两次点击间隔，避免疯狂连点。
+            if time.time() >= deadline:  # 超时仍未消失。
+                break  # 退出循环，下方兜底按成功收尾。
+        logger.warning("Lie success confirm timeout, still mark SUCCESS. 点击【测谎成功确定】超时仍未消失，按成功收尾。")  # 记录超时兜底。
+        return "success"  # 已出现过成功标注，超时也归为成功。
 
     def _move_mouse_toward(self, current, target):  # 每帧向预测光标位置分步移动鼠标，返回移动后的位置。
         if current is None:  # 首帧无参照点，直接跳到预测点（游戏内光标也会瞬间到位）。

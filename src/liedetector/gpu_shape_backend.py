@@ -1,15 +1,18 @@
-"""测谎「找目标」打分内核的双后端实现：同一份算法代码，分别跑在 NumPy（CPU）与 CuPy（NVIDIA 显卡）上。
+"""测谎「找目标」打分内核的双后端实现：同一份算法代码，分别跑在 NumPy（CPU）与 torch CUDA（NVIDIA 显卡）上。
 
-设计要点（对应 DIS 光流 + 粒子滤波 GPU 加速改造的 Phase 1）：
-- 双编译结构：打分函数全部写成后端无关的数组代码，数组模块（numpy 或 cupy）由
-  ShapeScoreBackend.xp 注入；有 N 卡走 CuPy，没有则自动回落 NumPy，行为与结果等价。
-- 职责切分：只有「打分」这一纯函数上 GPU；粒子状态机（权重更新、回滚、重采样、
-  边界约束）与全部 RNG 仍留在 CPU NumPy，保证同一局录像的结果可复现、可与旧版逐帧对照。
+设计要点（对应光流 + 粒子滤波 GPU 加速改造的 Phase 1）：
+- 双编译结构：打分函数全部写成后端无关的数组代码，数组门面（torch_array.NumpyArrayApi
+  或 TorchArrayApi）由 ShapeScoreBackend.xp 注入；有 N 卡走 torch CUDA，没有则自动回落 NumPy，
+  行为与结果等价。内核只允许用门面上那套显式最小 API，不得出现 numpy 专有的方法写法
+  （``.astype`` / ``.max(axis=)`` / ``.copy()`` / ``.get()`` / ``[::-1]`` 均已被门面方法取代）。
+- 职责切分：打分与时序证据链上 GPU；全部 RNG 仍留在 CPU NumPy（``random_seed`` 的可复现契约不变）。
 - 降级策略：显卡运行期异常（显存不足/驱动重置等）由 shape_tracking 的薄壳捕获，
   自动改走 NumPy 重算本帧并计数；连续失败达到 _FAIL_LIMIT 次后本进程永久回退 NumPy，
   与 gpu_feature_match 的「隐藏式启用 + 永久降级」工程模式一致。
-- 首次调用会初始化 CUDA 上下文与 CuPy 显存池（约 1~3 秒），服务启动时可用
-  warmup_shape_backend() 预热，避免解题首帧冷启动。
+- 首次调用会初始化 CUDA 上下文与 torch 显存池（约 1~3 秒），服务启动时可用
+  warmup_shape_backend() 预热（同时跑一次证据链，把光流核缓存与帧缓冲一并建好），避免解题首帧冷启动。
+- CuPy 已从测谎链路移除；``src/gpu_match.py``、``src/gpu_feature_match.py``（任务模板匹配、
+  自动登录）仍用 CuPy，与本模块无关。
 
 打分数据流（每次调用）：证据图/状态/尺度上传后端（320px 证据图约 230KB，开销可忽略）
 → 后端上做旋转投影、9 组法向偏移采样、扇区/内部归约 → 得分与覆盖率转回 NumPy float32。
@@ -21,9 +24,13 @@ import math  # 数学函数：与 shape_tracking 打分逻辑共用。
 import threading  # 后端单例的线程安全初始化。
 from dataclasses import dataclass  # 打分结果数据类（从 shape_tracking 迁移，避免循环导入）。
 
-import numpy as np  # NumPy：CPU 后端与对外统一返回类型。
+import numpy as np  # NumPy：CPU 侧标量判定与预热假数据。
 
-from src.gpu_match import gpu_available  # 复用模板匹配模块的 CuPy 可用性探测（含无驱动异常兜底）。
+from src.liedetector.torch_array import (  # 数组门面：一套 API，numpy 与 torch CUDA 两份实现。
+    numpy_api,  # CPU 门面单例。
+    torch_gpu_available,  # torch CUDA 可用性探测（含无驱动异常兜底）。
+    torch_module,  # 显卡门面单例，同时显式创建 CUDA 上下文（不碰任何全局性能开关，详见门面 docstring）。
+)
 
 
 @dataclass
@@ -45,19 +52,19 @@ class BorderEvidence:
 _FAIL_LIMIT = 3  # 连续运行期异常达到该次数后本进程永久回退 NumPy，避免每帧都失败刷屏。
 
 _lock = threading.Lock()  # 保护后端单例与降级计数（服务线程与页签线程可能并发求解）。
-_gpu_backend: "ShapeScoreBackend | None" = None  # CuPy 后端单例，None 表示尚未创建或已被降级丢弃。
-_gpu_failed = False  # CuPy 是否已被永久禁用（探测失败或运行期异常达到上限）。
+_gpu_backend: "ShapeScoreBackend | None" = None  # torch 后端单例，None 表示尚未创建或已被降级丢弃。
+_gpu_failed = False  # 显卡后端是否已被永久禁用（探测失败或运行期异常达到上限）。
 _gpu_requests = 0  # 显卡后端的累计请求次数，用于区分「从未请求」与「请求后降级」。
 _fail_count = 0  # 连续运行期异常计数，成功打分后由调用方清零。
 _numpy_backend: "ShapeScoreBackend | None" = None  # NumPy 后端单例。
-_gpu_available: bool | None = None  # CuPy 可用性探测缓存：首次探测要初始化 CUDA 驱动，进程内只探一次。
+_gpu_available: bool | None = None  # torch CUDA 可用性探测缓存：首次探测要初始化 CUDA 驱动，进程内只探一次。
 
 
-def cupy_available() -> bool:  # CuPy 打分后端是否可用（结果缓存）。
+def gpu_backend_available() -> bool:  # torch CUDA 打分后端是否可用（结果缓存）。
     global _gpu_available  # 写探测缓存。
     if _gpu_available is None:  # 尚未探测过。
         try:  # 探测本身也可能因驱动异常抛错。
-            _gpu_available = bool(gpu_available())  # 复用 gpu_match 的探测：CuPy 已装且至少一块可用显卡。
+            _gpu_available = bool(torch_gpu_available())  # torch 已装、CUDA 可用且至少一块显卡。
         except Exception:  # 探测异常按不可用处理。
             _gpu_available = False  # 永久回落 NumPy。
     return _gpu_available  # 返回缓存结果。
@@ -66,23 +73,23 @@ def cupy_available() -> bool:  # CuPy 打分后端是否可用（结果缓存）
 def numpy_backend() -> ShapeScoreBackend:  # 取 NumPy 后端单例（CPU 路径）。
     global _numpy_backend  # 写单例缓存。
     if _numpy_backend is None:  # 尚未创建。
-        _numpy_backend = ShapeScoreBackend(np, "numpy")  # CPU 后端。
+        _numpy_backend = ShapeScoreBackend(numpy_api(), "numpy")  # CPU 门面后端。
     return _numpy_backend  # 返回单例。
 
 
-def require_gpu_backend() -> ShapeScoreBackend:  # 请求显卡后端：可用返回 CuPy 单例，不可用/已降级返回 NumPy 后端。
+def require_gpu_backend() -> ShapeScoreBackend:  # 请求显卡后端：可用返回 torch 单例，不可用/已降级返回 NumPy 后端。
     global _gpu_backend, _gpu_failed, _gpu_requests  # 写单例与降级标记。
     with _lock:  # 服务线程与页签线程可能并发请求。
         _gpu_requests += 1  # 记录请求，供 backend_in_use 判断。
         if _gpu_failed:  # 已被永久禁用。
             return numpy_backend()  # 直接走 CPU。
-        if not cupy_available():  # 无 CuPy 或无 N 卡。
+        if not gpu_backend_available():  # 无 torch 或无 N 卡。
             _gpu_failed = True  # 标记禁用，后续请求不再探测。
             return numpy_backend()  # 走 CPU。
         if _gpu_backend is None:  # 首次创建。
-            try:  # 构造过程只做属性赋值，理论上不抛；防御性兜底。
-                _gpu_backend = ShapeScoreBackend(_import_cupy(), "cupy")  # CuPy 后端。
-            except Exception:  # CuPy 导入/初始化失败。
+            try:  # 构造门面会导入 torch 并初始化 CUDA，驱动异常时在这里抛。
+                _gpu_backend = ShapeScoreBackend(torch_module(), "torch")  # torch CUDA 后端。
+            except Exception:  # torch 导入/初始化失败。
                 _gpu_failed = True  # 永久回退 NumPy。
                 _gpu_backend = None  # 清掉半成品。
                 return numpy_backend()  # 走 CPU。
@@ -110,8 +117,22 @@ def clear_gpu_failure() -> None:  # 打分成功后清零连续失败计数（�
         _fail_count = 0  # 清零。
 
 
-def warmup_shape_backend() -> str:  # 预热当前后端：返回后端名，异常静默（预热失败不影响正常路径）。
-    backend = require_gpu_backend()  # 触发探测与单例创建（CuPy 首次初始化上下文约 1~3 秒）。
+def warmup_shape_backend() -> str:  # 预热当前后端：返回「后端/光流引擎」描述串，异常静默（预热失败不影响正常路径）。
+    """跑一次打分内核 + 一次完整时序证据链，把冷启动开销全部提到服务启动阶段。
+
+    两条链路各自要预热的东西不同：
+
+    - 打分内核：触发 CUDA 上下文创建（torch 首次约 1~3 秒）与显存池分配；
+    - 证据链：触发 Farneback 的卷积核/衰减掩码/采样网格缓存，以及帧环形缓冲的显存分配。
+
+    预热用的是**默认精度档**的光流参数与 lag（默认档即 high），因为实际求解绝大多数时候跑在这一档。
+    预热尺寸与真实处理尺寸不必一致：本模块刻意不开 ``cudnn.benchmark``（详见 torch_array 的说明），
+    所以换形状不会触发昂贵的算法搜索，预热只需把上下文、显存池与各类缓存建起来即可。
+
+    返回 ``"torch(cuda)/farneback"`` 或 ``"numpy/dis"``，供服务日志核对实际生效的链路。
+    """
+
+    backend = require_gpu_backend()  # 触发探测与单例创建。
     try:  # 用一批假数据跑通打分链路，触发显存池分配与内部缓存。
         rng = np.random.default_rng(0)  # 预热专用随机源，与业务 RNG 无关。
         evidence = rng.random((64, 64), dtype=np.float32)  # 小证据图。
@@ -128,7 +149,30 @@ def warmup_shape_backend() -> str:  # 预热当前后端：返回后端名，异
         score_shape_contours_core(backend.xp, evidence, states, template, 1.0, 64)  # 跑一次完整打分。
     except Exception:  # 预热失败不影响可用性判定，正式调用时会再走降级链路。
         pass
-    return backend.name  # 返回预热完成的后端名。
+    _warmup_temporal_chain(backend)  # 再跑一次证据链（内部同样异常静默）。
+    if backend.is_gpu:  # 显卡：torch 后端 + Farneback 光流。
+        return f"{backend.name}(cuda)/farneback"  # 描述串供服务日志直接打印。
+    return f"{backend.name}/dis"  # CPU：NumPy 打分 + cv2 DIS 光流。
+
+
+def _warmup_temporal_chain(backend: ShapeScoreBackend) -> None:  # 证据链预热：合成几帧跑满全部 lag，把光流核与帧缓冲的缓存建起来。
+    try:  # 延迟导入：避免 gpu_shape_backend → shape_session 的模块级循环引用，也避免无显卡环境白担 cv2/torch_flow 的导入成本。
+        from src.liedetector.shape_session import PRECISION_TIERS, PRECISION_TIER_DEFAULT  # 默认精度档的参数。
+        from src.liedetector.tensor_evidence import TensorTemporalAligner  # 双后端证据链。
+        from src.liedetector.torch_flow import Cv2DisFlow, TorchFarnebackFlow  # 两套光流引擎。
+
+        tier = PRECISION_TIERS[PRECISION_TIER_DEFAULT]  # 默认档（high）。
+        lags = tuple(tier["temporal_lags"])  # 该档的时间基线。
+        params = {name[len("flow_") :]: value for name, value in tier.items() if name.startswith("flow_")}  # 剔掉 flow_ 前缀即引擎构造参数。
+        engine = TorchFarnebackFlow(backend.xp, **params) if backend.is_gpu else Cv2DisFlow(tier["dis_preset"])  # 按后端选引擎。
+        aligner = TensorTemporalAligner(lags, 1.0, engine, backend)  # 预热专用对齐器，用完就丢。
+        rng = np.random.default_rng(0)  # 预热专用随机源。
+        frame = rng.integers(0, 255, size=(214, 320, 3), dtype=np.uint8)  # 实际处理尺度的合成帧。
+        for step in range(max(lags) + 1):  # 喂满最大 lag + 1 帧，最后一帧会一次算完全部 lag 的合批光流。
+            shifted = np.roll(frame, step, axis=1)  # 每帧水平平移 1 像素，造出真实位移供光流求解。
+            aligner.update(shifted)  # 跑完整证据链。
+    except Exception:  # 预热失败不影响可用性判定，正式求解时会重新装配并走降级链路。
+        pass
 
 
 class _WarmupTemplate:  # 预热专用的模板替身：只提供打分函数访问的字段，避免依赖完整 ShapeTemplate。
@@ -143,36 +187,25 @@ class _WarmupTemplate:  # 预热专用的模板替身：只提供打分函数访
         self.rectangle_side = 16.0  # 矩形边长（未用）。
 
 
-class ShapeScoreBackend:  # 打分后端：持有数组模块（numpy 或 cupy）与设备名。
+class ShapeScoreBackend:  # 打分后端：持有数组门面（numpy 门面或 torch 门面）与后端名。
 
     def __init__(self, xp, name: str):  # 构造后端。
-        self.xp = xp  # 数组模块：全部打分代码通过它执行。
-        self.name = name  # 后端名："numpy" 或 "cupy"，供日志与诊断。
+        self.xp = xp  # 数组门面：全部打分代码通过它执行。
+        self.name = name  # 后端名："numpy" 或 "torch"，供日志与诊断。
 
     @property
     def is_gpu(self) -> bool:  # 是否显卡后端。
-        return self.name == "cupy"  # 按名字判定。
+        return self.name != "numpy"  # 除 CPU 门面外都算显卡。
 
     def to_backend(self, array):  # 把 NumPy 数组搬到后端设备（CPU 后端近似零拷贝）。
-        return self.xp.asarray(array)  # cupy.asarray 会做 H2D 上传；numpy.asarray 同设备直接复用。
+        return self.xp.asarray(array)  # torch 门面会做 H2D 上传；numpy 门面同设备直接复用。
 
     def to_numpy(self, array) -> np.ndarray:  # 把后端数组搬回 NumPy（显卡后端做 D2H 下载）。
-        getter = getattr(array, "get", None)  # CuPy 数组有 .get()；NumPy 数组没有。
-        if callable(getter):  # 显卡数组。
-            return getter()  # 下载到主存。
-        return np.asarray(array)  # CPU 数组直接转换。
+        return self.xp.to_numpy(array)  # 门面内部区分 torch 张量与 numpy 数组。
 
 
 def _on(xp, array):  # 确保数组落在后端设备上：模板点集等常驻 CPU 的小数组在这里上传（每次仅几 KB）。
-    module = getattr(array, "__array_module__", None)  # CuPy 数组带 __array_module__ 标记；NumPy 数组没有。
-    if module is xp:  # 已在目标设备上。
-        return array  # 直接复用，避免无谓拷贝。
-    return xp.asarray(array)  # 上传/转换到后端设备（CPU 后端下 asarray 近似零拷贝）。
-
-
-def _import_cupy():  # 延迟导入 CuPy：只有确认要创建显卡后端时才触发，避免无谓的导入开销。
-    import cupy  # 导入 CuPy。
-    return cupy  # 返回数组模块。
+    return xp.asarray(array)  # 两份门面的 asarray 都先判定是否已在目标设备/同类型，不在才搬运。
 
 
 # ---------------------------------------------------------------------------
@@ -185,8 +218,8 @@ def sample_map_core(xp, image, x, y):  # 在单通道证据图上做最近邻批
     x = _on(xp, x)  # 采样坐标同样归位。
     y = _on(xp, y)  # 采样坐标同样归位。
     height, width = image.shape  # 证据图尺寸。
-    xi = xp.rint(x).astype(xp.int32)  # x 坐标整数化。
-    yi = xp.rint(y).astype(xp.int32)  # y 坐标整数化。
+    xi = xp.astype(xp.rint(x), xp.int32)  # x 坐标整数化。
+    yi = xp.astype(xp.rint(y), xp.int32)  # y 坐标整数化。
     valid = (xi >= 0) & (xi < width) & (yi >= 0) & (yi < height)  # 标记在图内的采样点。
     xi = xp.clip(xi, 0, width - 1)  # 钳制索引，防止花式索引越界报错。
     yi = xp.clip(yi, 0, height - 1)  # 钳制 y 索引。
@@ -201,10 +234,10 @@ def transform_template_points_core(xp, template, states, scales):  # 把模板�
     angles = xp.deg2rad(states[:, 4])[:, None, None]  # 各假设角度转弧度并扩维广播。
     cosine = xp.cos(angles)  # 余弦。
     sine = xp.sin(angles)  # 正弦。
-    if np.isscalar(scales):  # 标量尺度：所有假设共用同一尺度（np.isscalar 与后端无关，cupy 没有该函数）。
+    if np.isscalar(scales):  # 标量尺度：所有假设共用同一尺度（np.isscalar 只看 Python 侧类型，与后端数组库无关）。
         scale_values = xp.full((len(states), 1, 1), float(scales), dtype=xp.float32)  # 广播成 (count,1,1)。
     else:  # 数组尺度：每个假设一个尺度。
-        scale_values = _on(xp, scales).astype(xp.float32)[:, None, None]  # 上传并扩维成 (count,1,1)。
+        scale_values = xp.astype(_on(xp, scales), xp.float32)[:, None, None]  # 上传并扩维成 (count,1,1)。
     local_x = points_local[None, :, 0:1]  # 模板局部 x，形状 (1,N,1)。
     local_y = points_local[None, :, 1:2]  # 模板局部 y。
     point_x = states[:, 0, None, None] + scale_values * (  # 旋转缩放后平移到假设中心 x。
@@ -227,16 +260,18 @@ def score_rotated_borders_core(xp, evidence, states, side, play_height) -> Borde
     along = xp.linspace(-0.82 * half, 0.82 * half, samples_per_side, dtype=xp.float32)  # 边内采样位置，只取中间 82% 避免角点歧义。
 
     local_x = xp.stack(  # 四条边上采样点的局部 x 坐标（上、右、下、左）。
-        [along, xp.full_like(along, half), along[::-1], xp.full_like(along, -half)]  # 下边反向，保证四条边环绕方向一致。
+        [along, xp.full_like(along, half), xp.flip(along, axis=0), xp.full_like(along, -half)]  # 下边反向，保证四条边环绕方向一致。
     )
     local_y = xp.stack(  # 四条边上采样点的局部 y 坐标。
-        [xp.full_like(along, -half), along, xp.full_like(along, half), along[::-1]]  # 与 local_x 配对构成闭合正方形。
+        [xp.full_like(along, -half), along, xp.full_like(along, half), xp.flip(along, axis=0)]  # 与 local_x 配对构成闭合正方形。
     )
+    unit = xp.full_like(along, 1.0)  # 单位向量（门面不提供 ones_like，用 full_like 等价构造）。
+    zero = xp.zeros_like(along)  # 零向量。
     normal_x = xp.stack(  # 四条边的外法向 x 分量。
-        [xp.zeros_like(along), xp.ones_like(along), xp.zeros_like(along), -xp.ones_like(along)]  # 上/右/下/左。
+        [zero, unit, zero, -unit]  # 上/右/下/左。
     )
     normal_y = xp.stack(  # 四条边的外法向 y 分量。
-        [-xp.ones_like(along), xp.zeros_like(along), xp.ones_like(along), xp.zeros_like(along)]  # 与 normal_x 配对。
+        [-unit, zero, unit, zero]  # 与 normal_x 配对。
     )
 
     radians = xp.deg2rad(states[:, 4])[:, None, None]  # 每个假设的角度转弧度，扩维便于广播。
@@ -308,14 +343,14 @@ def score_rotated_borders_core(xp, evidence, states, side, play_height) -> Borde
     )
     valid_fraction = xp.mean(valid, axis=(1, 2))  # 每个假设的有效采样点比例。
     scores -= 8.0 * (1.0 - valid_fraction)  # 越界惩罚。
-    return BorderEvidence(scores.astype(xp.float32), coverage.astype(xp.float32))  # 返回打分与覆盖率（后端数组）。
+    return BorderEvidence(xp.astype(scores, xp.float32), xp.astype(coverage, xp.float32))  # 返回打分与覆盖率（后端数组）。
 
 
 def score_shape_contours_core(xp, evidence, states, template, scales, play_height) -> ShapeEvidence:  # 通用轮廓打分（后端版）。
     evidence = _on(xp, evidence)  # 证据图确保在后端设备上（整帧只上传一次，后续采样全在显存）。
     states = _on(xp, states)  # 状态矩阵确保在后端设备上。
     if template.use_rectangle_model and np.isscalar(scales):  # 矩形模型且标量尺度时走规则四边评分（更抗白色蒙版毛边）。
-        rectangle_states = states.copy()  # 复制状态，避免污染调用方的角度。
+        rectangle_states = xp.clone(states)  # 复制状态，避免污染调用方的角度。
         rectangle_states[:, 4] = (  # 角度叠加矩形偏置并折回 90 度对称域。
             rectangle_states[:, 4] + template.rectangle_angle
         ) % 90.0
@@ -350,8 +385,8 @@ def score_shape_contours_core(xp, evidence, states, template, scales, play_heigh
     )
     sampled = sample_map_core(xp, evidence, sample_x, sample_y)  # 一次性采样。
     grouped = sampled.reshape(9, *point_x.shape)  # 拆回 9 组，前 5 组边界、后 4 组上下文。
-    border = grouped[:5].max(axis=0)  # 边界 5 组取最大得边界响应。
-    context = grouped[5:].mean(axis=0)  # 上下文 4 组取均值得局部背景。
+    border = xp.max(grouped[:5], axis=0)  # 边界 5 组取最大得边界响应。
+    context = xp.mean(grouped[5:], axis=0)  # 上下文 4 组取均值得局部背景。
     contrast = border - context  # 边界相对背景的对比度。
     sector_count = 12  # 把轮廓分成 12 个扇区分别统计。
     sector_length = len(template.points) // sector_count  # 每个扇区的采样点数。
@@ -383,7 +418,7 @@ def score_shape_contours_core(xp, evidence, states, template, scales, play_heigh
     if np.isscalar(scales):  # 标量尺度。
         scale_values = xp.full((len(states), 1), float(scales), dtype=xp.float32)  # 广播成 (count,1)。
     else:  # 数组尺度。
-        scale_values = _on(xp, scales).astype(xp.float32)[:, None]  # 上传并扩维成 (count,1)。
+        scale_values = xp.astype(_on(xp, scales), xp.float32)[:, None]  # 上传并扩维成 (count,1)。
     interior_local = _on(xp, template.interior_points)  # 内部采样点上传后端。
     interior_x = states[:, 0, None] + scale_values * (  # 内部采样点变换后的 x。
         interior_local[None, :, 0] * cosine  # 局部 x 旋转分量。
@@ -405,4 +440,4 @@ def score_shape_contours_core(xp, evidence, states, template, scales, play_heigh
         & (point_y <= play_height - 7.0)  # 下边以有效高度为准留 7 像素。
     )
     scores -= 7.0 * (1.0 - xp.mean(valid, axis=1))  # 越界惩罚：有效比例越低扣分越多。
-    return ShapeEvidence(scores.astype(xp.float32), coverage.astype(xp.float32))  # 返回打分与覆盖率（后端数组）。
+    return ShapeEvidence(xp.astype(scores, xp.float32), xp.astype(coverage, xp.float32))  # 返回打分与覆盖率（后端数组）。

@@ -26,15 +26,18 @@ from src.dashboard_store import (DASHBOARD_DEFAULTS, SUPER_CHANNEL, SUPER_CHARAC
                                  coco_fingerprint, config_fingerprint, load_annotations_by_supercategory,
                                  load_dashboard_config, save_dashboard_config, validate_key_name)
 from src.ui.DashboardTaskPanel import TaskControlPanel  # 任务控制栏：挂机/巡逻脚本手风琴卡 + 内嵌运行日志。
-from src.liedetector.gpu_shape_backend import cupy_available  # 探测 CuPy+N 卡可用性：决定测谎精度下拉可选档位与运算后端显示。
+from src.liedetector.gpu_shape_backend import gpu_backend_available  # 探测 torch CUDA+N 卡可用性：决定测谎精度下拉可选档位与运算后端显示。
+from src.liedetector.shape_session import (PRECISION_TIER_DEFAULT, PRECISION_TIER_GPU_ONLY,  # 精度档名单/默认档/显卡专属档：与算法内核同源，
+                                           PRECISION_TIER_KEYS)  # 免得下拉可选项与 _resolve_scoring_backend 的 clamp 名单两边漂移。
 
 CAPTURE_FPS = 30  # 截图采集固定帧率：实时画面刷新与无任务时的截图取帧都按该节拍。
 CAPTURE_INTERVAL_MS = round(1000 / CAPTURE_FPS)  # 帧间隔毫秒数（33ms）。
 VISION_MAX_AGE = 5.0  # 带标注画面的最长可用秒数：任务循环偶尔超过 1 秒时继续沿用上一帧标注画面，而不是立即闪回原始截图，消除两种画面交替闪烁。
 PLACEHOLDER = '(未选择)'  # 下拉框空选项占位文本，保存时映射回空字符串。
 SAVE_DEBOUNCE_MS = 300  # 控件变动后防抖多少毫秒再落盘：合并连续调参/逐字输入为一次保存，避免每敲一键就写盘。
-LIE_PRECISION_TIERS = (("low", "低"), ("medium", "中等"), ("high", "高"), ("ultra", "极高"))  # 测谎精度档 (key, 中文 label)，顺序由低到高；GPU 四档齐全，CPU 仅低/中等。
-LIE_PRECISION_GPU_ONLY = ("high", "ultra")  # 仅 GPU 可选的高精度档：无 N 卡时从下拉移除并回落中等。
+LIE_TIER_LABELS = {"low": "低", "medium": "中等", "high": "高", "ultra": "极高", "extreme": "最强"}  # 精度档 key -> 中文标签（唯一数据源，测谎检验页签也复用它）。
+LIE_PRECISION_TIERS = tuple((key, LIE_TIER_LABELS[key]) for key in PRECISION_TIER_KEYS)  # 测谎精度档下拉项 (key, 中文 label)，由低到高的顺序直接取算法层的档位顺序。
+LIE_PRECISION_GPU_ONLY = PRECISION_TIER_GPU_ONLY  # 仅 GPU 可选的重载档（高/极高/最强）：无 N 卡时从下拉移除并回落中等。
 
 
 def to_pixmap(frame):  # 把 OpenCV 的 BGR 画面矩阵转换成 Qt 图片，传入的画面应已缩放到目标显示尺寸。
@@ -204,7 +207,7 @@ class DashboardTab(CustomTab):  # 定义看板页签：视图区 + 测谎栏 + �
         self.lie_abort_edit.setPlaceholderText("留空不启用，如 f8")  # 占位提示：示例按键名，留空表示不装全局键盘监听。
         self.lie_alarm_edit = LineEdit()  # 报警音频路径输入框。
         self.lie_alarm_edit.setPlaceholderText("alarm.mp3")  # 占位提示。
-        self.lie_precision_combo = ComboBox()  # 解测谎精度档下拉（低/中等/高/极高，固定四档不可编辑）。
+        self.lie_precision_combo = ComboBox()  # 解测谎精度档下拉（低/中等/高/极高/最强，固定五档不可编辑）。
         for _tier_key, _tier_label in LIE_PRECISION_TIERS:  # 逐项填充：显示中文 label，userData 存英文 key。
             self.lie_precision_combo.addItem(_tier_label, None, _tier_key)
         self.lie_backend_label = BodyLabel("运算后端: --")  # 只读显示当前测谎打分后端（GPU/CPU），load_config 时按显卡可用性刷新。
@@ -348,7 +351,7 @@ class DashboardTab(CustomTab):  # 定义看板页签：视图区 + 测谎栏 + �
             self._set_combo_value(self.lie_trigger_combo, str(data.get('Lie Detector Trigger Feature') or ''))
             self.lie_threshold_spin.setValue(float(data.get('Lie Detector Threshold') or 0.75))
             self._refresh_precision_availability()  # 按显卡可用性刷新精度可选档与运算后端显示。
-            self._set_precision_value(str(data.get('Lie Detector Precision') or 'high'))  # 选中配置精度档（CPU 下高/极高不可用时回落中等）。
+            self._set_precision_value(str(data.get('Lie Detector Precision') or PRECISION_TIER_DEFAULT))  # 选中配置精度档（CPU 下重载档不可用时回落中等）。
             self.lie_delay_spin.setValue(float(data.get('Lie Detector Trigger Delay', DASHBOARD_DEFAULTS['Lie Detector Trigger Delay'])))
             self.lie_abort_edit.setText(str(data.get('Lie Detector Abort Key') or ''))
             self.lie_alarm_edit.setText(str(data.get('Lie Alarm Sound') or ''))
@@ -384,12 +387,12 @@ class DashboardTab(CustomTab):  # 定义看板页签：视图区 + 测谎栏 + �
         text = combo.currentText().strip()  # 取当前文本。
         return '' if text == PLACEHOLDER else text  # 占位项按空处理。
 
-    def _refresh_precision_availability(self):  # 按显卡可用性刷新精度下拉可选档与运算后端显示：GPU 四档齐全，CPU 移除高/极高并回落中等。
+    def _refresh_precision_availability(self):  # 按显卡可用性刷新精度下拉可选档与运算后端显示：GPU 五档齐全，CPU 移除高/极高/最强并回落中等。
         try:  # 探测异常（驱动问题等）按无显卡处理，不能拖垮看板加载。
-            gpu = bool(cupy_available())
+            gpu = bool(gpu_backend_available())
         except Exception:  # 探测本身报错。
             gpu = False
-        self.lie_backend_label.setText("运算后端: GPU" if gpu else "运算后端: CPU")  # 后端显示项，最佳努力（运行期真实降级以 service 端 clamp 为准）。
+        self.lie_backend_label.setText("运算后端: GPU (torch CUDA)" if gpu else "运算后端: CPU (numpy)")  # 后端显示项，最佳努力（运行期真实降级以 service 端 clamp 为准）。
         current = self.lie_precision_combo.currentData()  # 记录当前选中档 key，重建后尽量保持。
         tiers = LIE_PRECISION_TIERS if gpu else tuple(t for t in LIE_PRECISION_TIERS if t[0] not in LIE_PRECISION_GPU_ONLY)  # CPU 只保留低/中等。
         self.lie_precision_combo.blockSignals(True)  # 重建期间不触发信号。
@@ -397,9 +400,9 @@ class DashboardTab(CustomTab):  # 定义看板页签：视图区 + 测谎栏 + �
         for key, label in tiers:  # 按可用档重新填充。
             self.lie_precision_combo.addItem(label, None, key)
         self.lie_precision_combo.blockSignals(False)  # 恢复信号。
-        self._set_precision_value(current or 'high')  # 还原原选中档；被移除（CPU 下高/极高）时回落中等。
+        self._set_precision_value(current or PRECISION_TIER_DEFAULT)  # 还原原选中档；被移除（CPU 下的重载档）时回落中等。
 
-    def _set_precision_value(self, key):  # 按 key 选中精度档；key 不在可选档（如 CPU 下的高/极高）时回落中等，再不行落首项。
+    def _set_precision_value(self, key):  # 按 key 选中精度档；key 不在可选档（如 CPU 下的高/极高/最强）时回落中等，再不行落首项。
         index = self.lie_precision_combo.findData(key)  # 按 userData 定位目标档。
         if index < 0:  # 目标档不可用。
             index = self.lie_precision_combo.findData('medium')  # 回落中等。
@@ -443,7 +446,7 @@ class DashboardTab(CustomTab):  # 定义看板页签：视图区 + 测谎栏 + �
             'Lie Detector Region Feature': self._combo_value(self.lie_region_combo),
             'Lie Detector Trigger Feature': self._combo_value(self.lie_trigger_combo),
             'Lie Detector Threshold': round(float(self.lie_threshold_spin.value()), 2),
-            'Lie Detector Precision': self.lie_precision_combo.currentData() or 'high',
+            'Lie Detector Precision': self.lie_precision_combo.currentData() or PRECISION_TIER_DEFAULT,
             'Lie Detector Trigger Delay': round(float(self.lie_delay_spin.value()), 1),
             'Lie Detector Abort Key': self.lie_abort_edit.text().strip(),
             'Lie Alarm Sound': self.lie_alarm_edit.text().strip(),

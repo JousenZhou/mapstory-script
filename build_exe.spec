@@ -40,7 +40,9 @@ for _entry in _app_cfg.config.get('trigger_tasks', []):  # 后台触发任务 (�
     _hidden.append(_entry[0])
 hiddenimports = _hidden + collect_submodules('ok') + collect_submodules('openvino')
 
-# cupy/ultralytics 为可选加速依赖 (体积大), 运行时自动降级, 不打入包内。
+# cupy/ultralytics/torch 为可选加速依赖 (体积大), 运行时自动降级, 不打入包内。
+# torch 被排除后, 解测谎的稠密光流与粒子滤波自动走 CPU 路径 (cv2 DIS + numpy 打分),
+# 行为与引入 torch CUDA 管线之前一致; venv 里跑的服务才走显卡。
 excludes = [
     'cupy',
     'cupyx',

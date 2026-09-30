@@ -1,5 +1,5 @@
 # 测谎检验页签：用户上传谎言检测器录像，按视频原帧率实时播放（处理跟不上时丢帧保实时，贴近真实采集场景），
-# 用 DIS 稠密光流对齐历史帧 + 粒子滤波跟踪透明轮廓（无神经网络），
+# 用稠密光流对齐历史帧 + 粒子滤波跟踪透明轮廓（有 N 卡走 torch CUDA，否则走 CPU；无神经网络），
 # 画面叠加轮廓、状态与实测/源帧率，视频模式不发送鼠标，仅验证算法效果。
 import math
 import os
@@ -16,15 +16,18 @@ from qfluentwidgets import BodyLabel, ComboBox, FlowLayout, FluentIcon, PushButt
 
 from ok import og  # 导入全局对象：改精度/延迟后通知独立测谎服务热更新配置。
 from ok.gui.widget.CustomTab import CustomTab  # 导入自定义页签基类。
-from src.ui.DashboardTab import LIE_PRECISION_GPU_ONLY, LIE_PRECISION_TIERS, VisionLabel  # 复用看板页签的画面标签与精度档定义（单一数据源，避免两处不一致）。
+from src.ui.DashboardTab import (LIE_PRECISION_GPU_ONLY, LIE_PRECISION_TIERS, LIE_TIER_LABELS,  # 复用看板页签的画面标签与精度档定义（单一数据源，避免两处不一致）。
+                                 VisionLabel)
 from src.ui.spin_wheel_guard import DoubleSpinBox  # 触发延迟数字框用滚轮守卫子类：需点击聚焦后滚轮才生效，避免滚动页面误改数值。
 from src.dashboard_store import load_dashboard_config, save_dashboard_config  # 读写看板配置：验证页签与线上服务同档复算，改精度/延迟合并写回 Dashboard.json。
-from src.liedetector.gpu_shape_backend import cupy_available  # 探测 CuPy+N 卡可用性：决定验证页签精度下拉可选档位与运算后端显示。
+from src.liedetector.gpu_shape_backend import gpu_backend_available  # 探测 torch CUDA+N 卡可用性：决定验证页签精度下拉可选档位与运算后端显示。
 
 TICK_FPS_FALLBACK = 30  # 源帧率缺失时的回退帧率，与参考项目 FPS=30 一致。
 TIMEOUT_TICKS = 545  # 算法超时预算下限 545 tick@30fps（约 18 秒），与参考项目 solve_shape.rs 一致；实际 timeout_ticks 取此预算与视频总帧数的较大者（回放整段录像）。
 LOCATE_MAX_SIDE = 400  # 全屏弹窗定位的分辨率上限（最长边像素）：超过则先缩帧再匹配，坐标换算回原图。
-LIE_TIER_LABELS = {"low": "低", "medium": "中等", "high": "高", "ultra": "极高"}  # 精度档 key -> 中文，历史下拉摘要用。
+ENGINE_TAGS = {"torch-farneback": "torch CUDA", "cv2-dis": "CPU DIS", "cv2-farneback": "CPU Farneback"}  # 光流引擎名 -> 徽标短文案（未知引擎直接显原名）。
+LIE_OUTCOME_LABELS = {"success": "成功", "failure": "失败", "solved": "已解", "gone": "触发消失",  # 录像边车 outcome -> 中文结果（历史下拉摘要末尾展示，成功/失败来自解测谎结算）。
+                      "timeout": "超时", "abandoned": "放弃", "aborted": "急停"}
 
 try:  # 探测 OpenCV 是否包含 DIS 稠密光流，缺失时页签降级为不可运行。
     INFERENCE_AVAILABLE = hasattr(cv2, 'DISOpticalFlow_create')
@@ -34,9 +37,9 @@ except Exception:
 from src.liedetector.detector import (  # 仅保留多尺度模板定位能力（弹窗标题定位），不再需要 YOLO 检测器。
     TEMPLATE_THRESHOLD, LieDetectorRegion, MultiScaleTemplate, _template_best_score)
 from src.liedetector.shape_session import (  # 在线编排。
-    ShapeTrackParams, ShapeTrackSession, PRECISION_TIER_KEYS,
+    ShapeTrackParams, ShapeTrackSession, PRECISION_TIER_DEFAULT, PRECISION_TIER_KEYS,
     SOURCE_BORDER, SOURCE_COLOR, SOURCE_INTERPOLATED, SOURCE_PREDICTION, SOURCE_SCENE_ENDED)
-from src.liedetector.recorder import LIE_RECORD_DIR, list_records  # 测谎录像历史：列举 lie_records 边车记录供下拉复算。
+from src.liedetector.recorder import LIE_RECORD_DIR, delete_record, list_records  # 测谎录像历史：列举 lie_records 边车记录供下拉复算，并支持删除选中记录。
 
 
 class _EmitLogger:  # 把检测器内部日志转发成 Qt 信号的适配器。
@@ -97,7 +100,7 @@ def draw_shape_overlay(frame, region, result, tick, status, timeout_ticks, fps_t
 class LieDetectorWorker(QThread):  # 工作线程：在线分析 + 实时预览，按视频原帧率播放（处理超时丢帧保实时）。
 
     log_message = Signal(str)  # 日志消息信号。
-    algorithm_ready = Signal(str)  # 算法准备就绪信号（参数摘要）。
+    algorithm_ready = Signal(str, str)  # 算法准备就绪信号：(徽标文案, 日志参数摘要)。
     finished_result = Signal(bool, str)  # 结束信号：(是否通过, 结果描述)。
 
     def __init__(self, video_path, tier="high", parent=None, delay=0.0):
@@ -184,10 +187,10 @@ class LieDetectorWorker(QThread):  # 工作线程：在线分析 + 实时预览�
             return
 
         # ---- 在线分析初始化 ----
-        tier = str(self.tier or 'high').strip()  # 用页签精度下拉传入的档位复算，与线上服务同档验证。
+        tier = str(self.tier or PRECISION_TIER_DEFAULT).strip()  # 用页签精度下拉传入的档位复算，与线上服务同档验证。
         if tier not in PRECISION_TIER_KEYS:  # 非法档位（防御性校验）。
-            tier = 'high'
-        params = ShapeTrackParams(precision_tier=tier)  # 按精度档装配，与线上解测谎同档复算（无 N 卡时 high/ultra 会在会话构造时回落 medium）。
+            tier = PRECISION_TIER_DEFAULT
+        params = ShapeTrackParams(precision_tier=tier)  # 按精度档装配，与线上解测谎同档复算（无 N 卡时高/极高/最强会在会话构造时回落 medium）。
         logger_adapter = _EmitLogger(self.log_message.emit)  # 日志适配器。
         session = None  # 先置空：收尾日志兼容会话构造失败的情形。
         session = ShapeTrackSession(params=params, logger=logger_adapter)  # 在线编排状态机。
@@ -215,8 +218,10 @@ class LieDetectorWorker(QThread):  # 工作线程：在线分析 + 实时预览�
         delay_deadline = 0.0  # 触发延迟结束的绝对时间点。
 
         self.log_message.emit(  # 打印实际生效的参数，便于与外部脚本回归对照。
-            f"algorithm params: tier={params.precision_tier} scale={params.process_scale} lags={params.temporal_lags} "
-            f"particles={params.particle_count} proposals={params.global_proposals}")
+            f"algorithm params: tier={params.precision_tier} backend={session.backend.name} "
+            f"engine={session.aligner.engine_name} scale={params.process_scale} lags={params.temporal_lags} "
+            f"particles={params.particle_count} proposals={params.global_proposals} "
+            f"flow(levels={params.flow_levels},iterations={params.flow_iterations},winsize={params.flow_winsize})")
 
         try:  # ---- 在线分析 + 实时预览（按源帧率播放，处理超时丢帧保实时） ----
             while not self._stopped.is_set() and tick < timeout_ticks:
@@ -343,8 +348,12 @@ class LieDetectorWorker(QThread):  # 工作线程：在线分析 + 实时预览�
                     track_ms = (time.perf_counter() - t_track) * 1000  # 粒子跟踪耗时。
                     if not algo_emitted:  # 首次发出算法就绪信号。
                         algo_emitted = True
+                        engine = session.aligner.engine_name  # 会话实际生效的光流引擎（运行期降级后也会跟着变）。
+                        tag = ENGINE_TAGS.get(engine, engine)  # 引擎名映射成短文案。
                         self.algorithm_ready.emit(
-                            f"DIS光流+粒子滤波 P={params.particle_count} S={params.process_scale}")
+                            f"光流+粒子滤波 ({tag})",
+                            f"{tag}光流+粒子滤波 P={params.particle_count} S={params.process_scale} "
+                            f"engine={engine} flow(levels={params.flow_levels},iterations={params.flow_iterations},winsize={params.flow_winsize})")
                     if result.source in (SOURCE_COLOR, SOURCE_BORDER, SOURCE_INTERPOLATED):  # 有效跟踪。
                         last_target_tick = tick
                     if tick % 30 == 1:  # 诊断：每秒报告一次流水线状态与分段耗时。
@@ -395,6 +404,8 @@ class LieDetectorTab(CustomTab):  # 测谎检验页签：上传录像验证谎�
         self.history_combo.activated.connect(self._on_history_selected)  # activated 仅用户点选时触发，程序重建不误触发。
         self.refresh_history_button = PushButton(FluentIcon.SYNC, "刷新")  # 手动刷新历史下拉。
         self.refresh_history_button.clicked.connect(self._reload_history)
+        self.delete_history_button = PushButton(FluentIcon.DELETE, "删除")  # 删除当前选中的历史录像（mp4+json），弹确认框防误删。
+        self.delete_history_button.clicked.connect(self._delete_selected_history)
         self.precision_label = BodyLabel("精度")  # 精度下拉标签。
         self.precision_combo = ComboBox()  # 复算精度档下拉（低/中等/高/极高，GPU 门控），与看板 Dashboard.json 同键，改动即合并写回并通知服务。
         self.precision_combo.setMinimumWidth(90)  # 保证档位中文可见。
@@ -418,7 +429,7 @@ class LieDetectorTab(CustomTab):  # 测谎检验页签：上传录像验证谎�
         self.algorithm_label = BodyLabel("算法: --")
         # 成对的「标签+控件」与「开始/停止」各自包进小容器，作为整体参与流式换行，避免标签与其控件被拆到两行。
         layout.addWidget(self.pick_button)
-        layout.addWidget(self._flow_group(self.history_combo, self.refresh_history_button))
+        layout.addWidget(self._flow_group(self.history_combo, self.refresh_history_button, self.delete_history_button))
         layout.addWidget(self._flow_group(self.precision_label, self.precision_combo))
         layout.addWidget(self.backend_label)
         layout.addWidget(self._flow_group(self.delay_label, self.delay_spin))
@@ -483,8 +494,9 @@ class LieDetectorTab(CustomTab):  # 测谎检验页签：上传录像验证谎�
         except (TypeError, ValueError):  # 分数缺失或非法。
             score_txt = "--"
         tier = LIE_TIER_LABELS.get(str(rec.get("tier") or ""), str(rec.get("tier") or "--"))  # 精度档中文。
-        outcome = str(rec.get("outcome") or "--")  # 结束原因（solved/timeout/gone/abandoned）。
-        return f"{short} 分{score_txt} {tier} {outcome}"  # 拼接摘要。
+        outcome = str(rec.get("outcome") or "")  # 结束原因/结果（success/failure/solved/timeout/gone/abandoned/aborted）。
+        result_txt = LIE_OUTCOME_LABELS.get(outcome, outcome or "--")  # 映射为中文结果，未知值原样显，空值显 --。
+        return f"{short} 分{score_txt} {tier} {result_txt}"  # 拼接摘要：结果固定放在每条记录的最后。
 
     def _on_history_selected(self, index):  # 用户从历史下拉选中一条录像：设为当前视频，供「开始」复算验证。
         path = self.history_combo.itemData(index)  # 取该项的 mp4 路径。
@@ -494,12 +506,30 @@ class LieDetectorTab(CustomTab):  # 测谎检验页签：上传录像验证谎�
         self.path_label.setText(os.path.basename(path))  # 显示文件名。
         self.append_log(f"history selected 已选择历史录像: {path}")  # 记日志。
 
-    def _refresh_precision_options(self):  # 按显卡可用性刷新精度下拉可选档与运算后端显示：GPU 四档齐全，CPU 移除高/极高并回落中等。
+    def _delete_selected_history(self):  # 删除历史下拉当前选中的录像（mp4+json）：弹确认框防误删，确认后删除并刷新下拉。
+        path = self.history_combo.itemData(self.history_combo.currentIndex())  # 取当前选中项的 mp4 路径。
+        if not path:  # 占位首项或无路径：无可删。
+            self.append_log("no record selected 未选择要删除的历史记录")  # 记日志提示。
+            return
+        from qfluentwidgets import Dialog  # 延迟导入确认对话框（与 DashboardTaskPanel 一致）。
+        dialog = Dialog("删除记录", f"确定删除该测谎录像记录？\n{os.path.basename(path)}", self.window())  # 构造确认框。
+        dialog.yesButton.setText("删除")  # 确认按钮文案。
+        dialog.cancelButton.setText("取消")  # 取消按钮文案。
+        if not dialog.exec():  # 用户取消：不删。
+            return
+        removed = delete_record(path)  # 成对删除 mp4+json，返回是否删掉 mp4。
+        if self.video_path == path:  # 删的是当前待验证视频：清空选择并复位路径标签。
+            self.video_path = ""
+            self.path_label.setText("未选择视频")
+        self._reload_history()  # 重建历史下拉（删后该项消失）。
+        self.append_log((f"deleted 已删除历史录像: {path}" if removed else f"delete failed 删除失败: {path}"))  # 记结果日志。
+
+    def _refresh_precision_options(self):  # 按显卡可用性刷新精度下拉可选档与运算后端显示：GPU 五档齐全，CPU 移除高/极高/最强并回落中等。
         try:  # 探测异常（驱动问题等）按无显卡处理，不能拖垮验证页签加载。
-            gpu = bool(cupy_available())
+            gpu = bool(gpu_backend_available())
         except Exception:  # 探测本身报错。
             gpu = False
-        self.backend_label.setText("运算后端: GPU" if gpu else "运算后端: CPU")  # 后端显示项，最佳努力（运行期真实降级以会话构造 clamp 为准）。
+        self.backend_label.setText("运算后端: GPU (torch CUDA)" if gpu else "运算后端: CPU (numpy)")  # 后端显示项，最佳努力（运行期真实降级以会话构造 clamp 为准）。
         current = self.precision_combo.currentData()  # 记录当前选中档 key，重建后尽量保持。
         tiers = LIE_PRECISION_TIERS if gpu else tuple(t for t in LIE_PRECISION_TIERS if t[0] not in LIE_PRECISION_GPU_ONLY)  # CPU 只保留低/中等。
         self.precision_combo.blockSignals(True)  # 重建期间不触发信号（也避免误触发持久化）。
@@ -507,9 +537,9 @@ class LieDetectorTab(CustomTab):  # 测谎检验页签：上传录像验证谎�
         for key, label in tiers:  # 按可用档重新填充。
             self.precision_combo.addItem(label, None, key)
         self.precision_combo.blockSignals(False)  # 恢复信号。
-        self._set_precision_value(current or 'high')  # 还原原选中档；被移除（CPU 下高/极高）时回落中等。
+        self._set_precision_value(current or PRECISION_TIER_DEFAULT)  # 还原原选中档；被移除（CPU 下的重载档）时回落中等。
 
-    def _set_precision_value(self, key):  # 按 key 选中精度档；key 不在可选档（如 CPU 下的高/极高）时回落中等，再不行落首项。
+    def _set_precision_value(self, key):  # 按 key 选中精度档；key 不在可选档（如 CPU 下的高/极高/最强）时回落中等，再不行落首项。
         index = self.precision_combo.findData(key)  # 按 userData 定位目标档。
         if index < 0:  # 目标档不可用。
             index = self.precision_combo.findData('medium')  # 回落中等。
@@ -522,7 +552,7 @@ class LieDetectorTab(CustomTab):  # 测谎检验页签：上传录像验证谎�
         try:  # 配置读取异常不能拖垮页签构造/显示。
             data = load_dashboard_config()  # 读看板配置（缺失键由其内部补默认）。
             self._refresh_precision_options()  # 先按显卡可用性重建可选档。
-            self._set_precision_value(str(data.get('Lie Detector Precision') or 'high'))  # 选中配置精度档（CPU 下高/极高自动回落中等）。
+            self._set_precision_value(str(data.get('Lie Detector Precision') or PRECISION_TIER_DEFAULT))  # 选中配置精度档（CPU 下重载档自动回落中等）。
             self.delay_spin.setValue(float(data.get('Lie Detector Trigger Delay', 5.0)))  # 回填触发延迟秒数。
         except Exception:  # 读取/回填异常：保持控件默认值。
             pass
@@ -534,7 +564,7 @@ class LieDetectorTab(CustomTab):  # 测谎检验页签：上传录像验证谎�
             return
         try:  # 合并写：先读全量配置，只改精度与延迟两键，避免覆盖看板其它字段。
             data = load_dashboard_config()  # 读当前全量配置。
-            data['Lie Detector Precision'] = self.precision_combo.currentData() or 'high'  # 精度档。
+            data['Lie Detector Precision'] = self.precision_combo.currentData() or PRECISION_TIER_DEFAULT  # 精度档。
             data['Lie Detector Trigger Delay'] = round(float(self.delay_spin.value()), 1)  # 触发延迟（一位小数，与看板一致）。
             save_dashboard_config(data)  # 全量落盘（save 内部原子写）。
             lie_service = getattr(og.my_app, 'lie_service', None) if og.my_app is not None else None  # 取独立测谎监控服务（由 Globals 持有）。
@@ -600,8 +630,8 @@ class LieDetectorTab(CustomTab):  # 测谎检验页签：上传录像验证谎�
             self.append_log("stopping... 正在停止")
             self.worker.stop()
 
-    def on_algorithm_ready(self, summary):  # 算法就绪后更新徽标与日志。
-        self.algorithm_label.setText(f"算法: DIS光流+粒子滤波")
+    def on_algorithm_ready(self, label, summary):  # 算法就绪后更新徽标与日志：徽标按会话实际引擎显示。
+        self.algorithm_label.setText(f"算法: {label}")
         self.append_log(f"algorithm ready 算法就绪: {summary}")
 
     def on_finished(self, ok, message):  # 工作线程结束：恢复按钮并输出结论。

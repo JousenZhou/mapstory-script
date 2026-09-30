@@ -1,4 +1,4 @@
-"""测谎检验「找目标」算法内核：无神经网络的轮廓学习 + DIS 光流 + 粒子滤波。
+"""测谎检验「找目标」算法内核：无神经网络的轮廓学习 + 稠密光流 + 粒子滤波。
 
 本模块从外部验证脚本 track_transparent_shape.py / track_transparent_square_v2.py
 移植而来，只做纯算法计算，不含任何视频读写、CSV 输出、GUI 绘制与命令行参数。
@@ -6,8 +6,8 @@
 整体分三段：
 1. 学习段：首帧从白色区域提取轮廓，重采样成 120 点模板（含法向、内部采样点、
    旋转对称周期、矩形度），满足四重对称 + 高矩形度时自动切换规则矩形边框评分模型。
-2. 证据段：用 DIS 稠密光流把多个 lag 的历史帧对齐到当前帧，取绝对差得到「时序残差
-   证据图」，目标透明化后仍会在残差图边界留下痕迹。
+2. 证据段：用稠密光流（显卡走 torch Farneback，CPU 走 cv2 DIS）把多个 lag 的历史帧
+   对齐到当前帧，取绝对差得到「时序残差证据图」，目标透明化后仍会在残差图边界留下痕迹。
 3. 跟踪段：粒子群在 6 维状态空间 (x, y, vx, vy, angle, 角速度) 上联合轮廓边界与
    内部残差打分，输出位置/角度/小范围缩放。
 
@@ -19,13 +19,12 @@ np.random.default_rng(seed) 保证。
 from __future__ import annotations
 
 import math  # 数学函数：三角、开方、弧度角度互转。
-from collections import deque  # 定长队列，保存光流对齐所需的历史帧。
 from dataclasses import dataclass  # 数据类装饰器，承载算法中间结果。
 
 import cv2  # OpenCV：HSV 转换、形态学、轮廓、光流、重映射。
 import numpy as np  # 数值计算：向量化旋转、打分、粒子群运算。
 
-from src.liedetector.gpu_shape_backend import (  # 打分内核双后端：同一份算法代码，有 N 卡走 CuPy，没有则 NumPy。
+from src.liedetector.gpu_shape_backend import (  # 打分内核双后端：同一份算法代码，有 N 卡走 torch CUDA，没有则 NumPy。
     BorderEvidence,  # 矩形四边打分结果（定义迁至后端模块，此处 re-export 保持旧导入路径可用）。
     ShapeEvidence,  # 轮廓打分结果（同上）。
     ShapeScoreBackend,  # 打分后端类型。
@@ -38,36 +37,45 @@ from src.liedetector.gpu_shape_backend import (  # 打分内核双后端：同�
     score_shape_contours_core,  # 通用轮廓打分内核（后端版）。
     transform_template_points_core,  # 模板点变换内核（后端版）。
 )
+from src.liedetector.tensor_evidence import (  # 时序证据链：唯一一份实现，CPU 与 CUDA 共用。
+    TemporalEvidence,  # 多 lag 光流对齐后的时序残差证据（定义迁至证据链模块，此处 re-export）。
+    TensorTemporalAligner,  # 双后端对齐器本体，DenseTemporalAligner 只做装配。
+)
+from src.liedetector.torch_flow import Cv2DisFlow, TorchFarnebackFlow  # 光流引擎：显卡 Farneback / CPU DIS。
 
 
-def _resolve_backend(backend):  # 解析本次打分使用的后端：显式传入优先，否则取全局生效后端（CuPy 或 NumPy）。
+def _resolve_backend(backend):  # 解析本次打分使用的后端：显式传入优先，否则取全局生效后端（torch CUDA 或 NumPy）。
     if backend is not None:  # 调用方显式指定了后端（会话装配时注入）。
         return backend  # 直接使用。
     return require_gpu_backend()  # 未指定：请求显卡后端，不可用/已降级时返回 NumPy 后端。
 
 
-def _to_numpy_array(item):  # 把后端数组统一转回 NumPy（CuPy 数组用 .get() 下载，NumPy 数组直接复用）。
+def _to_numpy_array(item):  # 把后端数组统一转回 NumPy（torch 张量 detach 后 D2H，NumPy 数组直接复用）。
     if isinstance(item, np.ndarray):  # 已是 NumPy 数组。
         return item  # 直接返回。
-    getter = getattr(item, "get", None)  # CuPy 数组的 D2H 下载方法。
-    if callable(getter):  # 显卡数组。
-        return getter()  # 下载到主存。
+    detach = getattr(item, "detach", None)  # torch 张量的去求导方法。
+    if callable(detach):  # 显卡张量。
+        return detach().cpu().numpy()  # 下载到主存并转 numpy。
     return np.asarray(item)  # 其余情况兼容处理。
 
 
-def _run_scoring(core, kind, backend, *args):  # 统一的打分调度：显卡后端异常时自动改走 NumPy 重算本帧，返回 NumPy 版结果数据类。
+def _pack_scoring(result, to_numpy):  # 把内核返回的打分结果重新打包；to_numpy 为真时下载成 NumPy 版数据类。
+    if not to_numpy:  # 调用方自己持有后端（粒子滤波），结果原样留在设备上，省掉一次 D2H。
+        return result  # 直接返回。
+    return type(result)(_to_numpy_array(result.scores), _to_numpy_array(result.coverage))  # 下载并按原数据类重新打包。
+
+
+def _run_scoring(core, backend, *args, to_numpy=True):  # 统一的打分调度：显卡后端异常时自动改走 NumPy 重算本帧。
     chosen = _resolve_backend(backend)  # 本次生效的后端。
     if chosen.is_gpu and chosen is require_gpu_backend():  # 全局显卡后端：运行期异常（显存不足/驱动重置等）不能中断求解。
         try:  # 显卡执行段。
             result = core(chosen.xp, *args)  # 在显卡上执行打分内核。
-            packed = kind(_to_numpy_array(result.scores), _to_numpy_array(result.coverage))  # 下载并重新打包成 NumPy 版结果。
             clear_gpu_failure()  # 打分成功，清零连续失败计数。
-            return packed  # 返回结果。
+            return _pack_scoring(result, to_numpy)  # 按需下载后返回。
         except Exception:  # 显卡运行期异常。
             mark_gpu_failure()  # 计数，连续 3 次后本进程永久回退 NumPy。
-            chosen = numpy_backend()  # 本帧改走 CPU 重算，调用方拿到的结果与显卡正常时等价。
-    result = core(chosen.xp, *args)  # NumPy 后端（或显卡降级后）直接计算。
-    return kind(_to_numpy_array(result.scores), _to_numpy_array(result.coverage))  # 打包成 NumPy 版结果返回。
+            chosen = numpy_backend()  # 本帧改走 CPU 重算，调用方拿到的结果与显卡正常时等价（门面的 asarray 会把显存数组降级下载）。
+    return _pack_scoring(core(chosen.xp, *args), to_numpy)  # NumPy 后端（或显卡降级后）直接计算。
 
 
 @dataclass
@@ -100,12 +108,18 @@ class ShapeTemplate:
     use_rectangle_model: bool  # 是否启用规则矩形边框评分模型。
 
 
-@dataclass
-class TemporalEvidence:
-    """多 lag 光流对齐后的时序残差证据。"""
-
-    normalized: np.ndarray  # 鲁棒归一化后的残差图（单通道 float32），边界处响应强。
-    raw_mean: float  # 各 lag 归一化前残差均值的最小值，用于判断场景切换/静止。
+# 倒计时数字的冷色光环（蓝灰边框阴影）判别阈值与排除区参数，取自生产录像实测（lie_records/20260930_*）：
+# 倒计时数字被一圈 H∈[40,130]、S∈[15,140]、V≥90 的冷色光环包围（处理尺度下连通域 700~1600px），
+# 而目标图形周围环带该特征占比≈0；无倒计时帧的全图冷色连通域均 <60px，故 HALO_MIN_AREA=200 留 3 倍余量。
+HALO_HUE_MIN = 40  # 冷色光环色相下限（OpenCV 色相 0~179，40~130 覆盖绿-青-蓝）。
+HALO_HUE_MAX = 130  # 冷色光环色相上限。
+HALO_SAT_MIN = 15  # 冷色光环饱和度下限：排除低饱和的白色数字本体与纯灰高光。
+HALO_SAT_MAX = 140  # 冷色光环饱和度上限：阴影是淡蓝灰，不是高饱和纯蓝。
+HALO_VALUE_MIN = 90  # 冷色光环明度下限：排除暗色描边。
+HALO_DILATE_SIZE = 5  # 防线一膨胀核边长：从光环向白像素吃入 2px，吃掉数字本体外缘并切断数字↔图形粘连桥。
+HALO_MIN_AREA = 200.0  # 光环连通域成排除区的最小面积（处理尺度像素）：背景冷色噪声连通域实测 <60px。
+HALO_MIN_FILL = 0.2  # 光环连通域入选防线的最小填充率（面积/bbox 面积）：倒计时环实测 ≈0.52、数字过渡碎片 0.32~0.36、合成帧环 ≈0.27，而旧录像背景散点噪声会连成整帧级连通域（bbox≈384x254、面积 ≈950、填充率 ≈0.01）；入选门槛同时约束防线一与防线二——散点噪声若参与防线一膨胀，会随机蚀穿全图白色掩码（实测星形面积 813→354、质心偏 9px），参与防线二则排除区覆盖全帧误杀所有候选。
+HALO_ZONE_PAD = 4  # 排除区 bbox 外扩边距（像素）：罩住防线一吃剩的数字核心残片。
 
 
 def resize_for_processing(frame: np.ndarray, scale: float) -> np.ndarray:
@@ -267,7 +281,13 @@ def transformed_contour(
 def detect_white_shapes(
     frame: np.ndarray, play_height_ratio: float
 ) -> list[ShapeDetection]:
-    """在一帧里找出所有「低饱和高亮」的白色候选目标，按面积*置信度降序返回。"""
+    """在一帧里找出所有「低饱和高亮」的白色候选目标，按面积*置信度降序返回。
+
+    测谎弹窗里的倒计时数字同样是白色（带蓝灰冷色边框阴影），会被白色掩码检成候选，
+    甚至与目标图形粘连成单一轮廓拉偏质心。这里用冷色光环特征加两道防线剔除它：
+    防线一在形态学前删掉贴着光环的白像素（吃数字本体、切粘连桥），防线二把大光环连通域
+    的 bbox 外扩成排除区，中心落在区内的候选（数字核心残片）直接丢弃。
+    """
 
     height, width = frame.shape[:2]  # 帧的高和宽。
     play_height = int(height * play_height_ratio)  # 有效检测高度（比例以下视为无效带）。
@@ -275,6 +295,32 @@ def detect_white_shapes(
     saturation = hsv[:, :, 1]  # 饱和度通道。
     value = hsv[:, :, 2]  # 明度通道。
     mask = ((saturation <= 92) & (value >= 188)).astype(np.uint8) * 255  # 低饱和 + 高亮 = 白色掩码。
+    hue = hsv[:, :, 0]  # 色相通道：倒计时冷色光环判别用。
+    halo = (  # 冷色光环掩码：倒计时数字独有的蓝灰边框阴影（实测 H∈[40,130]、S∈[15,140]、V≥90）。
+        (hue >= HALO_HUE_MIN) & (hue <= HALO_HUE_MAX)
+        & (saturation >= HALO_SAT_MIN) & (saturation <= HALO_SAT_MAX)
+        & (value >= HALO_VALUE_MIN)
+    ).astype(np.uint8)
+    _, halo_labels, halo_stats, _ = cv2.connectedComponentsWithStats(halo, 8)  # 冷色光环连通域（8 邻域）。
+    halo_clean = np.zeros_like(halo)  # 通过面积+填充率门槛的真光环：防线一只从它膨胀。
+    zones = []  # 防线二排除区：真光环 bbox 外扩一圈，防线一吃剩的数字核心残片会落在里面。
+    for label, stat in enumerate(halo_stats[1:], start=1):  # 跳过背景连通域。
+        halo_area = float(stat[cv2.CC_STAT_AREA])  # 连通域面积。
+        halo_fill = halo_area / max(1.0, stat[cv2.CC_STAT_WIDTH] * stat[cv2.CC_STAT_HEIGHT])  # 填充率。
+        if halo_area < HALO_MIN_AREA or halo_fill < HALO_MIN_FILL:  # 散点噪声/整帧级噪声连通域不入防线。
+            continue  # 跳过。
+        halo_clean[halo_labels == label] = 1  # 保留真光环供防线一蚀除。
+        zones.append(  # 记录一个排除区（bbox 四界外扩）。
+            (
+                int(stat[cv2.CC_STAT_LEFT]) - HALO_ZONE_PAD,  # 左界外扩。
+                int(stat[cv2.CC_STAT_TOP]) - HALO_ZONE_PAD,  # 上界外扩。
+                int(stat[cv2.CC_STAT_LEFT]) + int(stat[cv2.CC_STAT_WIDTH]) + HALO_ZONE_PAD,  # 右界外扩。
+                int(stat[cv2.CC_STAT_TOP]) + int(stat[cv2.CC_STAT_HEIGHT]) + HALO_ZONE_PAD,  # 下界外扩。
+            )
+        )
+    mask[  # 防线一：删掉贴着蓝灰阴影的白像素，数字本体被从外向内吃掉、数字↔图形粘连桥被切断。
+        cv2.dilate(halo_clean, np.ones((HALO_DILATE_SIZE, HALO_DILATE_SIZE), np.uint8)) > 0
+    ] = 0
     margin_x = max(2, int(width * 0.012))  # 左右边距，避开画面边框高光。
     margin_y = max(2, int(height * 0.012))  # 上边距。
     mask[:margin_y] = 0  # 清掉顶部边距。
@@ -301,6 +347,12 @@ def detect_white_shapes(
         aspect = max(box_width, box_height) / max(1.0, min(box_width, box_height))  # 长宽比。
         if aspect > 4.2:  # 过于细长的条状物不是目标。
             continue  # 丢弃。
+        center = contour_center(contour)  # 质心：先算出来供排除区判定与候选输出共用。
+        if any(  # 防线二：质心落在倒计时排除区内的是数字核心残片，不是目标图形。
+            left <= center[0] <= right and top <= center[1] <= bottom  # 点在扩边后的 bbox 内。
+            for left, top, right, bottom in zones  # 逐个排除区判定。
+        ):
+            continue  # 丢弃。
         hull_area = float(abs(cv2.contourArea(cv2.convexHull(contour))))  # 凸包面积。
         solidity = area / max(hull_area, 1.0)  # 实心度：凸缺陷越少越接近 1。
         extent = area / max(1.0, box_width * box_height)  # 延展度：占外接矩形的比例。
@@ -322,7 +374,7 @@ def detect_white_shapes(
         )
         detections.append(  # 记录一个通过筛选的候选目标。
             ShapeDetection(
-                center=contour_center(contour),  # 质心。
+                center=center,  # 质心（排除区判定已算好）。
                 contour=contour,  # 原始轮廓。
                 area=area,  # 面积。
                 nominal_size=math.sqrt(area),  # 标称尺寸。
@@ -332,24 +384,24 @@ def detect_white_shapes(
     return sorted(detections, key=lambda item: item.area * item.confidence, reverse=True)  # 面积*置信度降序，最像目标的排前面。
 
 
-def periodic_angle_difference(
-    angles: np.ndarray, reference: float, period: float
-) -> np.ndarray:
-    """求一组角度与参考角在周期域内的最小角距离。"""
+def periodic_angle_difference(angles, reference: float, period: float):
+    """求一组角度与参考角在周期域内的最小角距离（后端无关：只用四则、取模与 abs）。"""
 
-    return np.abs((angles - reference + period * 0.5) % period - period * 0.5)  # 平移半周期取模再折回，得到 [-period/2, period/2] 的绝对值。
+    return abs((angles - reference + period * 0.5) % period - period * 0.5)  # 平移半周期取模再折回，得到 [-period/2, period/2] 的绕对值。
 
 
-def weighted_periodic_angle(
-    angles: np.ndarray, weights: np.ndarray, period: float
-) -> float:
-    """周期域内的加权平均角：用复数向量求和避免 0/period 边界处的错误平均。"""
+def periodic_angle_from_components(cosine: float, sine: float, plain_mean: float, period: float) -> float:
+    """由周期域的加权 cos/sin 合向量还原加权平均角。
 
-    radians = angles * (2.0 * math.pi / period)  # 把周期域角度映射到 0~2pi。
-    vector = np.sum(weights * np.exp(1j * radians))  # 加权复数向量求和。
-    if abs(vector) < 1e-8:  # 向量相互抵消，方向无意义。
-        return float(np.mean(angles) % period)  # 退化为算术平均。
-    return float((np.angle(vector) * period / (2.0 * math.pi)) % period)  # 取合向量方向并映射回周期域。
+    改造前这里写的是 ``np.sum(weights * np.exp(1j * radians))`` 再取 ``np.angle``；复数 dtype 是
+    NumPy 专有的，数组门面上没有对应算子。拆成实部/虚部分别累加后数学上完全等价：
+    ``abs(vector)`` 就是 ``hypot(cosine, sine)``，``np.angle(vector)`` 就是 ``atan2(sine, cosine)``。
+    分量在后端上算（``ParticleShapeTracker._estimate_backend``），本函数只处理下载回来的标量。
+    """
+
+    if math.hypot(cosine, sine) < 1e-8:  # 合向量相互抵消，方向无意义。
+        return float(plain_mean % period)  # 退化为算术平均。
+    return float((math.atan2(sine, cosine) * period / (2.0 * math.pi)) % period)  # 取合向量方向并映射回周期域。
 
 
 def estimate_detection_angle(
@@ -415,79 +467,45 @@ def choose_shape_candidate(
     return max(plausible, key=lambda item: item[0])[1] if plausible else None  # 取得分最高者；全被筛掉则返回 None。
 
 
-class DenseTemporalAligner:
-    """用 DIS 稠密光流把历史帧对齐到当前帧，生成鲁棒的时序残差证据图。"""
+class DenseTemporalAligner(TensorTemporalAligner):
+    """按后端装配的时序证据对齐器：只做装配，算法本体在 ``tensor_evidence``。
+
+    - 显卡后端：``TorchFarnebackFlow``，帧缓冲常驻显存，全部 lag 合成一个 batch 一次算完；
+    - CPU 后端：``Cv2DisFlow``，与改造前的 ``cv2.DISOpticalFlow`` 逐位一致（打包版行为零变化）。
+
+    跨设备算法不同（Farneback vs DIS）是刻意取舍：DIS 在 CPU 上 3.06ms/次、Farneback 要 7.7ms/次，
+    三个 lag 会吃掉 30fps 的全部预算；显卡侧反过来，Farneback 能用张量算子合批，DIS 没有可用的 GPU 实现。
+
+    显卡运行期异常（显存不足/驱动重置）按打分内核同样的语义降级：记一次显卡失败并当场换成
+    CPU DIS 对齐器接管后续帧，连续 3 次后本进程永久回退 NumPy。降级会丢掉显存里的历史帧，
+    因此紧接的 ``max(lags)`` 帧返回 None，会话侧退化为 prediction 而不是报错。
+    """
 
     def __init__(  # 构造对齐器。
         self,
         lags: tuple[int, ...],  # 使用的时间基线（帧间隔），例如 (1, 2, 4)。
         play_height_ratio: float,  # 有效高度比例，其下部分在证据图里清零。
-        preset: int = cv2.DISOPTICAL_FLOW_PRESET_MEDIUM,  # DIS 光流精度档位。
+        preset: int = cv2.DISOPTICAL_FLOW_PRESET_MEDIUM,  # CPU 引擎的 DIS 精度档位。
+        backend=None,  # 打分后端；None 表示取全局生效后端。
+        flow_params: dict | None = None,  # 显卡 Farneback 的光流参数，缺省项由引擎默认值（= medium 档）补齐。
     ):
-        self.lags = lags  # 保存时间基线。
-        self.play_height_ratio = play_height_ratio  # 保存有效高度比例。
-        self.history: deque[tuple[np.ndarray, np.ndarray]] = deque(  # 定长历史队列，存 (彩色帧, 灰度帧)。
-            maxlen=max(lags) + 1  # 只需要保留最大 lag 再加当前帧。
-        )
-        self.flow = cv2.DISOpticalFlow_create(preset)  # 创建 DIS 稠密光流实例。
-        self.flow.setUseSpatialPropagation(True)  # 开启空间传播，提升弱纹理区域的稳定性。
-
-    def reset(self) -> None:
-        """清空历史帧队列；跨局/区域位移后必须调用，否则残差会被上一段画面污染。"""
-
-        self.history.clear()  # 丢弃全部历史帧。
-
-    def update(self, frame: np.ndarray) -> TemporalEvidence | None:
-        """喂入一帧，返回多 lag 合并后的时序残差证据；历史不足时返回 None。"""
-
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)  # 光流只需要灰度。
-        self.history.append((frame.copy(), gray))  # 入队；彩色帧留一份拷贝用于重建背景。
-        available = [lag for lag in self.lags if len(self.history) > lag]  # 筛出历史长度已经足够的 lag。
-        if not available:  # 一个 lag 都算不了（刚启动）。
-            return None  # 返回空证据。
-
-        height, width = gray.shape  # 帧尺寸。
-        play_height = int(height * self.play_height_ratio)  # 有效高度。
-        xx, yy = np.meshgrid(  # 采样网格坐标，供 remap 使用。
-            np.arange(width, dtype=np.float32),  # x 网格。
-            np.arange(height, dtype=np.float32),  # y 网格。
-        )
-        normalized_maps: list[np.ndarray] = []  # 收集每个 lag 的归一化残差图。
-        raw_means: list[float] = []  # 收集每个 lag 归一化前的残差均值。
-
-        for lag in available:  # 逐个时间基线计算。
-            previous, previous_gray = self.history[-1 - lag]  # 取出对应的历史帧（倒数第 lag+1 个）。
-            # 光流把当前帧每个像素映射到它在旧帧里的来源位置，
-            # 因此按该光流 remap 旧帧即可重建「当前帧的背景」。
-            flow = self.flow.calc(gray, previous_gray, None)  # 计算当前帧到历史帧的稠密光流。
-            aligned = cv2.remap(  # 按光流重建背景。
-                previous,  # 源图像为历史彩色帧。
-                xx + flow[:, :, 0],  # x 方向映射坐标。
-                yy + flow[:, :, 1],  # y 方向映射坐标。
-                cv2.INTER_LINEAR,  # 双线性插值。
-                borderMode=cv2.BORDER_REFLECT,  # 边界反射填充，避免黑边。
+        chosen = _resolve_backend(backend)  # 本次生效的后端。
+        params = dict(flow_params or {})  # 参数副本：不污染调用方的 dict。
+        if chosen.is_gpu:  # 显卡：torch Farneback，并挂上 CPU 降级器。
+            super().__init__(
+                lags,
+                play_height_ratio,
+                TorchFarnebackFlow(chosen.xp, **params),
+                chosen,
+                fallback=lambda: self._degrade_to_cpu(lags, play_height_ratio, preset),
             )
-            delta = np.max(cv2.absdiff(frame, aligned), axis=2).astype(np.float32)  # 逐像素绝对差取三通道最大值。
-            valid_delta = delta[:play_height]  # 只统计有效带内的残差。
-            median = float(np.median(valid_delta))  # 残差中位数，作为鲁棒基线。
-            mad = float(np.median(np.abs(valid_delta - median)))  # 中位数绝对偏差。
-            sigma = max(1.0, 1.4826 * mad)  # 鲁棒标准差，下限 1.0 防止过度放大。
-            normalized = np.clip((delta - median) / sigma, 0.0, 12.0)  # 鲁棒归一化并截断极端值。
-            normalized[play_height:] = 0.0  # 有效带以下一律清零。
-            normalized_maps.append(normalized)  # 收集该 lag 的归一化残差。
-            raw_means.append(float(np.mean(valid_delta)))  # 收集该 lag 的原始残差均值。
+        else:  # CPU：DIS，行为与改造前一致，不需要降级器。
+            super().__init__(lags, play_height_ratio, Cv2DisFlow(preset), numpy_backend())
 
-        # 真实运动的边界只需要在某一个时间基线上清晰即可，因此多 lag 取最大。
-        combined = np.maximum.reduce(normalized_maps)  # 逐像素取各 lag 的最大响应。
-        combined = cv2.GaussianBlur(combined, (3, 3), 0)  # 轻度平滑，抑制单像素噪声。
-        # remap 的边界填充会产生又长又笔直的假边界。只压制这条窄的不可靠带：
-        # 贴到画面边缘的目标仍能靠它剩下的两三条边被找回来。
-        edge_band = max(8, int(round(width * 0.014)))  # 边缘带宽度，随画面宽度自适应。
-        combined[:edge_band] = 0.0  # 压制上边缘带。
-        combined[max(0, play_height - edge_band) :] = 0.0  # 压制有效带下边缘。
-        combined[:, :edge_band] = 0.0  # 压制左边缘带。
-        combined[:, max(0, width - edge_band) :] = 0.0  # 压制右边缘带。
-        return TemporalEvidence(combined, min(raw_means))  # 残差均值取最小，避免单一 lag 的抖动误判场景切换。
+    @staticmethod
+    def _degrade_to_cpu(lags, play_height_ratio, preset):  # 显卡链路异常时建一个 CPU DIS 对齐器接管。
+        mark_gpu_failure()  # 计数，连续 3 次后本进程永久回退 NumPy（与打分内核同一套语义）。
+        return TensorTemporalAligner(lags, play_height_ratio, Cv2DisFlow(preset), numpy_backend())
 
 
 def sample_map(image: np.ndarray, x: np.ndarray, y: np.ndarray, backend=None) -> np.ndarray:
@@ -502,7 +520,7 @@ def score_rotated_borders(
 ) -> BorderEvidence:
     """矩形模型专用：给一批位姿假设的四条薄边打分（双后端薄壳，实现在 gpu_shape_backend）。"""
 
-    return _run_scoring(score_rotated_borders_core, BorderEvidence, backend, evidence, states, side, play_height)  # 统一调度与降级。
+    return _run_scoring(score_rotated_borders_core, backend, evidence, states, side, play_height)  # 统一调度与降级。
 
 
 def transform_template_points(
@@ -525,7 +543,27 @@ def score_shape_contours(
 ) -> ShapeEvidence:
     """给一批粒子假设打分：联合轮廓边界对比度与半透明区域内部残差（双后端薄壳，实现在 gpu_shape_backend）。"""
 
-    return _run_scoring(score_shape_contours_core, ShapeEvidence, backend, evidence, states, template, scales, play_height)  # 统一调度与降级。
+    return _run_scoring(score_shape_contours_core, backend, evidence, states, template, scales, play_height)  # 统一调度与降级。
+
+
+def score_shape_contours_on_backend(
+    evidence,
+    states,
+    template,
+    scales,
+    play_height,
+    backend=None,
+) -> ShapeEvidence:
+    """与 :func:`score_shape_contours` 同一套调度与降级，但结果**留在后端设备上**。
+
+    粒子滤波每帧要拿得分继续做加权/重采样，全部在设备上算完后再一次性下载决策标量，
+    因此不能像薄壳那样每次打分都把 (count,) 数组拽回主存。打分降级到 NumPy 时返回的就是
+    NumPy 数组，调用方用 ``backend.to_backend`` 归位即可，两个方向都由门面的 ``asarray`` 兜住。
+    """
+
+    return _run_scoring(  # 复用同一套调度，只把下载关掉。
+        score_shape_contours_core, backend, evidence, states, template, scales, play_height, to_numpy=False
+    )
 
 
 class ParticleShapeTracker:
@@ -554,7 +592,8 @@ class ParticleShapeTracker:
         backend=None,  # 打分后端（gpu_shape_backend.ShapeScoreBackend），None 时用 NumPy 后端。
     ):
         self.template = template  # 保存模板。
-        self.backend = numpy_backend() if backend is None else backend  # 打分后端：会话装配时注入，缺省 NumPy（双后端结构：有 N 卡时为 CuPy）。
+        self.backend = numpy_backend() if backend is None else backend  # 打分后端：会话装配时注入，缺省 NumPy（有 N 卡时为 torch CUDA）。
+        self.xp = self.backend.xp  # 数组门面：粒子群的全部向量运算都走它，CPU 与显卡共用同一份代码。
         self.count = particle_count  # 保存粒子数。
         self.frame_width = frame_width  # 保存帧宽。
         self.play_height = play_height  # 保存有效高度。
@@ -567,14 +606,18 @@ class ParticleShapeTracker:
         self.refine_per_top = refine_per_top  # 保存每邻域精扫候选数。
         self.relocation_cooldown = relocation_cooldown  # 保存重定位冷却帧数。
         self.scale = 1.0  # 当前估计的目标缩放，初值 1。
-        self.states = np.zeros((particle_count, 6), dtype=np.float32)  # 粒子状态矩阵。
-        self.states[:, :2] = detection.center + rng.normal(  # 位置围绕检测中心小幅扩散。
+        # 随机数一律在 NumPy 侧生成（保住 random_seed 的可复现契约），整块搬上设备后不再回主存。
+        states = np.zeros((particle_count, 6), dtype=np.float32)  # 粒子状态矩阵。
+        states[:, :2] = detection.center + rng.normal(  # 位置围绕检测中心小幅扩散。
             0.0, template.nominal_size * 0.035, size=(particle_count, 2)  # 扩散标准差为标称尺寸的 3.5%。
         )
-        self.states[:, 2:4] = rng.normal(0.0, 1.2, size=(particle_count, 2))  # 初速度零均值随机，标准差 1.2 像素/帧。
-        self.states[:, 4] = rng.normal(0.0, 2.5, particle_count) % template.symmetry_period  # 初始角度围绕 0 小范围扰动后折回对称周期域。
-        self.states[:, 5] = rng.normal(0.0, 0.6, particle_count)  # 初始角速度零均值随机。
-        self.weights = np.full(particle_count, 1.0 / particle_count, dtype=np.float64)  # 权重均匀初始化。
+        states[:, 2:4] = rng.normal(0.0, 1.2, size=(particle_count, 2))  # 初速度零均值随机，标准差 1.2 像素/帧。
+        states[:, 4] = rng.normal(0.0, 2.5, particle_count) % template.symmetry_period  # 初始角度围绕 0 小范围扰动后折回对称周期域。
+        states[:, 5] = rng.normal(0.0, 0.6, particle_count)  # 初始角速度零均值随机。
+        self.states = self.backend.to_backend(states)  # 状态常驻后端设备（float32）。
+        # 权重用 float64：归一化后要反复乘除，float32 在 700 个粒子上会累积出可见偏差；
+        # 显卡双精度在这个规模上不是瓶颈（每帧只有几个千元级的归约）。
+        self.weights = self.backend.to_backend(np.full(particle_count, 1.0 / particle_count, dtype=np.float64))  # 权重均匀初始化。
         self.confidence = detection.confidence  # 初始置信度取白色检测置信度。
         self.last_reliable_center = detection.center.astype(np.float32).copy()  # 最后一个已确认可靠的中心。
         self.pending_reliable_center = self.last_reliable_center.copy()  # 正在累积命中次数的待定中心。
@@ -585,94 +628,148 @@ class ParticleShapeTracker:
         self.last_border_snr = 0.0  # 上一次边界信噪比，供诊断输出。
         self.search_radius = template.nominal_size * 0.5  # 当前搜索半径，供诊断输出。
 
+    def _estimate_device(self):  # 在后端设备上算出全部加权估计量，不做任何主存同步。
+        """返回 ``(center, velocity, cosine, sine, plain_mean)``，全部是设备上的张量。
+
+        ``cosine``/``sine`` 是周期域加权合向量的两个分量：改造前这里写的是
+        ``np.sum(weights * np.exp(1j * radians))``，复数 dtype 是 NumPy 专有的，拆成实部/虚部
+        分别累加后与 ``abs(vector)`` / ``np.angle(vector)`` 完全等价。
+        """
+
+        xp = self.xp
+        column_weights = xp.stack([self.weights], axis=1)  # (count,1)，供位置/速度加权。
+        center = xp.sum(xp.narrow(self.states, 1, 0, 2) * column_weights, axis=0)  # 位置加权均值 (2,)。
+        velocity = xp.sum(xp.narrow(self.states, 1, 2, 2) * column_weights, axis=0)  # 速度加权均值 (2,)。
+        period = self.template.symmetry_period  # 对称周期。
+        radians = xp.column(self.states, 4) * (2.0 * math.pi / period)  # 把周期域角度映射到 0~2pi。
+        cosine = xp.sum(self.weights * xp.cos(radians))  # 合向量实部。
+        sine = xp.sum(self.weights * xp.sin(radians))  # 合向量虚部。
+        plain_mean = xp.astype(xp.mean(xp.column(self.states, 4)), xp.float64)  # 合向量抵消时的算术均值兜底。
+        return center, velocity, cosine, sine, plain_mean
+
     def estimate(self) -> tuple[np.ndarray, np.ndarray, float]:
-        """输出加权估计：中心、速度与周期域加权平均角度。"""
+        """输出加权估计：中心、速度与周期域加权平均角（一次 D2H 取回全部标量）。"""
 
-        center = np.sum(self.states[:, :2] * self.weights[:, None], axis=0)  # 位置加权均值。
-        velocity = np.sum(self.states[:, 2:4] * self.weights[:, None], axis=0)  # 速度加权均值。
-        angle = weighted_periodic_angle(  # 角度必须走周期域平均，不能直接算术均。
-            self.states[:, 4], self.weights, self.template.symmetry_period  # 传入角度、权重与对称周期。
-        )
-        return center.astype(np.float32), velocity.astype(np.float32), angle  # 返回三个估计量。
+        xp = self.xp
+        center, velocity, cosine, sine, plain_mean = self._estimate_device()  # 全部在设备上算完。
+        period = self.template.symmetry_period  # 对称周期。
+        packed = xp.concatenate([center, velocity, xp.stack([cosine, sine, plain_mean])])  # 攒成一个 (7,) 张量。
+        values = xp.to_numpy(packed)  # 本函数唯一一次 D2H，避免逐标量同步。
+        angle = periodic_angle_from_components(float(values[4]), float(values[5]), float(values[6]), period)  # 标量还原加权平均角。
+        return values[:2].astype(np.float32), values[2:4].astype(np.float32), angle  # 返回三个估计量。
 
-    def _apply_bounds(self, states: np.ndarray) -> None:
-        """对状态矩阵就地施加边界、限速、角度取模与角速度截断约束。"""
+    def _apply_bounds(self, states):  # 施加边界、限速、角度取模与角速度截断约束，返回新状态。
+        """与改造前的布尔掩码就地赋值等价，但只用门面的 ``where``，因此显卡上也能跑。
 
+        改造前写的是 ``states[left, 0] = margin`` 这类花式索引赋值；``where`` 版本逐元素选出
+        同一批值，数值结果一致，且不要求数组可写、不打断 CUDA Graph 捕获。
+        """
+
+        xp = self.xp
         margin = self.template.nominal_size * 0.50 * self.scale  # 边距为半个形状，避免中心贴到画面边缘。
         max_x = self.frame_width - margin  # x 上限。
         max_y = self.play_height - margin  # y 上限（以有效高度为准）。
-        left = states[:, 0] < margin  # 越左界的粒子。
-        right = states[:, 0] > max_x  # 越右界的粒子。
-        top = states[:, 1] < margin  # 越上界的粒子。
-        bottom = states[:, 1] > max_y  # 越下界的粒子。
-        states[left, 0] = margin  # 钳回左边界。
-        states[left, 2] = np.maximum(states[left, 2], 0.0)  # 左界处不允许继续向左的速度。
-        states[right, 0] = max_x  # 钳回右边界。
-        states[right, 2] = np.minimum(states[right, 2], 0.0)  # 右界处不允许继续向右的速度。
-        states[top, 1] = margin  # 钳回上边界。
-        states[top, 3] = np.maximum(states[top, 3], 0.0)  # 上界处不允许继续向上的速度。
-        states[bottom, 1] = max_y  # 钳回下边界。
-        states[bottom, 3] = np.minimum(states[bottom, 3], 0.0)  # 下界处不允许继续向下的速度。
+        pos_x, pos_y, vel_x, vel_y, angle, spin = [xp.narrow(states, 1, index, 1) for index in range(6)]  # 六列各 (count,1)。
+        left = pos_x < margin  # 越左界的粒子。
+        right = pos_x > max_x  # 越右界的粒子。
+        top = pos_y < margin  # 越上界的粒子。
+        bottom = pos_y > max_y  # 越下界的粒子。
+        pos_x = xp.where(left, xp.full_like(pos_x, margin), pos_x)  # 钳回左边界。
+        vel_x = xp.where(left, xp.maximum(vel_x, 0.0), vel_x)  # 左界处不允许继续向左的速度。
+        pos_x = xp.where(right, xp.full_like(pos_x, max_x), pos_x)  # 钳回右边界。
+        vel_x = xp.where(right, xp.minimum(vel_x, 0.0), vel_x)  # 右界处不允许继续向右的速度。
+        pos_y = xp.where(top, xp.full_like(pos_y, margin), pos_y)  # 钳回上边界。
+        vel_y = xp.where(top, xp.maximum(vel_y, 0.0), vel_y)  # 上界处不允许继续向上的速度。
+        pos_y = xp.where(bottom, xp.full_like(pos_y, max_y), pos_y)  # 钳回下边界。
+        vel_y = xp.where(bottom, xp.minimum(vel_y, 0.0), vel_y)  # 下界处不允许继续向下的速度。
         max_speed = self.template.nominal_size * self.max_speed_ratio  # 单帧最大位移。
-        speed = np.linalg.norm(states[:, 2:4], axis=1)  # 当前速度大小。
+        speed = xp.linalg_norm(xp.concatenate([vel_x, vel_y], axis=1), axis=1)  # 当前速度大小 (count,)。
         too_fast = speed > max_speed  # 超速的粒子。
-        states[too_fast, 2:4] *= (max_speed / speed[too_fast])[:, None]  # 保留方向、按比例缩到限速。
-        states[:, 4] %= self.template.symmetry_period  # 角度折回对称周期域。
-        states[:, 5] = np.clip(states[:, 5], -6.0, 6.0)  # 角速度截断，避免无限累积。
+        # 超速的按 max_speed/speed 等比缩放（保留方向），其余乘 1 保持原样；
+        # 分母取 max(speed, 1e-9) 只为避开 where 两个分支都要算带来的除零，超速分支里 speed 远大于它。
+        ratio = xp.where(too_fast, max_speed / xp.maximum(speed, 1e-9), 1.0)
+        factor = xp.astype(xp.stack([ratio], axis=1), xp.float32)  # (count,1)，强制 float32 以与状态列同精度。
+        vel_x = vel_x * factor  # 限速后的 x 速度。
+        vel_y = vel_y * factor  # 限速后的 y 速度。
+        angle = angle % self.template.symmetry_period  # 角度折回对称周期域（两套门面的 % 同为 floor-mod）。
+        spin = xp.clip(spin, -6.0, 6.0)  # 角速度截断，避免无限累积。
+        return xp.astype(xp.concatenate([pos_x, pos_y, vel_x, vel_y, angle, spin], axis=1), xp.float32)  # 状态恒为 float32。
 
     def propagate(self) -> None:
         """粒子推进一步：按当前速度平移，并按「1 - 置信度」放大扩散噪声。"""
 
+        xp = self.xp
         uncertainty = 1.0 - float(np.clip(self.confidence, 0.0, 1.0))  # 不确定度：置信度越低扩散越大。
-        self.states[:, :2] += self.states[:, 2:4]  # 位置按速度推进。
-        self.states[:, :2] += self.rng.normal(  # 位置扩散噪声。
-            0.0, 0.45 + 2.8 * uncertainty, size=(self.count, 2)  # 基准 0.45，不确定度满时额外 2.8。
-        )
-        self.states[:, 2:4] += self.rng.normal(  # 速度随机游走。
-            0.0, 0.18 + 0.85 * uncertainty, size=(self.count, 2)  # 基准 0.18。
-        )
-        self.states[:, 4] += self.states[:, 5]  # 角度按角速度推进。
-        self.states[:, 4] += self.rng.normal(  # 角度扩散噪声。
-            0.0, 0.35 + 2.0 * uncertainty, self.count  # 基准 0.35 度。
-        )
-        self.states[:, 5] += self.rng.normal(  # 角速度随机游走。
-            0.0, 0.20 + 0.30 * uncertainty, self.count  # 基准 0.20。
-        )
-        self._apply_bounds(self.states)  # 推进后统一施加约束。
+        # 噪声整块在 NumPy 侧生成后一次上传：随机数契约（random_seed=20260902 可复现）只在 NumPy 侧成立，
+        # 且顺序与改造前逐列 rng.normal 完全一致，因此同种子下噪声逐位相同。
+        noise = np.zeros((self.count, 6), dtype=np.float32)  # 六列噪声容器。
+        noise[:, :2] = self.rng.normal(0.0, 0.45 + 2.8 * uncertainty, size=(self.count, 2))  # 位置扩散：基准 0.45，不确定度满时额外 2.8。
+        noise[:, 2:4] = self.rng.normal(0.0, 0.18 + 0.85 * uncertainty, size=(self.count, 2))  # 速度随机游走：基准 0.18。
+        noise[:, 4] = self.rng.normal(0.0, 0.35 + 2.0 * uncertainty, self.count)  # 角度扩散：基准 0.35 度。
+        noise[:, 5] = self.rng.normal(0.0, 0.20 + 0.30 * uncertainty, self.count)  # 角速度随机游走：基准 0.20。
+        columns = [xp.narrow(self.states, 1, index, 1) for index in range(6)]  # 当前六列。
+        # 确定性推进用「加噪声之前」的速度/角速度，与改造前「先 += 速度列、再 += 噪声」的先后顺序一致。
+        advanced = [
+            columns[0] + columns[2],  # x += vx。
+            columns[1] + columns[3],  # y += vy。
+            columns[2],  # vx 本身不做确定性推进。
+            columns[3],  # vy 同上。
+            columns[4] + columns[5],  # angle += 角速度。
+            columns[5],  # 角速度本身不做确定性推进。
+        ]
+        self.states = xp.astype(xp.concatenate(advanced, axis=1) + xp.asarray(noise), xp.float32)  # 推进 + 噪声，一次上传。
+        self.states = self._apply_bounds(self.states)  # 推进后统一施加约束。
         self.frames_since_relocation += 1  # 重定位冷却计数 +1。
 
     def observe_color(self, detection: ShapeDetection) -> None:
         """强测量：白色轮廓仍然可见，直接用检测结果修正粒子群与尺度。"""
 
-        distance = np.linalg.norm(self.states[:, :2] - detection.center, axis=1)  # 每个粒子到检测中心的距离。
-        angle_distance = periodic_angle_difference(  # 周期域角度偏差。
-            self.states[:, 4], detection.angle, self.template.symmetry_period  # 粒子角度 vs 检测角度。
-        )
-        position_sigma = max(5.0, self.template.nominal_size * 0.22)  # 位置似然标准差，随尺寸自适应。
-        angle_sigma = max(8.0, self.template.symmetry_period * 0.15)  # 角度似然标准差，随对称周期自适应。
-        likelihood = np.exp(-0.5 * (distance / position_sigma) ** 2)  # 位置高斯似然。
-        # 对称/接近圆形的轮廓携带的角度信息很弱，必须降低角度项权重。
-        angle_weight = 0.35 if self.template.symmetry_period <= 60.0 else 0.75  # 周期≤ 60 度时降权到 0.35。
-        likelihood *= (1.0 - angle_weight) + angle_weight * np.exp(  # 角度高斯似然按权重混合进去。
-            -0.5 * (angle_distance / angle_sigma) ** 2  # 角度高斯项。
-        )
-        self.weights *= likelihood + 1e-9  # 权重乘似然，加极小量避免全零。
-        self._normalize_weights()  # 归一化。
-        innovation = detection.center - self.states[:, :2]  # 位置新息（测量 - 预测）。
-        self.states[:, 2:4] += 0.14 * innovation  # 速度弱修正，保留惯性。
-        self.states[:, :2] += 0.52 * innovation  # 位置强修正，快速贴向测量。
-        angular_innovation = (  # 角度新息，必须走周期域最短弧。
-            detection.angle  # 测量角度。
-            - self.states[:, 4]  # 减去粒子角度。
-            + self.template.symmetry_period * 0.5  # 平移半周期。
-        ) % self.template.symmetry_period - self.template.symmetry_period * 0.5  # 取模后折回，得到最短角差。
-        self.states[:, 4] = (  # 角度按权重修正，并折回对称周期域。
-            self.states[:, 4] + 0.28 * angle_weight * angular_innovation  # 修正量同时受对称性降权影响。
-        ) % self.template.symmetry_period  # 取模保证角度始终在周期域内。
-        measured_scale = detection.nominal_size / max(self.template.nominal_size, 1.0)  # 测量到的相对尺度。
-        if 0.86 <= measured_scale <= 1.16:  # 只接受合理范围内的尺度测量。
-            self.scale = float(np.clip(0.94 * self.scale + 0.06 * measured_scale, 0.86, 1.16))  # 低通滤波平滑尺度，并限制上下限。
-        self._apply_bounds(self.states)  # 修正后重新施加约束。
+        xp = self.xp
+        with xp.inference():  # 显卡侧关掉自动求导。
+            measured_center = xp.asarray(detection.center)  # 检测中心 (2,)，一次 8 字节 H2D。
+            positions = xp.narrow(self.states, 1, 0, 2)  # 当前粒子位置 (count,2)。
+            distance = xp.linalg_norm(positions - measured_center, axis=1)  # 每个粒子到检测中心的距离。
+            angles = xp.column(self.states, 4)  # 当前粒子角度 (count,)。
+            angle_distance = periodic_angle_difference(  # 周期域角度偏差。
+                angles, detection.angle, self.template.symmetry_period  # 粒子角度 vs 检测角度。
+            )
+            position_sigma = max(5.0, self.template.nominal_size * 0.22)  # 位置似然标准差，随尺寸自适应。
+            angle_sigma = max(8.0, self.template.symmetry_period * 0.15)  # 角度似然标准差，随对称周期自适应。
+            likelihood = xp.exp(-0.5 * (distance / position_sigma) ** 2)  # 位置高斯似然。
+            # 对称/接近圆形的轮廓携带的角度信息很弱，必须降低角度项权重。
+            angle_weight = 0.35 if self.template.symmetry_period <= 60.0 else 0.75  # 周期≤ 60 度时降权到 0.35。
+            likelihood = likelihood * ((1.0 - angle_weight) + angle_weight * xp.exp(  # 角度高斯似然按权重混合进去。
+                -0.5 * (angle_distance / angle_sigma) ** 2  # 角度高斯项。
+            ))
+            self.weights = self.weights * xp.astype(likelihood + 1e-9, xp.float64)  # 权重乘似然，加极小量避免全零（权重恒为 float64）。
+            self._normalize_weights()  # 归一化。
+            innovation = measured_center - positions  # 位置新息（测量 - 预测）。
+            shift_x = xp.narrow(innovation, 1, 0, 1)  # 新息 x 分量 (count,1)。
+            shift_y = xp.narrow(innovation, 1, 1, 1)  # 新息 y 分量 (count,1)。
+            columns = [xp.narrow(self.states, 1, index, 1) for index in range(6)]  # 修正前的六列快照。
+            period = self.template.symmetry_period  # 对称周期。
+            angular_innovation = (  # 角度新息，必须走周期域最短弧。
+                detection.angle  # 测量角度。
+                - angles  # 减去粒子角度。
+                + period * 0.5  # 平移半周期。
+            ) % period - period * 0.5  # 取模后折回，得到最短角差。
+            corrected_angle = (  # 角度按权重修正，并折回对称周期域。
+                angles + 0.28 * angle_weight * angular_innovation  # 修正量同时受对称性降权影响。
+            ) % period  # 取模保证角度始终在周期域内。
+            # 位置强修正（快速贴向测量）与速度弱修正（保留惯性）共用同一份修正前的新息，
+            # 与改造前两句就地 += 的数值语义一致。
+            self.states = xp.astype(xp.concatenate([
+                columns[0] + 0.52 * shift_x,  # x 位置强修正。
+                columns[1] + 0.52 * shift_y,  # y 位置强修正。
+                columns[2] + 0.14 * shift_x,  # vx 弱修正。
+                columns[3] + 0.14 * shift_y,  # vy 弱修正。
+                xp.stack([corrected_angle], axis=1),  # 修正后的角度。
+                columns[5],  # 角速度不变。
+            ], axis=1), xp.float32)
+            measured_scale = detection.nominal_size / max(self.template.nominal_size, 1.0)  # 测量到的相对尺度。
+            if 0.86 <= measured_scale <= 1.16:  # 只接受合理范围内的尺度测量。
+                self.scale = float(np.clip(0.94 * self.scale + 0.06 * measured_scale, 0.86, 1.16))  # 低通滤波平滑尺度，并限制上下限。
+            self.states = self._apply_bounds(self.states)  # 修正后重新施加约束。
         self.confidence = max(self.confidence * 0.55, detection.confidence)  # 置信度：旧值衰减后与测量值取大。
         self.last_reliable_center = detection.center.astype(np.float32).copy()  # 白色检测就是可靠中心。
         self.pending_reliable_center = self.last_reliable_center.copy()  # 待定中心同步。
@@ -683,8 +780,14 @@ class ParticleShapeTracker:
         self.search_radius = self.template.nominal_size * 0.5  # 搜索半径回到默认值。
         self._resample_if_needed(force=False)  # 按需重采样，不强制。
 
-    def _proposal_states(self, reference_center: np.ndarray) -> np.ndarray:
-        """生成全局重定位候选位姿：30% 局部圆域 + 70% 全画面网格×角度离散。"""
+    def _proposal_states(self, reference_center: np.ndarray, velocity: np.ndarray, current_angle: float) -> np.ndarray:
+        """生成全局重定位候选位姿：30% 局部圆域 + 70% 全画面网格×角度离散。
+
+        整段留在 NumPy：候选生成要消耗随机数，而随机数的可复现契约只在 NumPy 侧成立。
+        返回的 ``(proposal_count, 6)`` 数组由调用方一次上传到后端并施加边界约束；
+        ``velocity`` / ``current_angle`` 也从调用方传入（取自 :meth:`estimate`），
+        这样整次重定位只需一次 D2H，不必在候选生成里再同步一遍。
+        """
 
         proposal_count = self.global_proposals  # 候选总数。
         lost = max(1, self.frames_since_reliable)  # 已丢失帧数，下限 1 避免除零。
@@ -729,7 +832,6 @@ class ParticleShapeTracker:
 
         states = np.zeros((proposal_count, 6), dtype=np.float32)  # 候选状态矩阵。
         states[:, :2] = positions  # 写入位置。
-        _, velocity, current_angle = self.estimate()  # 取当前速度与角度作为候选初值。
         states[:, 2:4] = 0.55 * (  # 速度主项：由「候选位置相对参考中心的位移 / 丢失帧数」推出的隐含速度。
             (positions - reference_center) / max(lost, 1)  # 平均到每帧。
         ) + 0.45 * velocity  # 副项：保留当前速度估计。
@@ -742,45 +844,56 @@ class ParticleShapeTracker:
             global_angles + self.rng.normal(0.0, min(3.0, period * 0.04), global_count)  # 加微小抖动，但保留网格覆盖性。
         ) % period  # 折回周期域。
         states[:, 5] = self.rng.normal(0.0, 1.5, proposal_count)  # 角速度随机初始化。
-        self._apply_bounds(states)  # 统一施加边界与限速约束。
-        return states  # 返回全部候选位姿。
+        return states  # 返回全部候选位姿（边界约束改由调用方在后端上施加，省一次主存往返）。
 
     def _relocate(  # 两级粗到细全局重定位。
         self,
-        temporal_map: np.ndarray,  # 时序残差证据图。
-        particle_evidence: ShapeEvidence,  # 当前粒子打分结果，拉回的候选要同步写回。
-        predicted_center: np.ndarray,  # 推进后的预测中心，作为运动先验参考点。
-        control_median: float,  # 对照组得分中位数。
-        control_sigma: float,  # 对照组鲁棒标准差。
-    ) -> None:
+        temporal_map,  # 时序残差证据图（CPU 时是 NumPy 数组，显卡时是显存张量）。
+        particle_scores,  # 当前粒子得分（后端数组），拉回的候选要同步写回。
+        particle_coverage,  # 当前粒子覆盖率（后端数组），同上。
+        control_median,  # 对照组得分中位数（后端 float64 标量）。
+        control_sigma,  # 对照组鲁棒标准差（后端 float64 标量）。
+    ):
         """第一级用有限候选粗扫全图（单尺度），第二级对 top-K 邻域拖尾细化（3 尺度）。
-        替代旧版 2400×3 尺度一次性打分，把单次重定位从 ~240ms 降到 ~30ms。"""
+        替代旧版 2400×3 尺度一次性打分，把单次重定位从 ~240ms 降到 ~30ms。
 
+        打分与排序全部留在后端设备上，只有两处必须回主存：
+        一是粗扫 top-K 的基准位姿（拖尾抖动要消耗随机数，而随机数契约只在 NumPy 侧成立），
+        二是精扫的 ``order + 候选位置 + best_snr + best_scale``——后者攒成一个张量一次下载，
+        最小间距贪婪去重仍在 CPU 上按原算法跑（算法一字不改），选中的索引再上传回写。
+        返回可能被覆写过的 ``(particle_scores, particle_coverage)``。
+        """
+
+        xp = self.xp  # 数组门面。
         scale_factors = (0.90, 1.0, 1.10)  # 精扫跑三个尺度。
-        coarse_states = self._proposal_states(predicted_center)  # 第一级粗扫候选，数量 = global_proposals（实时档 400）。
-        coarse_result = score_shape_contours(  # 粗扫只在 1.0 尺度下打分。
+        top_k = min(self.coarse_top, self.global_proposals)  # 进入精扫的邻域数，不超过粗扫候选总数。
+        if top_k == 0:  # 没有任何候选（理论上不会出现），直接放弃重定位。
+            return particle_scores, particle_coverage  # 保持冷却计数不变，下一帧再试。
+        predicted_center, velocity, current_angle = self.estimate()  # 一次 D2H：候选生成需要主存侧的运动先验。
+        predicted_device = xp.asarray(predicted_center)  # 预测中心的设备副本，供两次距离惩罚复用。
+        coarse_states = self._apply_bounds(self.backend.to_backend(  # 候选在主存生成后一次上传，再施加边界/限速约束。
+            self._proposal_states(predicted_center, velocity, current_angle)  # 第一级粗扫候选，数量 = global_proposals（实时档 400）。
+        ))
+        coarse_result = score_shape_contours_on_backend(  # 粗扫只在 1.0 尺度下打分，结果留在设备上。
             temporal_map, coarse_states, self.template, 1.0, self.play_height, self.backend  # 证据图、候选、模板、尺度、有效高度与打分后端。
         )
         prior_radius = self.template.nominal_size * (  # 距离先验半径：丢失越久容忍越宽。
             0.55 + 0.060 * min(self.frames_since_reliable, 10)  # 基础 0.55，每丢失一帧 +0.06，上限 10 帧。
         )
-        coarse_distance = np.linalg.norm(  # 候选到预测中心的距离。
-            coarse_states[:, :2] - predicted_center, axis=1  # 二维距离。
+        coarse_distance = xp.linalg_norm(  # 候选到预测中心的距离。
+            xp.narrow(coarse_states, 1, 0, 2) - predicted_device, axis=1  # 二维距离。
         )
         coarse_ranking = coarse_result.scores - 2.20 * (  # 排序得分 = 证据得分 - 平方距离惩罚。
             coarse_distance / max(prior_radius, 1.0)  # 归一化距离，下限防除零。
         ) ** 2
-        top_k = min(self.coarse_top, len(coarse_states))  # 进入精扫的邻域数，不超过粗扫候选总数。
-        top_indices = np.argsort(coarse_ranking)[::-1][:top_k]  # 粗扫排序得分最高的 top-K 索引。
-        if top_k == 0:  # 没有任何候选（理论上不会出现），直接放弃重定位。
-            return  # 保持冷却计数不变，下一帧再试。
+        top_indices = xp.narrow(xp.argsort(coarse_ranking, descending=True), 0, 0, top_k)  # 粗扫排序得分最高的 top-K 索引。
+        bases = xp.to_numpy(xp.take(coarse_states, top_indices)).astype(np.float32)  # 一次 D2H：只把 top-K 行拉回主存做拖尾抖动。
 
         period = self.template.symmetry_period  # 对称周期。
         position_jitter = max(4.0, self.template.nominal_size * 0.14)  # 位置抖动标准差：标称尺寸的 14%。
         angle_jitter = max(6.0, period * 0.10)  # 角度抖动标准差：周期的 10%。
         refined_list: list[np.ndarray] = []  # 收集每个邻域的抖动候选组。
-        for index in top_indices:  # 遍历粗扫 top-K 邻域。
-            base = coarse_states[index]  # 邻域基准位姿。
+        for base in bases:  # 遍历粗扫 top-K 邻域（顺序即排序得分降序，随机数消耗次序与改造前一致）。
             variants = np.tile(base, (self.refine_per_top, 1))  # 复制基准位姿成一组。
             variants[:, :2] += self.rng.normal(  # 位置抖动。
                 0.0, position_jitter, size=(self.refine_per_top, 2)  # x/y 独立抖动。
@@ -790,14 +903,15 @@ class ParticleShapeTracker:
             ) % period  # 取模保证在周期域内。
             refined_list.append(variants)  # 收集本邻域候选。
         proposals = np.vstack(refined_list).astype(np.float32)  # 合并成精扫候选集。
-        self._apply_bounds(proposals)  # 统一施加边界约束。
+        proposal_rows = len(proposals)  # 精扫候选行数（= top_k * refine_per_top）。
+        proposals_device = self._apply_bounds(self.backend.to_backend(proposals))  # 一次上传并统一施加边界约束。
         # 三个尺度的精扫合并成一次打分：候选按「尺度段 × 候选」排列，与旧版逐尺度拼接顺序一致，
         # 后续 ranking/selected 索引到 all_states 的映射语义不变。
-        all_states = np.concatenate([proposals] * len(scale_factors)).astype(np.float32)  # 同一批候选在三个尺度下各记一次。
-        all_scales = np.concatenate(  # 逐候选尺度：每段 proposals 对应一个尺度因子。
-            [np.full(len(proposals), float(np.clip(factor, 0.86, 1.16)), dtype=np.float32) for factor in scale_factors]  # 尺度限在合法区间内。
-        )
-        refine_evidence = score_shape_contours(  # 一次合批对全部尺度候选打分。
+        all_states = xp.concatenate([proposals_device] * len(scale_factors), axis=0)  # 同一批候选在三个尺度下各记一次。
+        all_scales = xp.asarray(np.concatenate(  # 逐候选尺度：每段 proposals 对应一个尺度因子。
+            [np.full(proposal_rows, float(np.clip(factor, 0.86, 1.16)), dtype=np.float32) for factor in scale_factors]  # 尺度限在合法区间内。
+        ))
+        refine_evidence = score_shape_contours_on_backend(  # 一次合批对全部尺度候选打分，结果留在设备上。
             temporal_map,  # 证据图。
             all_states,  # 三尺度合并候选。
             self.template,  # 模板。
@@ -810,19 +924,38 @@ class ParticleShapeTracker:
         top_count = min(self.count, max(42, self.count // 5))  # 要拉回的候选数，至少 42 个，但不超过粒子总数。
         # 重定位候选的排序要围绕当前运动预测，而不是围绕一个陈旧的已确认点。
         # 这样既能保持运动平滑，又能让远处的背景轮廓付出很高代价。
-        distance_from_prediction = np.linalg.norm(  # 候选到预测中心的距离。
-            all_states[:, :2] - predicted_center, axis=1  # 二维距离。
+        distance_from_prediction = xp.linalg_norm(  # 候选到预测中心的距离。
+            xp.narrow(all_states, 1, 0, 2) - predicted_device, axis=1  # 二维距离。
         )
         ranking_scores = all_scores - 2.20 * (  # 排序得分 = 证据得分 - 平方距离惩罚。
             distance_from_prediction / max(prior_radius, 1.0)  # 归一化距离，下限防除零。
         ) ** 2
-        order = np.argsort(ranking_scores)[::-1]  # 排序得分降序索引。
+        order = xp.argsort(ranking_scores, descending=True)  # 排序得分降序索引。
+        best_slot = xp.stack([xp.argmax(ranking_scores)])  # 精扫集内最优候选索引，包成 (1,) 便于 take 出标量段。
+        best_snr = (  # 最优候选的信噪比（float64，与改造前 float(...) 的精度一致）。
+            xp.take(xp.astype(all_scores, xp.float64), best_slot) - control_median  # 最优得分减背景基线。
+        ) / control_sigma  # 除以鲁棒标准差。
+        # 本帧重定位的唯一一次批量 D2H：排序索引 + 精扫候选位置 + 最优信噪比 + 最优尺度。
+        # 候选位置只取 proposals 的一段（三个尺度段共用同一批位置），下载量从 720x6 降到 240x2 加几个标量。
+        payload = xp.concatenate([
+            xp.astype(order, xp.float64),  # 排序索引段。
+            xp.astype(xp.ravel(xp.narrow(proposals_device, 1, 0, 2)), xp.float64),  # 候选位置段（展平）。
+            best_snr,  # 信噪比标量。
+            xp.astype(xp.take(all_scales, best_slot), xp.float64),  # 最优尺度标量。
+        ])
+        host = xp.to_numpy(payload)  # 一次下载全部决策数据。
+        total_rows = proposal_rows * len(scale_factors)  # 精扫候选总数。
+        order_host = host[:total_rows].astype(np.int64)  # 排序索引（主存）。
+        positions_host = host[total_rows : total_rows + proposal_rows * 2].reshape(-1, 2).astype(np.float32)  # 候选位置（主存）。
+        best_snr_host = float(host[-2])  # 最优信噪比（主存）。
+        best_scale_host = float(host[-1])  # 最优尺度（主存）。
+        all_positions = np.tile(positions_host, (len(scale_factors), 1))  # 还原 all_states 的位置列，与设备侧逐行一致。
         selected: list[int] = []  # 已选中的候选索引。
         minimum_separation = self.template.nominal_size * 0.24  # 候选之间的最小间距，避免拉回一堆重复位姿。
-        for candidate in order:  # 按排序依次尝试选取。
+        for candidate in order_host:  # 按排序依次尝试选取。
             if all(  # 与所有已选候选的距离都达标准。
                 np.linalg.norm(  # 两点距离。
-                    all_states[candidate, :2] - all_states[chosen, :2]  # 当前候选 vs 已选候选。
+                    all_positions[candidate] - all_positions[chosen]  # 当前候选 vs 已选候选。
                 )
                 >= minimum_separation  # 不小于最小间距。
                 for chosen in selected  # 遍历已选集合。
@@ -832,108 +965,128 @@ class ParticleShapeTracker:
                     break  # 提前结束循环。
         if len(selected) < top_count:  # 去重后不够 top_count 个。
             used = set(selected)  # 已用索引集合。
-            selected.extend(int(item) for item in order if int(item) not in used)  # 按排序补齐剩下的名额。
-        top = np.asarray(selected[:top_count], dtype=np.int32)  # 最终拉回的候选索引。
-        replace = np.argsort(self.weights)[:top_count]  # 权重最低的 top_count 个粒子被替换。
-        self.states[replace] = all_states[top]  # 用高分候选替换低权重粒子的状态。
-        particle_evidence.scores[replace] = all_scores[top]  # 同步替换得分。
-        particle_evidence.coverage[replace] = all_coverages[top]  # 同步替换覆盖率。
-        self.weights[replace] = np.median(self.weights)  # 新粒子给中位数权重，避免它们直接主导。
-        best = int(np.argmax(ranking_scores))  # 精扫集内最优候选索引。
-        best_snr = (float(all_scores[best]) - control_median) / control_sigma  # 最优候选的信噪比。
-        if best_snr >= 4.0:  # 信噪比足够高才相信它的尺度。
+            selected.extend(int(item) for item in order_host if int(item) not in used)  # 按排序补齐剩下的名额。
+        top = np.asarray(selected[:top_count], dtype=np.int64)  # 最终拉回的候选索引。
+        replace = xp.narrow(xp.argsort(self.weights), 0, 0, top_count)  # 权重最低的 top_count 个粒子被替换。
+        weight_median = xp.median(self.weights)  # 新粒子给中位数权重，必须在覆写之前算出来。
+        replaced_weights = xp.take(self.weights, replace)  # 被替换粒子的旧权重，只当 zeros_like 的形状/dtype 模板用。
+        self.states = xp.put_rows(self.states, replace, xp.take(all_states, top))  # 用高分候选替换低权重粒子的状态。
+        particle_scores = xp.put_rows(particle_scores, replace, xp.take(all_scores, top))  # 同步替换得分。
+        particle_coverage = xp.put_rows(particle_coverage, replace, xp.take(all_coverages, top))  # 同步替换覆盖率。
+        self.weights = xp.put_rows(self.weights, replace, xp.zeros_like(replaced_weights) + weight_median)  # 新粒子给中位数权重，避免它们直接主导。
+        if best_snr_host >= 4.0:  # 信噪比足够高才相信它的尺度。
             self.scale = float(  # 尺度低通滤波。
-                np.clip(0.90 * self.scale + 0.10 * all_scales[best], 0.86, 1.16)  # 90% 保留旧值 + 10% 吸收测量，并限制上下限。
+                np.clip(0.90 * self.scale + 0.10 * best_scale_host, 0.86, 1.16)  # 90% 保留旧值 + 10% 吸收测量，并限制上下限。
             )
-            self._apply_bounds(self.states)  # 尺度变化后边界也变，重新施加约束。
+            self.states = self._apply_bounds(self.states)  # 尺度变化后边界也变，重新施加约束。
         self.frames_since_relocation = 0  # 重定位完成，冷却计数归零。
+        return particle_scores, particle_coverage  # 返回可能被覆写过的得分与覆盖率。
 
-    def observe_border(self, temporal_map: np.ndarray) -> bool:
-        """弱测量：目标已透明，只能靠时序残差证据加权。返回本帧估计是否可靠。"""
+    def observe_border(self, temporal_map) -> bool:
+        """弱测量：目标已透明，只能靠时序残差证据加权。返回本帧估计是否可靠。
 
-        # 把推进后的状态先存一份作为回滚点。纹理丰富的场景里经常存在
-        # 另一条更强的轮廓；不能让单独一帧把跟踪器「传送」过去。
-        predicted_states = self.states.copy()  # 回滚用状态快照。
-        predicted_weights = self.weights.copy()  # 回滚用权重快照。
-        predicted_scale = self.scale  # 回滚用尺度快照。
-        predicted_center, _, _ = self.estimate()  # 推进后的预测中心，作为运动先验的参考点。
-        particle_evidence = score_shape_contours(  # 给当前全部粒子打分。
-            temporal_map, self.states, self.template, self.scale, self.play_height, self.backend  # 证据图、状态、模板、尺度、有效高度与打分后端。
-        )
-        control_count = self.control_count  # 对照组数量：随机位姿，用于估计背景得分分布。
-        controls = np.zeros((control_count, 6), dtype=np.float32)  # 对照组状态矩阵。
-        margin = self.template.nominal_size * 0.50  # 与 _apply_bounds 一致的边距。
-        controls[:, 0] = self.rng.uniform(margin, self.frame_width - margin, control_count)  # 随机 x。
-        controls[:, 1] = self.rng.uniform(margin, self.play_height - margin, control_count)  # 随机 y。
-        controls[:, 4] = self.rng.uniform(  # 随机角度，铺满对称周期域。
-            0.0, self.template.symmetry_period, control_count  # 角度上下限。
-        )
-        scale_factors = (0.90, 1.0, 1.10)  # 对照组与重定位都跑三个尺度。
-        # 粒子 + 对照组×3 尺度合并成一次打分：显卡上加大 batch 几乎免费，CPU 上也省掉多次函数调用与证据图重复处理。
-        batch_states = np.concatenate(  # 合并状态：粒子在前、对照组按尺度重复三次在后。
-            [self.states] + [controls] * len(scale_factors)
-        ).astype(np.float32)  # 统一精度。
-        batch_scales = np.concatenate(  # 合并尺度：粒子段用当前估计尺度，对照组三段逐尺度铺开。
-            [np.full(len(self.states), self.scale, dtype=np.float32)]  # 粒子段。
-            + [np.full(control_count, factor, dtype=np.float32) for factor in scale_factors]  # 对照组三段。
-        )
-        batch_evidence = score_shape_contours(  # 一次合批打分。
-            temporal_map, batch_states, self.template, batch_scales, self.play_height, self.backend  # 合并后的状态与逐假设尺度。
-        )
-        particle_evidence = ShapeEvidence(  # 拆回粒子段得分，保持原有变量语义。
-            batch_evidence.scores[: len(self.states)],  # 前 count 个是粒子。
-            batch_evidence.coverage[: len(self.states)],  # 覆盖率同段。
-        )
-        control_scores = batch_evidence.scores[len(self.states):]  # 其余是三个尺度段的对照组得分（拼接顺序与旧版一致）。
-        control_median = float(np.median(control_scores))  # 对照组得分中位数，作为背景基线。
-        control_mad = float(np.median(np.abs(control_scores - control_median)))  # 中位数绝对偏差。
-        control_sigma = max(0.12, 1.4826 * control_mad)  # 鲁棒标准差，下限 0.12 避免除零放大。
+        全部向量运算都在后端设备上完成，整帧只有一次批量 D2H：把加权中心、加权得分/覆盖率、
+        信噪比、证据置信度、修正幅度与有效样本数攒成一个 float64 张量一次取回，之后的可靠性判定、
+        回滚与簿记全在 CPU 上跑（都是标量分支，放到设备上没有意义）。触发全局重定位的帧会额外
+        多两次 D2H（运动先验 + 精扫决策），但重定位本身有冷却限频。
+        """
 
-        if (  # 置信度偏低或已不是刚刚可靠，且冷却期已满：启动两级粗到细全局重定位。
-            self.confidence < 0.56 or self.frames_since_reliable > 0
-        ) and self.frames_since_relocation >= self.relocation_cooldown:  # 限频：避免透明阶段每帧都花几十毫秒重定位。
-            self._relocate(  # 两级粗到细重定位。
-                temporal_map, particle_evidence, predicted_center, control_median, control_sigma  # 证据、粒子得分、预测中心与对照统计。
+        xp = self.xp  # 数组门面。
+        with xp.inference():  # 显卡侧关掉自动求导。
+            # 把推进后的状态先存一份作为回滚点。纹理丰富的场景里经常存在
+            # 另一条更强的轮廓；不能让单独一帧把跟踪器「传送」过去。
+            predicted_states = xp.clone(self.states)  # 回滚用状态快照。
+            predicted_weights = xp.clone(self.weights)  # 回滚用权重快照。
+            predicted_scale = self.scale  # 回滚用尺度快照。
+            # 推进后的预测中心，作为运动先验的参考点。全程留在设备上（float32，与改造前
+            # estimate() 的返回精度一致），避开一次只为拿两个浮点数的主存同步。
+            predicted_device = xp.astype(self._estimate_device()[0], xp.float32)
+            control_count = self.control_count  # 对照组数量：随机位姿，用于估计背景得分分布。
+            margin = self.template.nominal_size * 0.50  # 与 _apply_bounds 一致的边距。
+            controls = np.zeros((control_count, 6), dtype=np.float32)  # 对照组状态矩阵（随机数只在 NumPy 侧生成）。
+            controls[:, 0] = self.rng.uniform(margin, self.frame_width - margin, control_count)  # 随机 x。
+            controls[:, 1] = self.rng.uniform(margin, self.play_height - margin, control_count)  # 随机 y。
+            controls[:, 4] = self.rng.uniform(  # 随机角度，铺满对称周期域。
+                0.0, self.template.symmetry_period, control_count  # 角度上下限。
             )
+            scale_factors = (0.90, 1.0, 1.10)  # 对照组与重定位都跑三个尺度。
+            control_states = xp.asarray(controls)  # 对照组一次上传（3 个尺度段共用同一份）。
+            # 粒子 + 对照组×3 尺度合并成一次打分：显卡上加大 batch 几乎免费，CPU 上也省掉多次函数调用与证据图重复处理。
+            batch_states = xp.concatenate(  # 合并状态：粒子在前、对照组按尺度重复三次在后。
+                [self.states] + [control_states] * len(scale_factors), axis=0  # 拼接顺序与改造前一致。
+            )
+            batch_scales = xp.asarray(np.concatenate(  # 合并尺度：粒子段用当前估计尺度，对照组三段逐尺度铺开。
+                [np.full(self.count, self.scale, dtype=np.float32)]  # 粒子段。
+                + [np.full(control_count, factor, dtype=np.float32) for factor in scale_factors]  # 对照组三段。
+            ))
+            batch_evidence = score_shape_contours_on_backend(  # 一次合批打分，结果留在设备上。
+                temporal_map, batch_states, self.template, batch_scales, self.play_height, self.backend  # 合并后的状态与逐假设尺度。
+            )
+            particle_scores = xp.narrow(batch_evidence.scores, 0, 0, self.count)  # 前 count 个是粒子（视图，重定位会就地覆写）。
+            particle_coverage = xp.narrow(batch_evidence.coverage, 0, 0, self.count)  # 覆盖率同段。
+            control_scores = xp.narrow(batch_evidence.scores, 0, self.count, None)  # 其余是三个尺度段的对照组得分（拼接顺序与旧版一致）。
+            control_median = xp.astype(xp.median(control_scores), xp.float64)  # 对照组得分中位数，作为背景基线。
+            control_mad = xp.astype(xp.median(xp.abs(control_scores - control_median)), xp.float64)  # 中位数绝对偏差。
+            control_sigma = xp.clip(control_mad * 1.4826, 0.12, None)  # 鲁棒标准差，下限 0.12 避免除零放大。
 
-        robust_z = (particle_evidence.scores - control_median) / control_sigma  # 每个粒子的鲁棒 z 分数。
-        likelihood = np.exp(np.clip(0.48 * robust_z, -3.5, 3.8))  # z 分数转似然，上下限截断避免指数爆炸/消失。
-        likelihood *= 0.35 + 0.65 * np.clip(particle_evidence.coverage, 0.0, 1.0)  # 覆盖率调制似然：边界命中越多越可信。
-        continuity_sigma = max(  # 运动连续性先验的标准差：丢失越久容忍越宽。
-            10.0,  # 下限 10 像素。
-            self.template.nominal_size  # 随形状尺度自适应。
-            * (0.16 + 0.035 * min(self.frames_since_reliable, 12)),  # 基础 0.16，每丢失一帧 +0.035，上限 12 帧。
-        )
-        prior_distance = np.linalg.norm(  # 粒子到预测中心的距离。
-            self.states[:, :2] - predicted_center, axis=1  # 二维距离。
-        )
-        motion_prior = np.exp(  # 运动先验：离预测越远可能性越低。
-            -0.5 * (prior_distance / max(continuity_sigma, 1.0)) ** 2  # 高斯衰减。
-        )
-        prior_floor = min(  # 先验下限：丢失很久后必须允许「完全不看运动先验」的重定位。
-            0.18, 0.015 + 0.012 * min(self.frames_since_reliable, 14)  # 从 0.015 逐步括到上限 0.18。
-        )
-        likelihood *= prior_floor + (1.0 - prior_floor) * motion_prior  # 先验按下限混合，保留一定的全局探索能力。
-        self.weights *= likelihood + 1e-10  # 权重乘似然，加极小量避免全零。
-        self._normalize_weights()  # 归一化。
-        weighted_score = float(np.sum(self.weights * particle_evidence.scores))  # 加权证据得分。
-        weighted_coverage = float(np.sum(self.weights * particle_evidence.coverage))  # 加权覆盖率。
-        border_snr = (weighted_score - control_median) / control_sigma  # 相对对照组的信噪比。
-        evidence_confidence = float(  # 证据置信度：信噪比与覆盖率两项相乘，缺一不可。
-            np.clip((border_snr - 1.15) / 4.5, 0.0, 1.0)  # 信噪比项：1.15 起步，4.5 跨度。
-            * np.clip((weighted_coverage - 0.16) / 0.50, 0.0, 1.0)  # 覆盖率项：0.16 起步，0.50 跨度。
-        )
-        self.last_border_score = weighted_score  # 记录得分供诊断。
-        self.last_border_snr = border_snr  # 记录信噪比供诊断。
-        center, _, _ = self.estimate()  # 加权后的新中心。
-        correction = float(np.linalg.norm(center - predicted_center))  # 本帧修正幅度。
-        maximum_correction = max(  # 允许的最大单帧修正。
-            20.0, self.template.nominal_size * self.max_correction_ratio  # 下限 20 像素，否则按标称尺寸比例。
-        )
-        evidence_confidence *= math.exp(  # 修正幅度越大，置信度越高扣（软惩罚）。
-            -0.5 * (correction / max(maximum_correction * 0.75, 1.0)) ** 2  # 高斯惩罚，标准差为上限的 75%。
-        )
-        if correction > maximum_correction:  # 单帧修正超限：认定这一帧证据不可信，整体回滚。
+            if (  # 置信度偏低或已不是刚刚可靠，且冷却期已满：启动两级粗到细全局重定位。
+                self.confidence < 0.56 or self.frames_since_reliable > 0
+            ) and self.frames_since_relocation >= self.relocation_cooldown:  # 限频：避免透明阶段每帧都花几十毫秒重定位。
+                particle_scores, particle_coverage = self._relocate(  # 两级粗到细重定位，拿回可能被覆写的粒子得分与覆盖率。
+                    temporal_map, particle_scores, particle_coverage, control_median, control_sigma  # 证据、粒子得分/覆盖率与对照统计。
+                )
+
+            robust_z = (xp.astype(particle_scores, xp.float64) - control_median) / control_sigma  # 每个粒子的鲁棒 z 分数。
+            likelihood = xp.exp(xp.clip(0.48 * robust_z, -3.5, 3.8))  # z 分数转似然，上下限截断避免指数爆炸/消失。
+            # 覆盖率调制似然：边界命中越多越可信。刻意先在 float32 里算完再放宽到 float64，与改造前的提升次序一致。
+            likelihood = likelihood * xp.astype(0.35 + 0.65 * xp.clip(particle_coverage, 0.0, 1.0), xp.float64)
+            continuity_sigma = max(  # 运动连续性先验的标准差：丢失越久容忍越宽。
+                10.0,  # 下限 10 像素。
+                self.template.nominal_size  # 随形状尺度自适应。
+                * (0.16 + 0.035 * min(self.frames_since_reliable, 12)),  # 基础 0.16，每丢失一帧 +0.035，上限 12 帧。
+            )
+            prior_distance = xp.linalg_norm(  # 粒子到预测中心的距离。
+                xp.narrow(self.states, 1, 0, 2) - predicted_device, axis=1  # 二维距离（重定位可能已改写 states，因此放在它后面）。
+            )
+            motion_prior = xp.exp(  # 运动先验：离预测越远可能性越低。
+                -0.5 * (prior_distance / max(continuity_sigma, 1.0)) ** 2  # 高斯衰减。
+            )
+            prior_floor = min(  # 先验下限：丢失很久后必须允许「完全不看运动先验」的重定位。
+                0.18, 0.015 + 0.012 * min(self.frames_since_reliable, 14)  # 从 0.015 逐步括到上限 0.18。
+            )
+            likelihood = likelihood * (prior_floor + (1.0 - prior_floor) * motion_prior)  # 先验按下限混合，保留一定的全局探索能力。
+            self.weights = self.weights * (likelihood + 1e-10)  # 权重乘似然，加极小量避免全零。
+            self._normalize_weights()  # 归一化。
+            weighted_score = xp.sum(self.weights * xp.astype(particle_scores, xp.float64))  # 加权证据得分。
+            weighted_coverage = xp.sum(self.weights * xp.astype(particle_coverage, xp.float64))  # 加权覆盖率。
+            border_snr = (weighted_score - control_median) / control_sigma  # 相对对照组的信噪比。
+            evidence_confidence = (  # 证据置信度：信噪比与覆盖率两项相乘，缺一不可。
+                xp.clip((border_snr - 1.15) / 4.5, 0.0, 1.0)  # 信噪比项：1.15 起步，4.5 跨度。
+                * xp.clip((weighted_coverage - 0.16) / 0.50, 0.0, 1.0)  # 覆盖率项：0.16 起步，0.50 跨度。
+            )
+            center = xp.astype(self._estimate_device()[0], xp.float32)  # 加权后的新中心。
+            correction = xp.astype(xp.linalg_norm(center - predicted_device), xp.float64)  # 本帧修正幅度。
+            maximum_correction = max(  # 允许的最大单帧修正。
+                20.0, self.template.nominal_size * self.max_correction_ratio  # 下限 20 像素，否则按标称尺寸比例。
+            )
+            evidence_confidence = evidence_confidence * xp.exp(  # 修正幅度越大，置信度扣得越狠（软惩罚）。
+                -0.5 * (correction / max(maximum_correction * 0.75, 1.0)) ** 2  # 高斯惩罚，标准差为上限的 75%。
+            )
+            effective = 1.0 / xp.sum(self.weights * self.weights)  # 有效样本数（Kish），一并下载给重采样判定复用，省一次同步。
+            summary = xp.to_numpy(xp.concatenate([  # 本帧唯一一次批量 D2H：8 个决策量一次取回。
+                xp.astype(center, xp.float64),  # 加权中心 (2,)。
+                xp.stack([weighted_score, weighted_coverage, border_snr, evidence_confidence, correction, effective]),  # 六个标量。
+            ]))
+            center_host = summary[:2].astype(np.float32)  # 加权中心（主存，float32 与改造前一致）。
+            weighted_score_host = float(summary[2])  # 加权证据得分（主存）。
+            weighted_coverage_host = float(summary[3])  # 加权覆盖率（主存）。
+            border_snr_host = float(summary[4])  # 信噪比（主存）。
+            evidence_confidence_host = float(summary[5])  # 证据置信度（主存）。
+            correction_host = float(summary[6])  # 修正幅度（主存）。
+            effective_host = float(summary[7])  # 有效样本数（主存）。
+        self.last_border_score = weighted_score_host  # 记录得分供诊断。
+        self.last_border_snr = border_snr_host  # 记录信噪比供诊断。
+        if correction_host > maximum_correction:  # 单帧修正超限：认定这一帧证据不可信，整体回滚。
             self.states = predicted_states  # 恢复状态。
             self.weights = predicted_weights  # 恢复权重。
             self.scale = predicted_scale  # 恢复尺度。
@@ -941,20 +1094,20 @@ class ParticleShapeTracker:
             self.confidence *= 0.94  # 置信度衰减。
             self.frames_since_reliable += 1  # 不可靠帧数 +1。
             return False  # 返回不可靠。
-        reliable = evidence_confidence >= 0.18  # 置信度过阈即认为本帧可靠。
+        reliable = evidence_confidence_host >= 0.18  # 置信度过阈即认为本帧可靠。
         if reliable:  # 可靠分支。
-            self.confidence = 0.40 * self.confidence + 0.60 * evidence_confidence  # 置信度低通吸收证据置信度。
-            if evidence_confidence >= 0.72:  # 强可靠：才有资格推进「已确认可靠中心」。
+            self.confidence = 0.40 * self.confidence + 0.60 * evidence_confidence_host  # 置信度低通吸收证据置信度。
+            if evidence_confidence_host >= 0.72:  # 强可靠：才有资格推进「已确认可靠中心」。
                 if (  # 与待定中心的距离足够近，说明连续多帧指向同一位置。
-                    np.linalg.norm(center - self.pending_reliable_center)  # 两者距离。
+                    np.linalg.norm(center_host - self.pending_reliable_center)  # 两者距离。
                     <= self.template.nominal_size * 0.70  # 阈值为标称尺寸的 70%。
                 ):
                     self.pending_reliable_hits += 1  # 命中次数 +1。
                 else:
                     self.pending_reliable_hits = 1  # 位置跳了，重新开始计数。
-                self.pending_reliable_center = center.copy()  # 更新待定中心。
+                self.pending_reliable_center = center_host.copy()  # 更新待定中心。
                 if self.pending_reliable_hits >= 4:  # 连续 4 帧强可靠且位置一致才正式确认。
-                    self.last_reliable_center = center.copy()  # 更新已确认可靠中心。
+                    self.last_reliable_center = center_host.copy()  # 更新已确认可靠中心。
                     self.frames_since_reliable = 0  # 不可靠帧数归零。
                 else:
                     self.frames_since_reliable += 1  # 尚未达 4 次，仍算不可靠。
@@ -965,43 +1118,61 @@ class ParticleShapeTracker:
             self.pending_reliable_hits = 0  # 清零待定命中。
             self.confidence *= 0.965  # 置信度缓慢衰减。
             self.frames_since_reliable += 1  # 不可靠帧数 +1。
-        self._resample_if_needed(force=reliable)  # 可靠时强制重采样以集中粒子，否则按需。
+        self._resample_if_needed(force=reliable, effective=effective_host)  # 可靠时强制重采样以集中粒子，否则按需。
         return reliable  # 返回本帧是否可靠。
 
     def _normalize_weights(self) -> None:
-        """归一化权重；全部退化时重置为均匀分布，避免数值崩溃。"""
+        """归一化权重；全部退化时重置为均匀分布，避免数值崩溃。
 
-        total = float(np.sum(self.weights))  # 权重总和。
-        if not np.isfinite(total) or total <= 1e-18:  # 出现 NaN/Inf 或权重全部衰减到 0。
-            self.weights.fill(1.0 / self.count)  # 重置为均匀分布，等价于放弃当前假设重新开始。
-        else:
-            self.weights /= total  # 正常归一化。
+        写成无分支的 ``where`` 形式：退化判定需要读回权重和，那就等于每帧多一次主存同步。
+        两个分支都算一遍再由 ``where`` 选，代价是几次千元级的逐元素运算，换来判定完全留在设备上。
+        """
 
-    def _resample_if_needed(self, force: bool) -> None:
-        """系统重采样：有效样本数过低或强制时重建粒子群，并对一部分粒子加抖动。"""
+        xp = self.xp  # 数组门面。
+        total = xp.sum(self.weights)  # 权重总和（0 维）。
+        # NaN/Inf 过不了 <= 比较，先把它换成 0 让它落进退化分支，语义与改造前的 not np.isfinite(total) 一致。
+        finite_total = xp.where(xp.isfinite(total), total, xp.zeros_like(total))  # 非有限值归零。
+        degenerate = finite_total <= 1e-18  # 出现 NaN/Inf 或权重全部衰减到 0。
+        safe_total = xp.where(degenerate, xp.full_like(total, 1.0), total)  # 退化时用一个安全分母占位，它的结果会被下面的 where 丢弃。
+        uniform = xp.full_like(self.weights, 1.0 / self.count)  # 均匀分布，等价于放弃当前假设重新开始。
+        self.weights = xp.where(degenerate, uniform, self.weights / safe_total)  # 退化走均匀重置，否则正常归一化。
 
-        effective = 1.0 / float(np.sum(self.weights**2))  # 有效样本数（Kish 有效样本量）。
+    def _resample_if_needed(self, force: bool, effective: float | None = None) -> None:
+        """系统重采样：有效样本数过低或强制时重建粒子群，并对一部分粒子加抖动。
+
+        ``effective`` 由调用方传入时可以省掉一次主存同步（observe_border 已经把它并进当帧的批量下载），
+        传 None 则就地算并下载。重采样索引在设备上用 cumsum + searchsorted 求出，
+        随机数（分层位置与抖动噪声）仍全部在 NumPy 侧生成，以保住可复现契约。
+        """
+
+        xp = self.xp  # 数组门面。
+        if effective is None:  # 调用方没有预算好有效样本数。
+            effective = float(xp.to_numpy(1.0 / xp.sum(self.weights * self.weights)))  # 有效样本数（Kish），一次 D2H 取回标量。
         if not force and effective >= self.count * 0.56:  # 未强制且粒子多样性还够。
             return  # 不重采样，保留现有假设分布。
         positions = (self.rng.random() + np.arange(self.count)) / self.count  # 系统重采样的均匀分层位置。
-        cumulative = np.cumsum(self.weights)  # 权重累积分布。
-        indexes = np.searchsorted(cumulative, positions, side="right")  # 查找每个分层位置对应的粒子索引。
-        indexes = np.clip(indexes, 0, self.count - 1)  # 防止浮点误差越界。
-        self.states = self.states[indexes].copy()  # 按权重重建粒子群（拷贝避免视图共享）。
-        self.weights.fill(1.0 / self.count)  # 重采样后权重重新均匀。
+        cumulative = xp.cumsum(self.weights)  # 权重累积分布。
+        indexes = xp.searchsorted(cumulative, xp.asarray(positions), side="right")  # 查找每个分层位置对应的粒子索引。
+        indexes = xp.clip(indexes, 0, self.count - 1)  # 防止浮点误差越界。
+        self.states = xp.take(self.states, indexes, axis=0)  # 按权重重建粒子群（take 返回新数组，不与原状态共享存储）。
+        self.weights = xp.full_like(self.weights, 1.0 / self.count)  # 重采样后权重重新均匀。
         jitter_count = max(10, self.count // 16)  # 需要抖动的粒子数，保留探索能力。
         chosen = self.rng.choice(self.count, jitter_count, replace=False)  # 不重复地选出抖动粒子。
         uncertainty = 1.0 - float(np.clip(self.confidence, 0.0, 1.0))  # 不确定度：置信度低时抖动更大。
-        self.states[chosen, :2] += self.rng.normal(  # 位置抖动。
+        # 抖动先在主存侧散播成 (count,6) 的整块增量再上传：显卡上不做花式索引赋值，
+        # 且 float64 增量与 float32 状态相加后只舍入一次，与改造前逐列就地 += 的精度语义一致。
+        delta = np.zeros((self.count, 6), dtype=np.float64)  # 抖动增量容器。
+        delta[chosen, :2] = self.rng.normal(  # 位置抖动。
             0.0,  # 零均值。
             1.0 + self.template.nominal_size * 0.10 * uncertainty,  # 基准 1 像素 + 随不确定度放大的形状尺度项。
             size=(jitter_count, 2),  # 二维噪声。
         )
-        self.states[chosen, 2:4] += self.rng.normal(  # 速度抖动。
+        delta[chosen, 2:4] = self.rng.normal(  # 速度抖动。
             0.0, 0.8 + uncertainty, size=(jitter_count, 2)  # 基准 0.8。
         )
-        self.states[chosen, 4] += self.rng.normal(  # 角度抖动。
+        delta[chosen, 4] = self.rng.normal(  # 角度抖动。
             0.0, 2.0 + min(10.0, self.template.symmetry_period * 0.10) * uncertainty,  # 基准 2 度，周期项上限 10。
             jitter_count,  # 一维噪声。
         )
-        self._apply_bounds(self.states)  # 抖动后重新施加约束。
+        self.states = xp.astype(self.states + xp.asarray(delta), xp.float32)  # 一次上传并叠加抖动，状态回到 float32。
+        self.states = self._apply_bounds(self.states)  # 抖动后重新施加约束。

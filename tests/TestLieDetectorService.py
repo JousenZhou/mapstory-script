@@ -587,15 +587,15 @@ class TestLieDetectorService(unittest.TestCase):
         self.assertEqual("solved", outcome)  # 场景结束 -> 结束原因标记为 solved。
 
     @unittest.skipUnless(service_module.LIE_SOLVER_AVAILABLE, "liedetector optical-flow solver unavailable")
-    def test_solve_writes_raw_frames_to_recorder(self):
-        # 解题循环每帧把整帧写给录像器（录像器按触发时确定的区域框内部裁剪），frame 全程干净供验证页签复算。
+    def test_solve_does_not_write_frames_recorder_self_captures(self):
+        # 录像改由录像器的独立采集线程按真 30FPS 抓帧（_start_recorder 传 capture=self._capture）：解题循环不再逐帧 write，避免与自采集重复喂帧。
         frame = np.full((300, 400, 3), 20, dtype=np.uint8)
         region = SimpleNamespace(x=100, y=50, width=200, height=150)
         ended = SimpleNamespace(source=service_module.SOURCE_SCENE_ENDED, center=None, contour=None,
                                 confidence=0.0, border_snr=0.0, tracker_alive=False, white_candidates=0,
                                 flow_residual=None)  # 首轮即场景结束，跑一帧就退出。
         fake_session = SimpleNamespace(reset=lambda w, h: None, update=lambda crop, fps: ended)
-        recorder = MagicMock()  # 假录像器，只验证 write 按帧被调用。
+        recorder = MagicMock()  # 假录像器：验证解题循环不再直接 write。
         self.service._recorder = recorder
         with patch.object(self.service, "_ensure_in_front"), \
                 patch.object(service_module, "ShapeTrackSession", return_value=fake_session), \
@@ -606,8 +606,7 @@ class TestLieDetectorService(unittest.TestCase):
                 patch.object(self.service, "_capture", return_value=None):
             outcome = self.service._solve(frame, "测谎触发", "测谎坐标框", 0.7)
         self.assertEqual("solved", outcome)  # 场景结束退出。
-        recorder.write.assert_called_once()  # 写了一帧。
-        self.assertIs(frame, recorder.write.call_args[0][0])  # 写入的是未裁剪的原始整帧（与触发帧同一对象）。
+        recorder.write.assert_not_called()  # 解题循环不再逐帧写录像（改由录像器自采集线程负责）。
 
     # ------------------------------------------------------------------ 解测谎结算
 
@@ -779,6 +778,7 @@ class TestLieDetectorService(unittest.TestCase):
         self.assertEqual((300, 400), tuple(shape_arg), "分辨率取触发帧 (高, 宽)")
         self.assertEqual("ultra", meta_arg["tier"], "元数据带精度档")
         self.assertEqual((100, 50, 200, 150), crop_arg, "按坐标框推导裁剪区域 (x,y,w,h)")
+        self.assertEqual(self.service._capture, fake_rec.start.call_args[1].get("capture"), "起流应传 capture=self._capture 供录像器独立 30FPS 采集")
         self.assertIs(fake_rec, self.service._recorder, "起录成功后记录录像器")
 
     def test_start_recorder_crop_none_when_region_missing(self):

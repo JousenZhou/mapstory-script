@@ -310,8 +310,8 @@ class LieDetectorService:  # 独立测谎监控服务：后台守护线程值守
                 crop = None  # 退回录整帧。
         try:  # 录像为最佳努力能力，启动失败不得拖垮解测谎。
             recorder = LieRecorder()  # 一局一个录像器实例。
-            recorder.start(frame.shape[:2], {"score": score, "tier": precision}, crop)  # 起流：分辨率取触发帧，元数据带触发分与精度档，裁剪区域取【测谎坐标框】。
-            self._recorder = recorder  # 记录，供延迟等待与解题循环写帧、finally 收尾。
+            recorder.start(frame.shape[:2], {"score": score, "tier": precision}, crop, capture=self._capture)  # 起流：分辨率取触发帧，元数据带触发分与精度档，裁剪区域取【测谎坐标框】；传 capture 让录像器起独立 30FPS 采集线程（与被光流拖慢的解题循环解耦，录像为真 30FPS）。
+            self._recorder = recorder  # 记录：录像器自采集线程按 30FPS 拓帧覆盖触发->解除->结算全程，finally 收尾。
         except Exception as e:  # 录像启动异常。
             logger.warning(f"Lie record start failed: {e}. 测谎录像启动失败，本局不录，解题照常进行。")
             self._recorder = None
@@ -527,8 +527,7 @@ class LieDetectorService:  # 独立测谎监控服务：后台守护线程值守
             self._set_status(f"delaying {math.ceil(remaining)}s")  # 倒计时按整秒变化，既能在日志看到进度又不会每帧刷屏。
             frame = self._capture()  # 延迟期也持续取帧，保证实时画面不冻结。
             if frame is not None:  # 取到画面才做复检与推送。
-                if self._recorder is not None:  # 延迟期也录进「触发->解除」全过程，覆盖弹窗展开与图形起势。
-                    self._recorder.write(frame)  # 非阻塞入队，队列满即丢帧，绝不阻塞等待循环。
+                # 延迟期录像由录像器自采集线程按真 30FPS 覆盖「触发->解除」全过程（见 _start_recorder 的 capture=self._capture），此处不再逐帧写。
                 found = self._find_trigger(frame, trigger_name, threshold)  # 复检触发标注是否仍在画面上。
                 if found is None:  # 本帧未命中：可能只是弹窗拖动或分数抖动造成的瞬时丢失，先容忍。
                     lost_ticks += 1  # 累计连续丢失帧数。
@@ -644,8 +643,7 @@ class LieDetectorService:  # 独立测谎监控服务：后台守护线程值守
                 mouse_pos = None  # 鼠标目标点重新校准。
             else:  # 区域位置稳定。
                 region = new_region  # 刷新区域（尺寸可能微调）。
-            if self._recorder is not None:  # 写整帧给录像器：录像器按触发时确定的【测谎坐标框】内部裁剪，frame 全程干净，可直接供验证页签复算。
-                self._recorder.write(frame)  # 非阻塞入队，队列满即丢帧，绝不回压 30FPS 求解。
+            # 录像由录像器的独立采集线程按真 30FPS 抓帧（见 _start_recorder 的 capture=self._capture），解题循环不再逐帧写，避免与自采集重复喂帧。
             crop = frame[region[1]:region[1] + region[3], region[0]:region[0] + region[2]]  # 裁出谎言检测图形区域。
             result = session.update(crop, fps)  # 喂入光流粒子滤波会话，返回单帧跟踪结果（区域局部坐标）。
             if result.tracker_alive and result.center is not None:  # 有有效跟踪输出时才移动光标。
@@ -677,8 +675,7 @@ class LieDetectorService:  # 独立测谎监控服务：后台守护线程值守
                 return "aborted"  # 录像标记为急停。
             frame = self._capture()  # 取一帧画面。
             if frame is not None:  # 取到画面才做匹配与推送。
-                if self._recorder is not None:  # 结算期也录进“触发->解除->结算”全过程。
-                    self._recorder.write(frame)  # 非阻塞入队，队列满即丢帧。
+                # 结算期录像同样由录像器自采集线程按真 30FPS 覆盖“触发->解除->结算”全过程，此处不再逐帧写。
                 success_box = self._find_trigger(frame, LIE_SUCCESS_TEMPLATE, threshold)  # 全屏匹配【测谎成功】。
                 self._update_vision(self.draw_lie_annotations(frame, success_box, None))  # 把成功标注框选推送到实时画面（未命中不画）。
                 if success_box is not None:  # 5s 内出现【测谎成功】：判定成功，进点击确定收尾。
@@ -704,8 +701,7 @@ class LieDetectorService:  # 独立测谎监控服务：后台守护线程值守
                 if time.time() >= deadline:  # 超时兜底。
                     break
                 continue  # 下一拍。
-            if self._recorder is not None:  # 确认期也录进全过程。
-                self._recorder.write(frame)  # 非阻塞入队。
+            # 确认期录像同样由录像器自采集线程按真 30FPS 覆盖全过程，此处不再逐帧写。
             success_box = self._find_trigger(frame, LIE_SUCCESS_TEMPLATE, threshold)  # 重新匹配【测谎成功】。
             if success_box is None:  # 【测谎成功】已消失：测谎流程结束（成功）。
                 logger.info("Lie success mark gone, settle done (SUCCESS). 【测谎成功】已消失，测谎流程结束（成功）。")

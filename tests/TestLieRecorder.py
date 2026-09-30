@@ -84,8 +84,8 @@ class TestLieRecorder(unittest.TestCase):
         self.assertIn("score0.79", mp4s[0], "文件名应含触发分")
         self.assertIn("high", mp4s[0], "文件名应含精度档")
 
-    def test_slow_capture_is_padded_to_real_time(self):
-        # 采集慢于标称帧率时，写线程按采集时间戳用上一帧补齐，使录像时长≈真实时长（回放不被压缩加速）。
+    def test_slow_capture_writes_real_frames_without_padding(self):
+        # 采集慢于标称帧率时，写线程不再用上一帧补齐：帧数==实际采集次数（杜绝重复帧），真实慢帧率只记进边车 measured_fps。
         rec = LieRecorder()
         rec.start((60, 80), {"score": 0.5, "tier": "ultra"})
         if rec._writer is None:  # 本机 mp4v 编码器不可用。
@@ -98,9 +98,52 @@ class TestLieRecorder(unittest.TestCase):
         jsons = [n for n in os.listdir(self.tmp) if n.endswith(".json")]
         with open(os.path.join(self.tmp, jsons[0]), encoding="utf-8-sig") as f:
             data = json.load(f)
-        # 6 次采集横跨约 0.5s：补齐后帧数应显著多于 6，时长≈真实时长（远超未补齐的 6/30=0.2s）。
-        self.assertGreater(data["frames"], 6, "慢采集应补齐帧，帧数多于实际采集次数")
-        self.assertGreater(data["duration"], 6 / float(LIE_RECORD_FPS), "录像时长应≈真实采集时长，而非被压缩")
+        # 不补帧：写多少帧就存多少帧，帧数恒等于采集次数（旧版会补齐到远多于 6）。
+        self.assertEqual(6, data["frames"], "慢采集不再补帧，帧数应等于实际采集次数")
+        self.assertEqual(round(6 / float(LIE_RECORD_FPS), 3), data["duration"], "容器时长 = 帧数 / 标称帧率（不补帧后回放会变快）")
+        # measured_fps 应反映真实慢采集（明显低于标称 30fps），而非被补帧到 30。
+        self.assertIn("measured_fps", data, "边车应记录真实采集帧率 measured_fps")
+        self.assertGreater(data["measured_fps"], 0.0, "measured_fps 应为正")
+        self.assertLess(data["measured_fps"], float(LIE_RECORD_FPS), "慢采集时 measured_fps 应明显低于标称帧率")
+
+    def test_self_capture_records_frames_without_external_write(self):
+        # 自采集模式：start 传 capture 回调后，录像器起独立线程按 LIE_RECORD_FPS 拓帧写入，无需外部 write；
+        # 帧数随采集时间增长、measured_fps 接近标称（与慢采集补帧场景的 ~10fps 区分）。
+        rec = LieRecorder()
+        counter = {"n": 0}
+
+        def fake_capture():  # 每次返回一张互异纯色帧，模拟独立 30fps 采集。
+            counter["n"] += 1
+            return _frame(counter["n"] * 7, height=60, width=80)
+
+        rec.start((60, 80), {"score": 0.5, "tier": "extreme"}, None, capture=fake_capture)
+        if rec._writer is None:  # 本机 mp4v 编码器不可用。
+            rec.stop("solved")
+            self.skipTest("mp4v 编码器不可用，跳过真实录像产出用例")
+        time.sleep(0.5)  # 让采集线程独立跑约 0.5s（~15 帧@30fps）。
+        rec.stop("solved")
+        jsons = [n for n in os.listdir(self.tmp) if n.endswith(".json")]
+        with open(os.path.join(self.tmp, jsons[0]), encoding="utf-8-sig") as f:
+            data = json.load(f)
+        self.assertGreaterEqual(counter["n"], 5, "自采集线程应在 0.5s 内独立抓多帧")
+        self.assertGreaterEqual(data["frames"], 5, "写入帧数应随采集增长（无需外部 write）")
+        self.assertLessEqual(abs(data["frames"] - counter["n"]), 2, "写入帧数应≈采集次数（仅收尾竞态可能差 1~2 帧）")
+        self.assertGreater(data["measured_fps"], 12.0, "自采集按 30fps 节拍，真实帧率应接近标称（远高于慢采集的 ~10fps）")
+
+    def test_write_is_noop_in_self_capture_mode(self):
+        # 自采集模式下手动 write 应被忽略（录像只由采集线程驱动），避免与采集线程重复喂帧。
+        rec = LieRecorder()
+        rec.start((60, 80), {"score": 0.5, "tier": "high"}, None, capture=lambda: None)  # 采集恒返回 None：采集线程不产帧。
+        if rec._writer is None:  # 本机 mp4v 编码器不可用。
+            rec.stop("solved")
+            self.skipTest("mp4v 编码器不可用，跳过真实录像产出用例")
+        for i in range(5):
+            rec.write(_frame(i * 10, height=60, width=80))  # 自采集模式下这些 write 应全部空转。
+        rec.stop("solved")
+        jsons = [n for n in os.listdir(self.tmp) if n.endswith(".json")]
+        with open(os.path.join(self.tmp, jsons[0]), encoding="utf-8-sig") as f:
+            data = json.load(f)
+        self.assertEqual(0, data["frames"], "自采集模式下手动 write 应被忽略，帧数为 0")
 
     def test_outcome_is_recorded_in_sidecar(self):
         # 不同结束原因（gone/timeout/abandoned）都应如实写进边车 outcome 字段。

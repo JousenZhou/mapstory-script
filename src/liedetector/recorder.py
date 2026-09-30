@@ -2,9 +2,12 @@
 
 设计要点：
 - 常开：每次测谎触发都录，无需开关；滚动保留最近 LIE_RECORD_KEEP 组（mp4+json），旧的自动删除。
-- 绝不阻塞求解：录帧走「有界队列 + 独立写线程」，队列满即丢帧，30FPS 的解测谎主循环永不等录像。
-- 真实时间轴：重档解测谎时实际采集常慢于标称 30FPS（如 ultra 约 11FPS），写线程按每帧采集时间戳把帧落到
-  对应帧号，慢于标称处用上一帧补齐空档，使录像时长==真实时长，回放（验证页签按源帧率播放）不被压缩加速。
+- 绝不阻塞求解：录帧走「有界队列 + 独立写线程」，队列满即丢帧，解测谎主循环永不等录像。
+- 真 30FPS 独立采集、不补帧：解测谎的重档光流运算会把解题循环拖慢到远低于 30FPS（如 extreme 约 11FPS）。若照解题
+  循环逐帧录，每秒只有 ~11 张真实帧，按 30FPS 容器回放会被加速（不是游戏真实速度）；旧版曾用上一帧补齐到 30FPS，
+  但重复帧会让复算端相邻帧光流残差≈0、被误判「结算静止画面」而提前触发 scene_ended、目标框在视频中段消失。现改为
+  录像器自带独立采集线程，按 LIE_RECORD_FPS 真实节拍抓帧（与解题慢运算解耦）——录像为真 30FPS 的互异真实帧，容器
+  30FPS 回放即游戏真实速度且无重复帧。实际达成帧率记进边车 measured_fps（正常应≈30）。
 - 录【测谎区域标注】区域的原始像素（裁剪到区域、不叠加标注）：service 循环里的 frame 全程是 _capture
   返回的干净副本，叠加绘制都在 frame.copy() 上做；录像器按触发时确定的区域框裁剪每帧后入队，验证页签能拿它
   按同一套算法复算（裁剪录像无弹窗标题，复算探测不中即自动进裁剪模式，整帧作为图形区域）。
@@ -28,7 +31,7 @@ logger = Logger.get_logger(__name__)
 
 LIE_RECORD_DIR = "lie_records"  # 录像目录（相对项目根，已在 .gitignore 忽略，不入库）。
 LIE_RECORD_KEEP = 50  # 滚动保留最近多少组录像（mp4+json 各一），超出按 mtime 删除最旧。
-LIE_RECORD_FPS = 30  # 录像标称帧率：写线程按采集时间戳把帧对齐到该帧率的真实时间轴，采集慢于此则用上一帧补齐，保证回放时长==真实时长（不被压缩加速）。
+LIE_RECORD_FPS = 30  # 录像帧率：既是容器标称帧率（VideoWriter 建流），也是自采集线程的真实抓帧节拍——真 30FPS 抓帧、原样写、不补帧，回放即游戏真实速度；实际达成帧率另记边车 measured_fps。
 LIE_RECORD_FOURCC = "mp4v"  # mp4 编码 fourcc，OpenCV 内置无需额外依赖。
 LIE_RECORD_QUEUE_MAX = 64  # 有界队列容量（约 2 秒缓冲）：写线程跟不上传者满即丢帧，绝不回压求解线程。
 _JOIN_TIMEOUT = 10.0  # stop 时等待写线程排空并退出的最长秒数，超时也继续收尾（守护线程随进程退出）。
@@ -67,7 +70,9 @@ class LieRecorder:
         self._writer = None  # cv2.VideoWriter，未起流或已收尾时为 None。
         self._queue = None  # 有界帧队列。
         self._thread = None  # 异步写线程句柄。
-        self._running = False  # 写线程是否应在跑：stop 置 False 后写线程排空即退出。
+        self._capture = None  # 独立采集回调（可调用，返回一帧 BGR 或 None）：传入则进自采集模式，起线程按 LIE_RECORD_FPS 真实节拍抓帧，与被光流运算拖慢的解题循环解耦。
+        self._cap_thread = None  # 自采集线程句柄（仅自采集模式非空）。
+        self._running = False  # 采集/写线程是否应在跑：stop 置 False 后两线程排空即退出。
         self._path = None  # mp4 文件路径，起流失败时保持 None（write/stop 自动空转）。
         self._json_path = None  # 边车 JSON 路径，stop 写完记录。
         self._width = 0  # 录像宽（像素）：有裁剪区域时为区域宽，否则为整帧宽。
@@ -78,10 +83,12 @@ class LieRecorder:
         self._score = 0.0  # 触发匹配分，写进文件名与边车。
         self._tier = "high"  # 精度档 key，写进文件名与边车。
         self._start_iso = ""  # 起录时间 ISO 字符串，写进边车。
+        self._first_ts = None  # 首帧采集时间戳（perf_counter）：与末帧之差为真实采集时长，用于算真实帧率 measured_fps。
+        self._last_ts = None  # 末帧采集时间戳。
 
     # ------------------------------------------------------------------ 起停
 
-    def start(self, shape, meta=None, crop=None):  # 起流：建目录、开 VideoWriter、拉起异步写线程。shape 为整帧 (高, 宽)；crop 为 (x,y,w,h) 录像区域，None 表示录整帧。
+    def start(self, shape, meta=None, crop=None, capture=None):  # 起流：建目录、开 VideoWriter、拉起异步写线程（传 capture 时再拉起自采集线程）。shape 为整帧 (高, 宽)；crop 为 (x,y,w,h) 录像区域，None 表示录整帧；capture 为可选采集回调。
         with self._lock:
             try:
                 if self._writer is not None or self._running:  # 已起流，幂等返回。
@@ -109,12 +116,18 @@ class LieRecorder:
                 self._writer = writer  # 记录写入流。
                 self._frames = 0  # 帧计数清零。
                 self._dropped = 0  # 丢帧计数清零。
+                self._first_ts = None  # 采集时间跨度复位（供 measured_fps 计算）。
+                self._last_ts = None
                 self._start_iso = time.strftime("%Y-%m-%dT%H:%M:%S")  # 起录时间戳。
                 self._queue = queue.Queue(maxsize=LIE_RECORD_QUEUE_MAX)  # 有界队列。
-                self._running = True  # 允许写线程运行与 write 入队。
+                self._capture = capture if callable(capture) else None  # 采集回调：非空则进自采集模式（write 转为空转，改由采集线程按 LIE_RECORD_FPS 拓帧）。
+                self._running = True  # 允许采集/写线程运行与入队。
                 self._thread = threading.Thread(target=self._consume, name="LieRecorder", daemon=True)  # 守护写线程随进程退出。
                 self._thread.start()  # 拉起写线程。
-                logger.info(f"Lie record started: {self._path} {self._width}x{self._height}@{LIE_RECORD_FPS}fps crop={self._crop} score={self._score:.2f} tier={self._tier}. 测谎录像已开始。")
+                if self._capture is not None:  # 自采集模式：起独立采集线程，按真实 30FPS 节拍抓帧喂录像，与被光流运算拖慢的解题循环解耦。
+                    self._cap_thread = threading.Thread(target=self._capture_loop, name="LieRecorderCap", daemon=True)  # 守护采集线程随进程退出。
+                    self._cap_thread.start()  # 拉起采集线程。
+                logger.info(f"Lie record started: {self._path} {self._width}x{self._height}@{LIE_RECORD_FPS}fps crop={self._crop} score={self._score:.2f} tier={self._tier} self_capture={self._capture is not None}. 测谎录像已开始。")
             except Exception as e:  # 起流任何异常都不能影响解测谎。
                 logger.warning(f"Lie record start failed: {e}. 测谎录像启动失败，本局不录。")
                 self._running = False  # 复位，write/stop 空转。
@@ -149,11 +162,16 @@ class LieRecorder:
 
     # ------------------------------------------------------------------ 录帧
 
-    def write(self, frame):  # 入队一帧 BGR 画面（带采集时间戳；有裁剪区域时只入队该区域）；未起流、已停止或队列满时安全跳过（绝不阻塞求解）。
+    def write(self, frame):  # 被动模式：外部逐帧喂一帧 BGR 画面。自采集模式（start 传了 capture）下为空转，避免与采集线程重复喂帧。
+        if self._capture is not None:  # 自采集模式：录像由独立采集线程按 LIE_RECORD_FPS 驱动，手动 write 忽略。
+            return
+        self._enqueue(frame)
+
+    def _enqueue(self, frame):  # 采集/写帧统一入口：按固定裁剪区域裁帧、打采集时间戳后非阻塞入队；未起流/已停/队列满时安全跳过（绝不阻塞采集与求解）。
         if not self._running or self._queue is None or frame is None:  # 未在录像或无帧。
             return
         try:
-            ts = time.perf_counter()  # 采集时刻：写线程据此把帧落到真实时间轴对应帧号，慢采集时补齐避免回放加速。
+            ts = time.perf_counter()  # 采集时刻：写线程记录首末帧时间跨度算真实采集帧率 measured_fps。
             item = frame  # 默认录整帧。
             crop = self._crop  # 触发时确定的固定录像区域。
             if crop is not None:  # 只录【测谎区域标注】区域。
@@ -166,16 +184,30 @@ class LieRecorder:
                 if x1 <= x0 or y1 <= y0:  # 区域完全越界：本帧无可录内容，跳过（不写整帧，保持输出尺寸恒定）。
                     return
                 item = frame[y0:y1, x0:x1].copy()  # 裁剪并拷贝：保证内存连续（VideoWriter 要求）且不牵住整帧内存。
-            self._queue.put_nowait((ts, item))  # 非阻塞入队 (采集时间戳, 帧)：capture 每帧返回独立副本，写线程跟不上传者满即丢帧。
+            self._queue.put_nowait((ts, item))  # 非阻塞入队 (采集时间戳, 帧)：每帧为独立副本，写线程跟不上传者满即丢帧。
         except queue.Full:  # 写线程暂时跟不上。
-            self._dropped += 1  # 记一次丢帧，宁可丢帧也不能回压 30FPS 求解。
+            self._dropped += 1  # 记一次丢帧，宁可丢帧也不能回压采集/求解。
         except Exception:  # 入队/裁剪其它异常（队列已关闭等）。
             pass  # 吞掉，录像问题不外溢。
 
-    def _consume(self):  # 写线程主体：按采集时间戳把帧落到真实时间轴对应帧号，慢于标称帧率处用上一帧补齐空档，使录像时长==真实时长（回放不加速）。
-        t0 = None  # 首帧采集时刻，真实时间轴原点。
-        fps = float(LIE_RECORD_FPS)  # 标称帧率。
-        last = None  # 上一帧（已缩放到输出尺寸），用于补齐采集空档。
+    def _capture_loop(self):  # 自采集线程主体：按 LIE_RECORD_FPS 真实节拍独立抓帧入队，使录像为真 30FPS（无补帧、无重复帧），与被光流运算拖慢的解题循环解耦。
+        interval = 1.0 / float(LIE_RECORD_FPS)  # 目标帧间隔（秒）。
+        next_t = time.perf_counter()  # 下一帧的节拍点（deadline 调度避免累积漂移）。
+        while self._running:  # stop 置 False 后退出。
+            try:
+                frame = self._capture()  # 独立抓一帧（框架截图内部加锁、返回副本，线程安全）。
+            except Exception:  # 采集异常（窗口失效等）不中断录像线程。
+                frame = None
+            if frame is not None:  # 抓到画面才入队（取不到则跳过该节拍，不补帧）。
+                self._enqueue(frame)
+            next_t += interval  # 推进节拍点。
+            delay = next_t - time.perf_counter()  # 距下一节拍点的剩余秒数。
+            if delay > 0:  # 未落后：睡到下一节拍点，稳定 30FPS。
+                time.sleep(delay)
+            else:  # 落后于节拍（采集慢/锁竞争）：重置基准，避免恢复后疯狂补采。
+                next_t = time.perf_counter()
+
+    def _consume(self):  # 写线程主体：把采集到的每一帧按到达顺序原样写入，不补帧（录像帧数==真实采集帧数）。
         while True:
             try:
                 item = self._queue.get(timeout=0.5)  # 取一帧，超时就复检是否该退出。
@@ -191,28 +223,25 @@ class LieRecorder:
                 if self._writer is not None:  # 写入流仍在。
                     if frame.shape[:2] != (self._height, self._width):  # 中途窗口尺寸变化。
                         frame = cv2.resize(frame, (self._width, self._height))  # 缩放到起流分辨率，VideoWriter 要求尺寸恒定。
-                    if t0 is None:  # 首帧确立时间轴原点。
-                        t0 = ts
-                    slot = int(round((ts - t0) * fps))  # 本帧按真实时间应处的帧号。
-                    if slot < self._frames:  # 采集快于标称帧率（或已补齐过）：不回退，顺写即可。
-                        slot = self._frames
-                    pad = last if last is not None else frame  # 补齐用上一帧（画面连续），首帧无上一帧则用自身。
-                    while self._frames < slot:  # 用上一帧填满 [已写帧号, slot) 的空档，把时间轴撑到真实时长。
-                        self._writer.write(pad)
-                        self._frames += 1
-                    self._writer.write(frame)  # 写入当前帧到 slot。
-                    self._frames += 1  # 累计已写帧数（含补齐帧）。
-                    last = frame  # 记住当前帧供下次补齐。
+                    if self._first_ts is None:  # 首帧采集时刻：真实时间轴原点。
+                        self._first_ts = ts
+                    self._last_ts = ts  # 末帧采集时刻：与首帧之差即真实采集时长（供 measured_fps）。
+                    self._writer.write(frame)  # 原样写入当前真实帧（不再用上一帧补齐空档，杜绝重复帧）。
+                    self._frames += 1  # 累计已写帧数（==真实采集帧数）。
             except Exception as e:  # 单帧写入失败（编码异常等）。
                 logger.warning(f"Lie record write frame failed: {e}. 测谎录像写入单帧失败，已跳过该帧。")
             finally:
                 self._queue.task_done()  # 无论成败都标记该帧处理完成。
 
-    def stop(self, outcome="solved"):  # 收尾：排空写线程 -> 关流 -> 写边车 JSON -> 滚动保留。outcome ∈ success/failure/solved/timeout/gone/abandoned/aborted。
+    def stop(self, outcome="solved"):  # 收尾：停采集线程 -> 排空写线程 -> 关流 -> 写边车 JSON -> 滚动保留。outcome ∈ success/failure/solved/timeout/gone/abandoned/aborted。
         with self._lock:
             if not self._running and self._writer is None:  # 从未起流或已收尾。
                 return
-            self._running = False  # 通知写线程排空后退出，write 也随之空转。
+            self._running = False  # 通知采集线程与写线程排空后退出，write 也随之空转。
+            cap_thread = self._cap_thread  # 取自采集线程句柄。
+            self._cap_thread = None  # 先摘引用，避免重复 join。
+            if cap_thread is not None:  # 先等采集线程停抓（不再入队），再收写线程，避免收尾期间还有新帧挤进来。
+                cap_thread.join(timeout=_JOIN_TIMEOUT)
             try:
                 if self._queue is not None:
                     self._queue.put_nowait(None)  # 投停止哨兵；队列满则失败也无妨，写线程排空后靠 _running 判定退出。
@@ -241,12 +270,20 @@ class LieRecorder:
 
     # ------------------------------------------------------------------ 边车与滚动保留
 
-    def _write_sidecar(self, outcome, frames):  # 写与 mp4 同名的 .json 边车：时间戳/触发分/精度档/结果/时长/帧数/分辨率。
+    def _measured_fps(self, frames):  # 由首末帧采集时间跨度算真实平均帧率；跨度非正或不足两帧时回退容器标称帧率。
+        if frames >= 2 and self._first_ts is not None and self._last_ts is not None:
+            span = self._last_ts - self._first_ts  # 真实采集时长（秒）。
+            if span > 1e-6:  # 跨度有效才做除法，避免瞬时连写导致除零/爆表。
+                return round((frames - 1) / span, 3)
+        return float(LIE_RECORD_FPS)
+
+    def _write_sidecar(self, outcome, frames):  # 写与 mp4 同名的 .json 边车：时间戳/触发分/精度档/结果/时长/帧数/真实帧率/分辨率。
         if not self._path:  # 未起流成功，无录像可记。
             return
         try:
             json_path = os.path.splitext(self._path)[0] + ".json"  # 同名 .json。
-            duration = round(frames / float(LIE_RECORD_FPS), 3) if frames else 0.0  # 时长（秒）= 帧数 / 帧率。
+            duration = round(frames / float(LIE_RECORD_FPS), 3) if frames else 0.0  # 容器时长（秒）= 帧数 / 标称帧率（真 30FPS 自采集下 ≈ 真实时长，回放不加速）。
+            measured_fps = self._measured_fps(frames)  # 真实采集帧率：自采集按 30FPS 节拍，正常应≈容器 fps（明显偏低说明采集被锁竞争/机器负载拖慢）。
             data = {  # 边车记录字段。
                 "video": os.path.basename(self._path),  # mp4 文件名，供 list_records 与目录无关地重建路径。
                 "path": self._path,  # 录制时的路径（相对项目根）。
@@ -254,9 +291,10 @@ class LieRecorder:
                 "score": round(self._score, 4),  # 触发匹配分。
                 "tier": self._tier,  # 精度档 key。
                 "outcome": str(outcome or "solved"),  # 结束原因。
-                "frames": int(frames),  # 已写帧数。
-                "fps": LIE_RECORD_FPS,  # 帧率。
-                "duration": duration,  # 时长（秒）。
+                "frames": int(frames),  # 已写帧数（==真实采集帧数，不补帧）。
+                "fps": LIE_RECORD_FPS,  # 容器标称帧率（VideoWriter 建流用）。
+                "measured_fps": measured_fps,  # 真实采集帧率：自采集模式正常≈fps（30）；明显低于 fps 说明抓帧被机器负载/锁竞争拖慢（回放会略快）。
+                "duration": duration,  # 容器时长（秒）。
                 "width": int(self._width),  # 分辨率宽（有裁剪区域时为区域宽）。
                 "height": int(self._height),  # 分辨率高（有裁剪区域时为区域高）。
                 "region": list(self._crop) if self._crop else None,  # 录像裁剪区域 [x,y,w,h]（整帧坐标系），None 表示录整帧。

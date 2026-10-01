@@ -275,15 +275,18 @@ class TensorTemporalAligner:
             torch.cuda.current_stream().wait_stream(stream)
             torch.cuda.synchronize()  # 捕获前必须无待完成的显卡工作。
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):  # 捕获不执行，输出张量要到首次 replay 才有值。
+            with torch.cuda.graph(graph, capture_error_mode="thread_local"):  # 捕获不执行，输出张量要到首次 replay 才有值；thread_local 让捕获只约束本线程的流，监控线程并发的 CuPy 匹配不会再把捕获打成 cudaErrorStreamCaptureUnsupported（默认 global 模式会因任意线程的并发核而报错）。
                 evidence, raw_mean = body()
             torch.cuda.synchronize()
             self._graph = graph
             self._graph_evidence = evidence
             self._graph_raw_mean = raw_mean
-        except Exception:  # 显存不足/驱动不支持捕获/图内含同步点，一律永久回退 eager。
-            self._release_graph()
-            self._graph_disabled = True
+        except Exception as exc:  # 捕获失败：区分「与并发 CuPy 匹配的瞬时流冲突」与真正不支持捕获。
+            self._release_graph()  # 先丢弃半张图与静态缓冲（self._graph 归 None，稳态下一帧会再次尝试捕获）。
+            message = str(exc)  # 异常文本，用于判定是否为可自愈的瞬时冲突。
+            if ("stream is capturing" in message) or ("StreamCapture" in message):  # cudaErrorStreamCaptureUnsupported：另一线程在捕获期发了核，属瞬时冲突。
+                return  # 不置 _graph_disabled：保留下一帧重试捕获的能力，避免整局因一次冲突永久退化成 eager（thread_local 已大幅降低发生率，这里是兜底）。
+            self._graph_disabled = True  # 显存不足/驱动不支持捕获/图内含同步点：永久回退 eager，不再重试。
     
     def _fill_static(self, color, gray) -> None:
         """把当前帧与各 lag 历史帧搬进固定地址的静态缓冲（图外执行，全是 D2D）。"""

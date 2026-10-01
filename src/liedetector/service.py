@@ -54,14 +54,16 @@ except Exception:  # liedetector 模块缺失或依赖损坏。
 
 logger = Logger.get_logger(__name__)  # 服务日志器。
 
-CAPTURE_FPS = 30  # 解测谎取帧固定帧率，与测谎检验页签一致。
-CAPTURE_MIN_INTERVAL = 1.0 / CAPTURE_FPS  # 解测谎固定帧间隔秒数（约 0.0333）。
+CAPTURE_FPS = 30  # 解测谎取帧目标帧率，与测谎检验页签一致；采集线程以此节拍供帧、解题循环按最新帧处理。
+CAPTURE_MIN_INTERVAL = 1.0 / CAPTURE_FPS  # 解测谎目标帧间隔秒数（约 0.0333），用作取帧等待上限与采集线程节拍。
+VISION_PUSH_INTERVAL = 1.0 / 12  # 解题态向 UI 推送叠加画面的最小间隔（约 12FPS）：提速后每 tick 整帧 copy+绘制会成为新瓶颈，预览无需跟满解题帧率。
 MONITOR_INTERVAL = 1.0 / 15  # 空闲监控节拍（约 15FPS），比解题态更省，降低与任务并发截图/匹配的开销。
 LIE_REGION_SHIFT_PIXELS = 4  # 【测谎坐标框】移动/缩放超过该像素数视为新一局（或窗口位移），重置光流会话。
 LIE_MOVE_MAX_STEP = 50  # 解测谎时每帧鼠标最多移动的像素数，分步追赶避免光标瞬移过大。
-LIE_MAX_TICKS = 750  # 解测谎无结果兜底退出的帧数（约 25 秒 @30FPS），防止触发标注误匹配造成死循环。
+LIE_MAX_TICKS = 1500  # 解测谎硬兜底帧数（采集异常导致墙钟判定失效时的最后防线，正常应先被 LIE_MAX_SECONDS 截断）。
+LIE_MAX_SECONDS = 25.0  # 解测谎无结果兜底退出的墙钟秒数（约 25 秒，与旧 750 帧@30FPS 的设计意图一致）：改用墙钟后与实测帧率无关，提速到 30FPS 也不会像旧按帧计数那样被误放宽到 75 秒。
 LIE_TRIGGER_CONFIRM_FRAMES = 3  # 连续命中【测谎触发】多少帧才认定为真触发，滤掉弹窗淡入期的分数抖动与单帧误匹配。
-LIE_TRIGGER_LOST_TOLERANCE = 8  # 解题中允许连续丢失【测谎触发】的帧数，超过才判定测谎结束（约 0.27 秒 @30FPS）。
+LIE_TRIGGER_LOST_TOLERANCE = 12  # 解题中允许连续丢失【测谎触发】的帧数，超过才判定测谎结束；12 帧@30FPS≈0.4 秒（旧 8 帧在 10FPS 实际约 0.8 秒，提速到 30FPS 后按 12 帧保持同量级墙钟容忍度，避免弹窗淡入抖动误判提前结束）。
 LIE_SOLVE_COOLDOWN = 2.0  # 一局测谎结束后的冷却秒数：期间不响应新触发，等弹窗完全淡出、画面稳定。
 LIE_TRIGGER_DELAY_DEFAULT = 5.0  # 触发延迟默认秒数（看板未配置或值非法时兜底），与 DASHBOARD_DEFAULTS 保持一致。
 LIE_TRIGGER_DELAY_MAX = 60.0  # 触发延迟上限秒数，防止配置误填过大导致长时间卡在等待。
@@ -117,6 +119,62 @@ def normalize_key_name(value):  # 把看板配置的按键名或 pynput 报出�
     return _KEY_NAME_ALIAS.get(name, name)  # 再收敛左右修饰键与命名风格差异。
 
 
+class _LieFramePump:  # 解测谎专用采集线程：后台按游戏帧率抓最新帧存入单槽，解题循环取帧不再串行等待新帧到达。
+    # 关键：旧解题循环是「处理(18ms) -> 睡(33ms) -> get_frame 阻塞等新帧(17~35ms)」的串行节拍，实测约 10FPS；
+    # 本线程把采集与处理解耦——处理第 N 帧期间第 N+1 帧已到达并存入槽，wait_new 立即返回最新帧，于是节拍 ≈ max(处理耗时, 帧间隔) ≈ 30FPS。
+    # 采集走调用方克隆的独立采集实例（自带 lock/DC/会话），与录像独立采集、框架共享采集互不抢帧互不饿死。
+
+    def __init__(self, capture, fps):  # capture 为独立采集回调（返回 BGR 帧或 None），fps 为抓帧节拍上限。
+        self._capture = capture  # 采集回调（独立克隆实例的 get_frame）。
+        self._min_interval = 1.0 / max(1.0, float(fps))  # 抓帧节拍上限对应的最小帧间隔（BitBlt 等即时返回的采集靠它限流；WGC 本身阻塞则不受影响）。
+        self._cond = threading.Condition()  # 保护帧槽并唤醒等待新帧的解题线程。
+        self._frame = None  # 最新一帧（单槽，始终被最新帧覆盖，解题只关心最新，旧帧直接丢弃）。
+        self._seq = 0  # 帧序号：每存入一新帧自增，wait_new 据此判定是否已等到比上次交付更新的帧。
+        self._delivered_seq = 0  # 上次交给消费者的帧序号：wait_new 只等比它更新的帧，避免把「处理期间刚到达」的新帧当成基准而跳过。
+        self._running = True  # 采集线程运行标志，stop 置 False 后线程排空当前抓取即退出。
+        self._thread = threading.Thread(target=self._loop, name="LieFramePump", daemon=True)  # 守护线程随进程退出。
+
+    def start(self):  # 拉起采集线程。
+        self._thread.start()
+
+    def _loop(self):  # 采集线程主体：deadline 调度抓帧入槽并唤醒等待者；落后于节拍则重置基准，避免恢复后疯狂补采。
+        next_t = time.perf_counter()  # 下一帧的节拍点（绝对时间，deadline 调度避免累积漂移）。
+        while self._running:  # stop 置 False 后退出。
+            try:
+                frame = self._capture()  # 独立抓一帧（自带 lock/DC，返回副本，线程安全）；WGC 会阻塞到游戏下一帧到达。
+            except Exception:  # 采集异常（窗口失效等）不中断采集线程。
+                frame = None
+            if frame is not None:  # 抓到画面才更新帧槽并唤醒等待者（取不到则跳过本轮，不覆盖已有最新帧）。
+                with self._cond:
+                    self._frame = frame
+                    self._seq += 1
+                    self._cond.notify_all()
+            next_t += self._min_interval  # 推进节拍点。
+            delay = next_t - time.perf_counter()  # 距下一节拍点的剩余秒数。
+            if delay > 0:  # 未落后：睡到下一节拍点，把即时返回型采集（BitBlt）限流在目标帧率内。
+                time.sleep(delay)
+            else:  # 落后于节拍（采集阻塞/机器负载）：重置基准，恢复后不补采。
+                next_t = time.perf_counter()
+
+    def wait_new(self, timeout):  # 阻塞到出现比「上次交付」更新的帧即返回最新帧：采集线程在上一帧处理期间已投入的新帧会被立即返回（不再等下一帧）；超过 timeout 仍无更新则返回当前（可能为空/旧）帧。
+        deadline = time.perf_counter() + timeout  # 等待截止时刻（perf_counter 单调，与 Condition.wait 同一时间基准）。
+        with self._cond:
+            while self._seq <= self._delivered_seq and self._running:  # 槽里没有比上次交付更新的帧且未停机：继续等（关键：与上次【交付】序号比，而非调用时刻快照，否则处理期间到达的新帧会被跳过）。
+                remaining = deadline - time.perf_counter()  # 剩余等待秒数。
+                if remaining <= 0:  # 超时：返回当前最新帧（可能是上一帧）。
+                    break
+                self._cond.wait(remaining)  # 释放锁并等待采集线程 notify，或超时被唤醒。
+            self._delivered_seq = self._seq  # 记录本次交付的帧序号，下次只等比它更新的帧。
+            return self._frame  # 返回最新帧。
+
+    def stop(self):  # 停机：清运行标志、唤醒可能卡在 wait 的解题线程、回收采集线程。
+        self._running = False
+        with self._cond:
+            self._cond.notify_all()  # 让正在 wait_new 的解题线程立即返回，不再等一个不会到来的新帧。
+        if self._thread.is_alive():
+            self._thread.join(timeout=1.0)  # 采集线程最多睡一个帧间隔，1 秒足够退出；超时也放行（守护线程随进程结束）。
+
+
 class LieDetectorService:  # 独立测谎监控服务：后台守护线程值守测谎触发，命中即暂停任务并自动解测谎。
 
     def __init__(self, exit_event):  # 构造服务，exit_event 与 app 退出事件一致，用于优雅停止线程。
@@ -132,6 +190,7 @@ class LieDetectorService:  # 独立测谎监控服务：后台守护线程值守
         self._disconnect_hits = 0  # 连续命中【掉线2】的帧数，达到 DISCONNECT_CONFIRM_FRAMES 才触发重登（防抖）。
         self._gpu = None  # 显卡匹配器（GpuFeatureMatcher），首次需要时创建，看板开关关闭或显卡异常时为 None。
         self._gpu_off = False  # 显卡加速是否已被运行期异常永久关闭：置位后本进程内不再重试，避免每帧失败刷日志。
+        self._gpu_transient_warned = False  # 显卡匹配与 CUDA Graph 流捕获瞬时冲突是否已告警：只提示一次，不永久降级但避免逐帧刷日志。
         self._watch_names = None  # 本轮值守要在同一帧上匹配的全部分类名，单点调用匹配时沿用同一组模板避免反复重建。
         self._recorder = None  # 当前测谎录像器（LieRecorder）：触发确认时起录、finally 收尾；非解题期为 None。
         self._abort_event = threading.Event()  # 急停标志：敲击看板配置的急停键后置位，解题与延迟等待循环每帧检查并立即退出。
@@ -308,13 +367,84 @@ class LieDetectorService:  # 独立测谎监控服务：后台守护线程值守
                 crop = (int(region_box.x), int(region_box.y), int(region_box.width), int(region_box.height))
             except (TypeError, ValueError, AttributeError):  # 框字段非法。
                 crop = None  # 退回录整帧。
+        capture, capture_release = self._make_independent_capture()  # 为录像器构建独立采集实例（自带 lock/DC），与解题循环共用的 capture_method 解耦，避免重档光流负载下录像抓帧被同一把锁饿死。
         try:  # 录像为最佳努力能力，启动失败不得拖垮解测谎。
             recorder = LieRecorder()  # 一局一个录像器实例。
-            recorder.start(frame.shape[:2], {"score": score, "tier": precision}, crop, capture=self._capture)  # 起流：分辨率取触发帧，元数据带触发分与精度档，裁剪区域取【测谎坐标框】；传 capture 让录像器起独立 30FPS 采集线程（与被光流拖慢的解题循环解耦，录像为真 30FPS）。
-            self._recorder = recorder  # 记录：录像器自采集线程按 30FPS 拓帧覆盖触发->解除->结算全程，finally 收尾。
+            recorder.start(frame.shape[:2], {"score": score, "tier": precision}, crop, capture=capture, capture_release=capture_release)  # 起录：分辨率取触发帧，元数据带触发分与精度档，裁剪区域取【测谎坐标框】；传独立 capture 让录像器起自采集线程按游戏真实帧率抓帧、去重，容器帧率按实测真实帧率标定（回放即真实速度、不加速）。
+            self._recorder = recorder  # 记录：录像器自采集线程按真实帧率拓帧覆盖触发->解除->结算全程，finally 收尾并释放独立采集实例。
         except Exception as e:  # 录像启动异常。
             logger.warning(f"Lie record start failed: {e}. 测谎录像启动失败，本局不录，解题照常进行。")
             self._recorder = None
+            if capture_release is not None:  # 起录失败时独立采集实例已建但没交给录像器，需在此释放，避免 GDI 资源泄漏。
+                try:
+                    capture_release()
+                except Exception:  # 释放失败不影响解题。
+                    pass
+
+    def _make_recorder_capture(self):  # 兼容旧名：录像独立采集与解题独立采集共用同一克隆逻辑，保留此别名供既有调用与单测。
+        return self._make_independent_capture()
+
+    def _make_independent_capture(self):  # 克隆一个与共享采集独立的采集实例，返回 (capture_callable, release_callable)；不可克隆时回退共享 (self._capture, None)。
+        # 关键：录像必须独享一路采集，不能与解题循环共用同一个 capture_method。以 WGC 为例，其 get_frame 走「单请求-单响应」
+        # 帧通道（frame_requested/frame_event/last_frame + get_frame_lock 串行化）：共享时录像与解题会「瓜分」同一窗口的帧
+        # （录像fps + 解题fps ≈ 游戏渲染fps），重档光流把解题拖到 ~10FPS 时录像只剩 ~20FPS，且交付抖动让标定帧率失真、回放偏快。
+        # 因此按当前采集方式克隆一个同类独立实例——WGC 建独立 frame pool/session（Windows.Graphics.Capture 支持同窗口多会话，
+        # 各自独享完整帧流），BitBlt 建独立 lock/DC/contexts。仅这两类可安全克隆；其它（DXGI 等）回退共享 self._capture。
+        # 任何异常都回退共享采集，绝不因录像影响解题。
+        try:
+            device_manager = getattr(og, "device_manager", None)  # 取设备管理器。
+            shared = getattr(device_manager, "capture_method", None) if device_manager is not None else None  # 取当前共享截图方法。
+            if shared is None:  # 无截图方法（未选择窗口等）。
+                return self._capture, None  # 回退共享采集（其内部也会因无 method 返回 None）。
+            hwnd_window = getattr(shared, "hwnd_window", None)  # 目标窗口元数据（hwnd/偏移/app_exit_event），只读共享。
+            if hwnd_window is None:  # 无窗口元数据无法克隆。
+                return self._capture, None
+            from ok.device.capture_methods.windows_graphics import WindowsGraphicsCaptureMethod  # 延迟导入：WGC 采集方式。
+            if isinstance(shared, WindowsGraphicsCaptureMethod):  # 当前用 WGC：克隆一个独立会话，录像独享整路帧流，不与解题瓜分。
+                wgc_inst = WindowsGraphicsCaptureMethod(hwnd_window)  # 构造函数自行 start_or_stop 建独立 frame pool/session，并从 hwnd_window.app_exit_event 设 exit_event。
+                if not wgc_inst.connected():  # 独立会话没起来（资源不足/窗口失效）：释放并回退共享，绝不半开一个坏会话。
+                    try:
+                        wgc_inst.close()
+                    except Exception:
+                        pass
+                    return self._capture, None
+
+                def _grab_wgc():  # 独立 WGC 采集回调：录像采集线程调用，走 wgc_inst 自己的会话与 get_frame_lock，不与解题争帧。
+                    return wgc_inst.get_frame()
+
+                def _release_wgc():  # 释放独立 WGC 会话（frame pool/session/D3D 设备），避免逐局泄漏。
+                    try:
+                        wgc_inst.close()
+                    except Exception as e:  # 释放失败不影响解题。
+                        logger.warning(f"Lie record release independent WGC capture failed: {e}. 释放录像独立 WGC 采集会话失败。")
+
+                return _grab_wgc, _release_wgc
+            from ok.device.capture_methods.bitblt import BitBltCaptureMethod, ForegroundBitBltCaptureMethod  # 延迟导入：BitBlt 采集方式。
+            if not isinstance(shared, (BitBltCaptureMethod, ForegroundBitBltCaptureMethod)):  # 既非 WGC 也非 BitBlt 家族（DXGI 等）。
+                return self._capture, None  # 回退共享采集，不克隆。
+            inst = type(shared)(hwnd_window)  # 复刻同类 BitBlt 实例：各自独立 lock/DC/contexts。
+            inst.hwnd_window = hwnd_window  # 绑定同一窗口（与框架 get_capture 初始化口径一致）。
+            inst.exit_event = getattr(shared, "exit_event", None)  # 绑定 app 退出事件：get_frame 依赖它判定是否停止。
+
+            def _grab():  # 独立 BitBlt 采集回调：录像采集线程调用，走 inst 自己的锁，不与解题循环争用。
+                return inst.get_frame()
+
+            def _release():  # 释放独立实例的 GDI 资源（DC/bitmap），避免逐局泄漏。
+                try:
+                    if isinstance(inst, ForegroundBitBltCaptureMethod):  # 前台桌面 BitBlt：框架自带 close 释放桌面 DC。
+                        inst.close()
+                    else:  # 窗口 BitBlt：清理主实例与子窗口合成上下文的 DC/bitmap。
+                        from ok.device.capture_methods.bitblt_utils import clean_up_bitblt
+                        for ctx in list(getattr(inst, "contexts", {}).values()):
+                            clean_up_bitblt(ctx)
+                        clean_up_bitblt(inst)
+                except Exception as e:  # 释放失败不影响解题。
+                    logger.warning(f"Lie record release independent capture failed: {e}. 释放录像独立采集实例失败。")
+
+            return _grab, _release
+        except Exception as e:  # 构建独立采集实例失败：回退共享采集，录像仍可用（只是与解题争锁）。
+            logger.warning(f"Lie record independent capture setup failed: {e}. 录像独立采集构建失败，回退共享采集。")
+            return self._capture, None
 
     def _stop_recorder(self, outcome):  # 收尾录像并写边车记录，异常吞掉；未起录时空转。
         recorder = self._recorder  # 取当前录像器。
@@ -595,75 +725,150 @@ class LieDetectorService:  # 独立测谎监控服务：后台守护线程值守
             return None  # 排除。
         return task  # 返回可暂停的脚本任务。
 
+    def _start_solve_pump(self):  # 为解题循环拉起一个独立采集线程（_LieFramePump）：与录像独立采集、框架共享采集互不抢帧。无法克隆时返回 (None, None)，_solve 回退 self._capture 旧路径。
+        capture, release = self._make_independent_capture()  # 克隆一路独立采集（WGC 建独立会话 / BitBlt 建独立实例），无法克隆时回退共享 (self._capture, None)。
+        if capture is self._capture:  # 没有克隆出独立采集（未选窗口/未知采集方式/单测）：不建线程，避免与共享采集抢帧，行为完全回退旧路径。
+            return None, None
+        try:
+            pump = _LieFramePump(capture, CAPTURE_FPS)  # 采集线程以 30FPS 为目标节拍抓帧入槽。
+            pump.start()  # 拉起采集线程。
+            return pump, release
+        except Exception as e:  # 建线程失败不能拖垮解题。
+            logger.warning(f"Lie solve frame pump start failed: {e}. 解题独立采集线程启动失败，回退共享采集取帧。")
+            if release is not None:  # 采集实例已建但没交给 pump，需在此释放，避免 GDI/会话泄漏。
+                try:
+                    release()
+                except Exception:
+                    pass
+            return None, None
+
+    def _stop_solve_pump(self, pump, release):  # 收尾解题采集：停线程并释放独立采集实例，异常吞掉；pump 为空则空转。
+        if pump is not None:  # 有独立采集线程。
+            try:
+                pump.stop()  # 停采集线程（内部 notify 唤醒可能卡在 wait_new 的解题线程）。
+            except Exception as e:  # 停止异常不影响收尾。
+                logger.warning(f"Lie solve frame pump stop failed: {e}. 停止解题采集线程失败。")
+        if release is not None:  # 释放独立采集实例（WGC 会话 / BitBlt DC）。
+            try:
+                release()
+            except Exception as e:  # 释放异常不影响解题。
+                logger.warning(f"Lie solve frame pump release failed: {e}. 释放解题独立采集实例失败。")
+
+    def _get_solve_frame(self, pump, timeout):  # 取解题用帧：pump 就绪时读最新帧槽（等新帧到达即返回，最多等 timeout）；无 pump 时回退旧路径（按帧间隔短等 + 共享采集）。
+        if pump is not None:  # 独立采集线程就绪：等新帧或超时返回最新帧，采集与处理并行，不再串行睡等。
+            return pump.wait_new(timeout)
+        self._idle_sleep(timeout)  # 无独立采集（单测/无窗口/未知采集方式）：沿用旧节拍——短等一个帧间隔再取。
+        return self._capture()
+
     def _solve(self, first_frame, trigger_name, region_name, threshold, precision_tier=PRECISION_TIER_DEFAULT):  # 解测谎子循环：稠密光流+粒子滤波跟踪透明图形并移动光标，直到【测谎触发】标注消失或场景结束。
         self._ensure_in_front()  # 游戏窗口置顶：鼠标追踪依赖前台窗口接收鼠标事件。
         session = ShapeTrackSession(params=ShapeTrackParams(precision_tier=precision_tier), logger=None)  # 光流粒子滤波在线会话，与测谎检验页签同一套算法（无神经网络）；按看板精度档装配。
-        fps = float(CAPTURE_FPS)  # 采集帧率，喂给会话换算时间阈值（场景结束/淡出判定）。
+        fps = float(CAPTURE_FPS)  # 会话时间阈值换算用帧率：算法按 30FPS 设计，提速后实测≈此值，保持阈值口径稳定。
         region = None  # 当前有效的【测谎坐标框】区域 (x, y, w, h)，未采集到前保持 None。
         mouse_pos = None  # 上一帧鼠标目标点（画面坐标），用于分步平滑追赶。
         frame = first_frame  # 从触发帧开始求解。
-        tick = 0  # 已处理帧数，用于兜底超时与诊断限频。
+        tick = 0  # 已处理帧数，用于诊断限频与硬兜底。
         last_diag_time = 0.0  # 上次诊断日志时间。
+        last_vision_time = 0.0  # 上次向 UI 推送叠加画面的时刻（perf_counter），用于 overlay 节流。
         trigger_box = None  # 最近一次命中的【测谎触发】框，丢失容忍期内沿用它继续绘制。
         lost_ticks = 0  # 连续未匹配到【测谎触发】的帧数，超过容忍值才判定测谎真正结束。
-        outcome = "timeout"  # 录像结束原因，默认兜底超时（含进程退出中断）；命中三个 break 出口时分别改写为 timeout/gone/solved。
-        while not self._exit_event.is_set():  # 循环直到触发标注持续消失、场景结束、兜底超时、用户急停或进程退出。
-            if self._abort_event.is_set():  # 用户敲了急停键：立即中止解题（跟踪路径不对时人为及时接管）。
-                logger.info(f"Lie solve aborted by hotkey at tick {tick}, resume. 第 {tick} 帧收到急停按键，已立即中止解测谎并退回监控。")
-                outcome = "aborted"  # 录像标记为用户急停中止。
-                self._set_status("aborted by hotkey")  # 状态立即可见，便于核对是谁中止的。
-                break  # 退出子循环，finally 会恢复被暂停的任务并开启冷却。
-            tick += 1  # 帧计数累加。
-            if tick > LIE_MAX_TICKS:  # 长时间未结束，可能触发标注误匹配，退回监控。
-                logger.warning(f"Lie solve exceeded {LIE_MAX_TICKS} frames, resume. 解测谎超过 {LIE_MAX_TICKS} 帧未结束，退回监控。")  # 记录兜底退出。
-                outcome = "timeout"  # 录像标记为兜底超时。
-                break  # 退出子循环。
-            found = self._find_trigger(frame, trigger_name, threshold)  # 本帧匹配【测谎触发】标注。
-            if found is None:  # 本帧未匹配到：可能只是弹窗淡出期或分数抖动造成的瞬时丢失，先容忍。
-                lost_ticks += 1  # 累计连续丢失帧数。
-                if lost_ticks > LIE_TRIGGER_LOST_TOLERANCE:  # 连续多帧都丢失才认定测谎结束，避免抖动导致光流会话刚建立就被打断。
-                    logger.info(f"Lie detector finished after {lost_ticks} lost frames, resume. 【测谎触发】标注连续 {lost_ticks} 帧消失，测谎已结束，解除测谎状态。")  # 记录退出原因与丢失帧数。
-                    outcome = "gone"  # 录像标记为触发消失（正常解除）。
+        outcome = "timeout"  # 录像结束原因，默认兜底超时（含进程退出中断）；命中 break 出口时分别改写为 timeout/gone/solved/aborted。
+        solve_start = time.perf_counter()  # 解题墙钟起点：兜底超时改按秒判定，与实测帧率无关。
+        last_frame_time = solve_start  # 上一帧处理时刻，用于算帧间 dt 驱动鼠标按秒步长（光标速度 FPS 无关）。
+        seg_match = seg_flow = seg_overlay = seg_wait = 0.0  # 分段计时累计（毫秒）：定位单帧 50ms 花在哪一段（等帧/触发匹配/光流/overlay）。
+        seg_match_n = seg_flow_n = seg_overlay_n = seg_wait_n = 0  # 各段累计次数（overlay 受节流非每 tick，其它每 tick 都计时，故分别取均值）。
+        last_diag_perf = solve_start  # 上次诊断的 perf_counter 时刻，用于算 pump_fps 的窗口秒数。
+        last_diag_seq = 0  # 上次诊断时采集线程已交付的帧序号(pump._seq)，差值即本窗口实际供帧数。
+        pump, pump_release = self._start_solve_pump()  # 独立采集线程+最新帧槽：采集与处理并行，去掉「睡 33ms 再等新帧」的串行等待。
+        try:
+            while not self._exit_event.is_set():  # 循环直到触发标注持续消失、场景结束、兜底超时、用户急停或进程退出。
+                if self._abort_event.is_set():  # 用户敲了急停键：立即中止解题（跟踪路径不对时人为及时接管）。
+                    logger.info(f"Lie solve aborted by hotkey at tick {tick}, resume. 第 {tick} 帧收到急停按键，已立即中止解测谎并退回监控。")
+                    outcome = "aborted"  # 录像标记为用户急停中止。
+                    self._set_status("aborted by hotkey")  # 状态立即可见，便于核对是谁中止的。
+                    break  # 退出子循环，finally 会恢复被暂停的任务并开启冷却。
+                tick += 1  # 帧计数累加。
+                now = time.perf_counter()  # 本帧处理时刻（单调时钟）。
+                if now - solve_start > LIE_MAX_SECONDS:  # 墙钟兜底：长时间未结束（可能触发标注误匹配）退回监控，与实测帧率无关。
+                    logger.warning(f"Lie solve exceeded {LIE_MAX_SECONDS}s ({tick} ticks), resume. 解测谎超过 {LIE_MAX_SECONDS} 秒（{tick} 帧）未结束，退回监控。")  # 记录兜底退出。
+                    outcome = "timeout"  # 录像标记为兜底超时。
                     break  # 退出子循环。
-            else:  # 本帧命中，触发仍在页面上。
-                lost_ticks = 0  # 丢失计数清零。
-                trigger_box = found  # 记录最新触发框供画面绘制。
-            region_box = self._get_region_box(frame, region_name)  # 直接采集【测谎坐标框】标注记录的坐标框信息，不做模板匹配。
-            new_region = (region_box.x, region_box.y, region_box.width, region_box.height) if region_box is not None else None  # 转为四元组，未采集到时为 None。
-            if new_region is None:  # 本帧未采集到坐标框：沿用旧区域，从未有过则跳过求解。
-                if region is None:  # 从未采集到坐标框。
-                    self._idle_sleep(LIE_FRAME_WAIT)  # 短等后重试。
-                    new_frame = self._capture()  # 取新帧。
-                    if new_frame is not None:  # 取到新帧才替换；numpy 数组不能用 or 判真值，必须显式判 None。
-                        frame = new_frame  # 更新当前帧，取不到沿用旧帧。
-                    continue  # 进入下一轮检查。
-            elif region is None or any(abs(new_region[i] - region[i]) > LIE_REGION_SHIFT_PIXELS for i in range(4)):  # 区域首次出现或位置/尺寸明显变化（任一边超阈值）。
-                region = new_region  # 更新区域。
-                session.reset(region[2], region[3])  # 重置光流会话：清空光流历史、模板与粒子跟踪器，避免上一局污染。
-                mouse_pos = None  # 鼠标目标点重新校准。
-            else:  # 区域位置稳定。
-                region = new_region  # 刷新区域（尺寸可能微调）。
-            # 录像由录像器的独立采集线程按真 30FPS 抓帧（见 _start_recorder 的 capture=self._capture），解题循环不再逐帧写，避免与自采集重复喂帧。
-            crop = frame[region[1]:region[1] + region[3], region[0]:region[0] + region[2]]  # 裁出谎言检测图形区域。
-            result = session.update(crop, fps)  # 喂入光流粒子滤波会话，返回单帧跟踪结果（区域局部坐标）。
-            if result.tracker_alive and result.center is not None:  # 有有效跟踪输出时才移动光标。
-                abs_center = (region[0] + float(result.center[0]), region[1] + float(result.center[1]))  # 目标中心由区域局部坐标换算为画面绝对坐标。
-                mouse_pos = self._move_mouse_toward(mouse_pos, abs_center)  # 分步向目标中心移动鼠标，模拟人眼平滑追踪。
-            if time.time() - last_diag_time >= 1.0:  # 每秒限频输出一次诊断日志。
-                last_diag_time = time.time()  # 记录本次诊断时间。
-                center = result.center  # 目标中心（区域局部坐标）。
-                center_desc = f"({center[0]:.1f},{center[1]:.1f})" if center is not None else "-"  # 中心描述。
-                logger.info(f"Lie solve diag: source={result.source} conf={result.confidence:.2f} center={center_desc} cursor={mouse_pos} whites={result.white_candidates} snr={result.border_snr:.2f} tick={tick} 解测谎诊断：光流来源/置信度/目标中心/光标/白色候选数。")  # 供排查跟踪为空等问题。
-            self._update_vision(self.draw_shape_overlay(frame, region, result, trigger_box))  # 把光流轮廓、目标中心与触发标注框选推送给 UI。
-            if result.source == SOURCE_SCENE_ENDED:  # 场景结束（切场景/结算文字）：测谎已解，退出。
-                logger.info("Lie detector scene ended, resume. 光流判定场景结束，测谎已解，解除测谎状态。")  # 记录退出原因。
-                outcome = "solved"  # 录像标记为已解出。
-                break  # 退出子循环。
-            self._idle_sleep(CAPTURE_MIN_INTERVAL)  # 按固定 30FPS 节拍取帧。
-            new_frame = self._capture()  # 取最新一帧画面。
-            if new_frame is not None:  # 取到新帧才替换，取不到沿用上一帧继续求解。
-                frame = new_frame  # 更新当前帧。
-        return outcome  # 返回结束原因（solved/timeout/gone），供录像边车记录。
+                if tick > LIE_MAX_TICKS:  # 硬帧数兜底：采集异常导致墙钟判定失效时的最后防线。
+                    logger.warning(f"Lie solve exceeded {LIE_MAX_TICKS} frames, resume. 解测谎超过 {LIE_MAX_TICKS} 帧未结束，退回监控。")  # 记录兜底退出。
+                    outcome = "timeout"  # 录像标记为兜底超时。
+                    break  # 退出子循环。
+                dt = now - last_frame_time  # 本帧相对上一帧的真实间隔（秒），供鼠标按秒步长缩放。
+                last_frame_time = now
+                _t_match = time.perf_counter()  # 计时起点：全屏触发匹配（含显卡句柄按需自建）。
+                found = self._find_trigger(frame, trigger_name, threshold)  # 本帧匹配【测谎触发】标注：每 tick 仅此一次模板匹配，显卡句柄由 _find_trigger 内部按需自建（显卡不可用/异常时自动回退 CPU），无需在解题循环里预先构建再显式传入。
+                seg_match += (time.perf_counter() - _t_match) * 1000.0; seg_match_n += 1  # 累计本段毫秒与次数，供分段诊断定位瓶颈。
+                if found is None:  # 本帧未匹配到：可能只是弹窗淡出期或分数抖动造成的瞬时丢失，先容忍。
+                    lost_ticks += 1  # 累计连续丢失帧数。
+                    if lost_ticks > LIE_TRIGGER_LOST_TOLERANCE:  # 连续多帧都丢失才认定测谎结束，避免抖动导致光流会话刚建立就被打断。
+                        logger.info(f"Lie detector finished after {lost_ticks} lost frames, resume. 【测谎触发】标注连续 {lost_ticks} 帧消失，测谎已结束，解除测谎状态。")  # 记录退出原因与丢失帧数。
+                        outcome = "gone"  # 录像标记为触发消失（正常解除）。
+                        break  # 退出子循环。
+                else:  # 本帧命中，触发仍在页面上。
+                    lost_ticks = 0  # 丢失计数清零。
+                    trigger_box = found  # 记录最新触发框供画面绘制。
+                region_box = self._get_region_box(frame, region_name)  # 直接采集【测谎坐标框】标注记录的坐标框信息，不做模板匹配。
+                new_region = (region_box.x, region_box.y, region_box.width, region_box.height) if region_box is not None else None  # 转为四元组，未采集到时为 None。
+                if new_region is None:  # 本帧未采集到坐标框：沿用旧区域，从未有过则跳过求解。
+                    if region is None:  # 从未采集到坐标框。
+                        new_frame = self._get_solve_frame(pump, LIE_FRAME_WAIT)  # 走采集线程短等/等新帧后重试，不串行睡等。
+                        if new_frame is not None:  # 取到新帧才替换；numpy 数组不能用 or 判真值，必须显式判 None。
+                            frame = new_frame  # 更新当前帧，取不到沿用旧帧。
+                        continue  # 进入下一轮检查。
+                elif region is None or any(abs(new_region[i] - region[i]) > LIE_REGION_SHIFT_PIXELS for i in range(4)):  # 区域首次出现或位置/尺寸明显变化（任一边超阈值）。
+                    region = new_region  # 更新区域。
+                    session.reset(region[2], region[3])  # 重置光流会话：清空光流历史、模板与粒子跟踪器，避免上一局污染。
+                    mouse_pos = None  # 鼠标目标点重新校准。
+                else:  # 区域位置稳定。
+                    region = new_region  # 刷新区域（尺寸可能微调）。
+                # 录像由录像器的独立采集线程按真 30FPS 抓帧（见 _start_recorder 的独立 capture），解题循环不再逐帧写，避免与自采集重复喂帧。
+                crop = frame[region[1]:region[1] + region[3], region[0]:region[0] + region[2]]  # 裁出谎言检测图形区域。
+                _t_flow = time.perf_counter()  # 计时起点：稠密光流+粒子滤波（extreme 档主力耗时）。
+                result = session.update(crop, fps)  # 喂入光流粒子滤波会话，返回单帧跟踪结果（区域局部坐标）。
+                seg_flow += (time.perf_counter() - _t_flow) * 1000.0; seg_flow_n += 1  # 累计本段毫秒与次数。
+                if result.tracker_alive and result.center is not None:  # 有有效跟踪输出时才移动光标。
+                    abs_center = (region[0] + float(result.center[0]), region[1] + float(result.center[1]))  # 目标中心由区域局部坐标换算为画面绝对坐标。
+                    mouse_pos = self._move_mouse_toward(mouse_pos, abs_center, dt)  # 按帧间真实秒数缩放步长：光标追赶速度与实测帧率无关。
+                if time.time() - last_diag_time >= 1.0:  # 每秒限频输出一次诊断日志。
+                    last_diag_time = time.time()  # 记录本次诊断时间。
+                    center = result.center  # 目标中心（区域局部坐标）。
+                    center_desc = f"({center[0]:.1f},{center[1]:.1f})" if center is not None else "-"  # 中心描述。
+                    inst_fps = (1.0 / dt) if dt > 1e-6 else 0.0  # 本帧瞬时处理帧率，供核对提速效果。
+                    avg_wait = seg_wait / seg_wait_n if seg_wait_n else 0.0  # 近 1 秒「等新帧」均耗时(ms)。
+                    avg_match = seg_match / seg_match_n if seg_match_n else 0.0  # 近 1 秒「全屏触发匹配」均耗时(ms)。
+                    avg_flow = seg_flow / seg_flow_n if seg_flow_n else 0.0  # 近 1 秒「光流+粒子」均耗时(ms)。
+                    avg_overlay = seg_overlay / seg_overlay_n if seg_overlay_n else 0.0  # overlay 单次均耗时(ms)，受节流非每 tick，括号内为每秒推送次数。
+                    pump_fps = 0.0  # 采集线程实测供帧率：wait 高时用它区分是采集封顶(pump_fps≈tick fps)还是处理封顶(pump_fps≈30)。
+                    if pump is not None:  # 有独立采集线程才统计（回退旧共享采集路径时无 pump，保持 0）。
+                        _diag_perf = time.perf_counter()  # 本次诊断时刻。
+                        _diag_span = _diag_perf - last_diag_perf  # 距上次诊断的真实秒数（≈1）。
+                        pump_fps = (pump._seq - last_diag_seq) / _diag_span if _diag_span > 1e-6 else 0.0  # 本窗口 pump 存入帧数/秒 = 采集线程实际交付帧率。
+                        last_diag_perf = _diag_perf  # 滚动诊断窗口基准时刻。
+                        last_diag_seq = pump._seq  # 滚动诊断窗口基准序号。
+                    logger.info(f"Lie solve diag: source={result.source} conf={result.confidence:.2f} center={center_desc} cursor={mouse_pos} whites={result.white_candidates} snr={result.border_snr:.2f} tick={tick} fps={inst_fps:.1f} cost_ms wait={avg_wait:.1f} match={avg_match:.1f} flow={avg_flow:.1f} overlay={avg_overlay:.1f}({seg_overlay_n}/s) pump_fps={pump_fps:.1f} 解测谎诊断：帧率与各段单帧耗时(ms)，pump_fps 为采集线程实测供帧率，用于判定 wait 高是采集封顶还是处理封顶。")  # 供排查跟踪为空与帧率不达标。
+                    seg_match = seg_flow = seg_overlay = seg_wait = 0.0  # 打印后清零，下一窗口重新累计。
+                    seg_match_n = seg_flow_n = seg_overlay_n = seg_wait_n = 0
+                if now - last_vision_time >= VISION_PUSH_INTERVAL:  # overlay 节流到约 12FPS：预览无需跟满解题帧率，省掉每 tick 整帧 copy+绘制。
+                    last_vision_time = now  # 记录本次推送时刻。
+                    _t_overlay = time.perf_counter()  # 计时起点：整帧绘制叠加 + 推送 UI。
+                    self._update_vision(self.draw_shape_overlay(frame, region, result, trigger_box))  # 把光流轮廓、目标中心与触发标注框选推送给 UI。
+                    seg_overlay += (time.perf_counter() - _t_overlay) * 1000.0; seg_overlay_n += 1  # 累计本段毫秒与次数。
+                if result.source == SOURCE_SCENE_ENDED:  # 场景结束（切场景/结算文字）：测谎已解，退出。
+                    logger.info("Lie detector scene ended, resume. 光流判定场景结束，测谎已解，解除测谎状态。")  # 记录退出原因。
+                    outcome = "solved"  # 录像标记为已解出。
+                    break  # 退出子循环。
+                _t_wait = time.perf_counter()  # 计时起点：向采集线程等新帧（反映采集节拍与是否被算子拖慢）。
+                new_frame = self._get_solve_frame(pump, CAPTURE_MIN_INTERVAL)  # 取最新一帧：采集线程就绪时等新帧到达即返回（与处理并行），无新帧最多等一个帧间隔。
+                seg_wait += (time.perf_counter() - _t_wait) * 1000.0; seg_wait_n += 1  # 累计本段毫秒与次数。
+                if new_frame is not None:  # 取到新帧才替换，取不到沿用上一帧继续求解。
+                    frame = new_frame  # 更新当前帧。
+        finally:
+            self._stop_solve_pump(pump, pump_release)  # 收尾：停采集线程并释放独立采集实例，绝不泄漏会话/GDI。
+        return outcome  # 返回结束原因（solved/timeout/gone/aborted），供录像边车记录。
 
     def _settle_lie_result(self, threshold):  # 解测谎结算：触发标注消失后开 LIE_SETTLE_WAIT 秒窗口，出现【测谎成功】则成功并点确定收尾，窗口内未出现则失败。
         self._set_status("settling")  # 结算态，供日志/诊断区分于解题态。
@@ -719,17 +924,22 @@ class LieDetectorService:  # 独立测谎监控服务：后台守护线程值守
         logger.warning("Lie success confirm timeout, still mark SUCCESS. 点击【测谎成功确定】超时仍未消失，按成功收尾。")  # 记录超时兜底。
         return "success"  # 已出现过成功标注，超时也归为成功。
 
-    def _move_mouse_toward(self, current, target):  # 每帧向预测光标位置分步移动鼠标，返回移动后的位置。
+    def _move_mouse_toward(self, current, target, dt=None):  # 每帧向预测光标位置分步移动鼠标，返回移动后的位置；dt 为本帧真实间隔（秒），用于把步长按秒缩放，使光标像素速度与实测帧率无关。
+        if dt is None:  # 单测/按帧驱动：用设计步长 LIE_MOVE_MAX_STEP（30FPS 标定值），行为与旧实现逐位一致。
+            step = LIE_MOVE_MAX_STEP
+        else:  # 生产传真实帧间隔：按「像素速度=步长×目标帧率≈1500px/s」缩放，dt 越大单帧允许跨的像素越多；截到 5 帧内防止卡顿帧光标瞬移过大。
+            velocity = LIE_MOVE_MAX_STEP / CAPTURE_MIN_INTERVAL  # 设计像素速度：30FPS 下每帧最多走 LIE_MOVE_MAX_STEP。
+            step = max(1.0, min(float(dt), 5 * CAPTURE_MIN_INTERVAL) * velocity)  # 最短 1 像素，最长 5 帧位移。
         if current is None:  # 首帧无参照点，直接跳到预测点（游戏内光标也会瞬间到位）。
             position = target  # 目标位置即预测光标点。
-        else:  # 已有参照点，按最大步长追赶。
+        else:  # 已有参照点，按步长上限追赶。
             dx = target[0] - current[0]  # 到预测点的横向位移。
             dy = target[1] - current[1]  # 到预测点的纵向位移。
             distance = math.hypot(dx, dy)  # 直线距离。
-            if distance <= LIE_MOVE_MAX_STEP:  # 距离在一个步长内，一步到位。
+            if distance <= step:  # 距离在一个步长内，一步到位。
                 position = target  # 直接到达预测点。
-            else:  # 距离超过单步上限，按最大步长截断方向向量。
-                position = (current[0] + dx / distance * LIE_MOVE_MAX_STEP, current[1] + dy / distance * LIE_MOVE_MAX_STEP)  # 沿目标方向移动一步。
+            else:  # 距离超过单步上限，按步长截断方向向量。
+                position = (current[0] + dx / distance * step, current[1] + dy / distance * step)  # 沿目标方向移动一步。
         self._move(int(position[0]), int(position[1]))  # 画面坐标转为鼠标移动事件发给游戏窗口。
         return position  # 返回当前位置，供下一帧作参照。
 
@@ -876,8 +1086,14 @@ class LieDetectorService:  # 独立测谎监控服务：后台守护线程值守
             self._disable_gpu(e)  # 关闭加速并回退 CPU。
             return None  # 本帧走 CPU。
 
-    def _disable_gpu(self, error):  # 运行期显卡异常：本进程内关闭加速并回退 CPU，避免每帧重复失败刷日志。
-        if not self._gpu_off:  # 首次失败才记日志。
+    def _disable_gpu(self, error):  # 运行期显卡异常处理：区分「与 CUDA Graph 捕获并发的瞬时流冲突」与真正的显卡故障。
+        message = str(error)  # 异常文本，用于判定是否为可自愈的瞬时冲突。
+        if ("stream is capturing" in message) or ("StreamCapture" in message):  # cudaErrorStreamCaptureUnsupported：捕获期内另一线程发了 CuPy 核，本帧匹配被拒，属可自愈的瞬时冲突。
+            if not self._gpu_transient_warned:  # 首次瞬时冲突才记日志，避免逐帧刷屏。
+                logger.warning(f"Lie GPU match hit a transient CUDA graph stream-capture conflict; this frame used CPU and will retry next frame: {error}. 显卡匹配与 CUDA Graph 捕获发生瞬时流冲突，本帧回退 CPU、下帧自动重试（不永久降级）。")
+                self._gpu_transient_warned = True  # 置位告警标志。
+            return  # 瞬时冲突不置 _gpu_off、不释放 self._gpu：本帧由调用方回退 CPU 即可，下一帧自动重试显卡，加速能力不丢。
+        if not self._gpu_off:  # 真正的显卡故障（显存不足/驱动重置等）：首次失败才记日志。
             logger.warning(f"Lie service GPU match failed, fallback to CPU: {error}. 测谎服务显卡匹配失败，已自动降级 CPU 模板匹配。")
         self._gpu_off = True  # 置位关闭标志。
         self._gpu = None  # 释放匹配器持有的显存。

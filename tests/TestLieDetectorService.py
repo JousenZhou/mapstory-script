@@ -588,7 +588,7 @@ class TestLieDetectorService(unittest.TestCase):
 
     @unittest.skipUnless(service_module.LIE_SOLVER_AVAILABLE, "liedetector optical-flow solver unavailable")
     def test_solve_does_not_write_frames_recorder_self_captures(self):
-        # 录像改由录像器的独立采集线程按真 30FPS 抓帧（_start_recorder 传 capture=self._capture）：解题循环不再逐帧 write，避免与自采集重复喂帧。
+        # 录像改由录像器的独立采集线程抓帧：_start_recorder 经 _make_recorder_capture() 克隆一个独立 BitBlt 实例（自带 lock/DC，不与解题循环争锁）传给录像器，按游戏当前真实帧率自由抓帧去重。解题循环不再逐帧 write，避免与自采集重复喂帧。
         frame = np.full((300, 400, 3), 20, dtype=np.uint8)
         region = SimpleNamespace(x=100, y=50, width=200, height=150)
         ended = SimpleNamespace(source=service_module.SOURCE_SCENE_ENDED, center=None, contour=None,
@@ -607,6 +607,54 @@ class TestLieDetectorService(unittest.TestCase):
             outcome = self.service._solve(frame, "测谎触发", "测谎坐标框", 0.7)
         self.assertEqual("solved", outcome)  # 场景结束退出。
         recorder.write.assert_not_called()  # 解题循环不再逐帧写录像（改由录像器自采集线程负责）。
+
+    def test_make_recorder_capture_clones_wgc_independent_session(self):
+        # 当前采集方式为 WGC 时：_make_recorder_capture 必须克隆一个独立 WGC 会话（release 非空 => independent_capture=True），
+        # grab 走独立实例的 get_frame、release 关闭独立会话。回归防护：绝不退回共享采集（否则录像与解题瓜分同一窗口帧、回放偏快）。
+        class FakeWGC:  # 伪造 WindowsGraphicsCaptureMethod：构造即登记实例，connected/get_frame/close 可控。
+            instances = []
+
+            def __init__(self, hwnd_window):
+                self.hwnd_window = hwnd_window
+                self.grabs = 0
+                self.closed = False
+                FakeWGC.instances.append(self)
+
+            def connected(self):
+                return True
+
+            def get_frame(self):
+                self.grabs += 1
+                return np.zeros((8, 8, 3), dtype=np.uint8)
+
+            def close(self):
+                self.closed = True
+
+        hwnd = SimpleNamespace(app_exit_event=None)  # 目标窗口元数据（含 app_exit_event）。
+        shared = FakeWGC(hwnd)  # 解题循环正在用的共享 WGC 实例。
+        FakeWGC.instances.clear()  # 只统计后续克隆出的独立实例。
+        fake_dm = SimpleNamespace(capture_method=shared)
+        with patch("ok.device.capture_methods.windows_graphics.WindowsGraphicsCaptureMethod", FakeWGC), \
+                patch.object(service_module.og, "device_manager", fake_dm, create=True):
+            grab, release = self.service._make_recorder_capture()
+        self.assertEqual(1, len(FakeWGC.instances), "应克隆出且仅克隆出一个独立 WGC 实例")
+        clone = FakeWGC.instances[0]
+        self.assertIsNotNone(release, "WGC 独立采集应返回 release 回调（independent_capture=True 的前提）")
+        self.assertIsNot(grab, self.service._capture, "grab 必须是独立采集回调，不能是共享 _capture")
+        self.assertIsNotNone(grab(), "grab() 应从独立会话取到帧")
+        self.assertEqual(1, clone.grabs, "grab() 应走独立实例的 get_frame，而非共享实例")
+        self.assertEqual(0, shared.grabs, "共享实例不应被录像 grab 触碰")
+        release()
+        self.assertTrue(clone.closed, "release() 应关闭独立 WGC 会话，避免逐局泄漏")
+        self.assertFalse(shared.closed, "release() 不得关闭解题循环共用的会话")
+
+    def test_make_recorder_capture_falls_back_to_shared_for_unknown_method(self):
+        # 采集方式既非 WGC 也非 BitBlt（如 DXGI）时：回退共享 _capture、release 为 None（不克隆、无额外资源需释放）。
+        fake_dm = SimpleNamespace(capture_method=SimpleNamespace(hwnd_window=SimpleNamespace()))  # 未知类型（非 WGC/BitBlt）。
+        with patch.object(service_module.og, "device_manager", fake_dm, create=True):
+            grab, release = self.service._make_recorder_capture()
+        self.assertEqual(grab, self.service._capture, "未知采集方式应回退共享 _capture")
+        self.assertIsNone(release, "回退共享时无独立资源需释放，release 应为 None")
 
     # ------------------------------------------------------------------ 解测谎结算
 
@@ -899,6 +947,27 @@ class TestLieDetectorService(unittest.TestCase):
                 patch.object(self.service, "_feature_set", return_value=MagicMock()):
             self.assertIsNone(self.service._gpu_handle(frame, ["测谎触发"]))
         self.assertTrue(self.service._gpu_off)  # 已关闭加速。
+        self.assertIsNone(self.service._gpu)  # 匹配器已释放。
+
+    def test_disable_gpu_treats_stream_capture_conflict_as_transient(self):
+        # 与 CUDA Graph 捕获并发的瞬时流冲突（cudaErrorStreamCaptureUnsupported）不应永久降级：保留匹配器、下帧自动重试，且只告警一次。
+        gpu = MagicMock()
+        self.service._gpu = gpu
+        conflict = RuntimeError("cudaErrorStreamCaptureUnsupported: operation not permitted when stream is capturing")
+        self.service._disable_gpu(conflict)
+        self.assertFalse(self.service._gpu_off)  # 不永久关闭加速（区别于真故障）。
+        self.assertIs(gpu, self.service._gpu)  # 匹配器未释放，下一帧仍能走显卡。
+        self.assertTrue(self.service._gpu_transient_warned)  # 首次冲突已告警。
+        with patch.object(service_module.logger, "warning") as warn:
+            self.service._disable_gpu(conflict)  # 第二次同类瞬时冲突。
+        warn.assert_not_called()  # 已告警过，不逐帧刷屏。
+
+    def test_disable_gpu_still_permanently_disables_on_real_fault(self):
+        # 真正的显卡故障（非流冲突文本）仍须永久降级并释放匹配器，与瞬时冲突路径区分开。
+        gpu = MagicMock()
+        self.service._gpu = gpu
+        self.service._disable_gpu(RuntimeError("device lost"))
+        self.assertTrue(self.service._gpu_off)  # 永久关闭加速。
         self.assertIsNone(self.service._gpu)  # 匹配器已释放。
 
     def test_find_trigger_uses_gpu_box_and_skips_cpu(self):

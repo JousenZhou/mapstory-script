@@ -131,11 +131,13 @@ config = {
     'my_app': ['src.globals', 'Globals'], #可选. 全局单例对象, 可以存放加载的模型, 使用og.my_app调用
     'custom_tabs': [  # 自定义 GUI 页签
         ["src.ui.DashboardTab", "DashboardTab"],  # 看板页签：实时识图画面 + 测谎/角色/怪物共享配置（任务从这里采集参数）
+        ["src.ui.MapTab", "MapTab"],  # 地图页签：管理路线挂机的全局小地图底图与彩色指令路线图（资产与配置）
         ["src.ui.LieDetectorTab", "LieDetectorTab"],  # 测谎检验页签, 上传谎言检测器录像验证求解流水线
     ],
     'onetime_tasks': [  # 用户点击触发的任务
         ["src.tasks.MapleIdleTask", "MapleIdleTask"],
         ["src.tasks.MaplePatrolTask", "MaplePatrolTask"],
         ["src.tasks.MapleSingleSpotTask", "MapleSingleSpotTask"],
+        ["src.tasks.MapleRouteTask", "MapleRouteTask"],  # 地图路线挂机：消费地图页签的全局小地图底图与彩色指令路线图
     ],
 }

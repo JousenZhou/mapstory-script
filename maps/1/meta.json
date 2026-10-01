@@ -1,0 +1,28 @@
+{
+    "Display Name": "",
+    "Search Range": 10,
+    "Color Code": {
+        "255,0,0": "left none none",
+        "0,0,255": "right none none",
+        "255,127,0": "left none jump",
+        "0,255,255": "right none jump",
+        "127,255,0": "none down jump",
+        "255,0,255": "none none jump",
+        "0,255,127": "stop stop stop",
+        "255,255,0": "none none goal",
+        "255,0,127": "none up teleport",
+        "127,0,255": "none down teleport",
+        "0,127,0": "left none teleport",
+        "139,69,19": "right none teleport"
+    },
+    "Color Code Up Down": {
+        "127,127,127": "none up none",
+        "255,255,127": "none down none"
+    },
+    "Edge Color": "255,127,127",
+    "Use Teleport To Walk": false,
+    "Teleport Cooldown": 1.0,
+    "Minimap Feature": "完整小地图",
+    "Minimap Threshold": 0.8,
+    "Monster Features": ""
+}

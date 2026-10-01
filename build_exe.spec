@@ -28,6 +28,8 @@ _hidden = [
     'src.config',
     'src.globals',
     'src.dashboard_store',
+    'src.map_store',
+    'src.map_route',
     'src.gpu_match',
 ]
 if _app_cfg.config.get('my_app'):  # 全局单例对象模块 (og.my_app)。

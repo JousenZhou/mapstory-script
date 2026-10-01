@@ -203,6 +203,30 @@
       "file_name": "33.png",
       "width": 1366,
       "height": 768
+    },
+    {
+      "id": 40,
+      "file_name": "34.png",
+      "width": 1366,
+      "height": 768
+    },
+    {
+      "id": 41,
+      "file_name": "35.png",
+      "width": 1366,
+      "height": 768
+    },
+    {
+      "id": 42,
+      "file_name": "36.png",
+      "width": 1366,
+      "height": 768
+    },
+    {
+      "id": 43,
+      "file_name": "37.png",
+      "width": 1366,
+      "height": 768
     }
   ],
   "annotations": [
@@ -279,9 +303,9 @@
         670,
         339,
         45,
-        18
+        16
       ],
-      "area": 810,
+      "area": 720,
       "iscrowd": 0
     },
     {
@@ -842,6 +866,123 @@
       ],
       "area": 544,
       "iscrowd": 0
+    },
+    {
+      "id": 50,
+      "image_id": 40,
+      "category_id": 50,
+      "bbox": [
+        5,
+        70,
+        144,
+        117
+      ],
+      "area": 16848,
+      "iscrowd": 0
+    },
+    {
+      "id": 51,
+      "image_id": 40,
+      "category_id": 51,
+      "bbox": [
+        385,
+        437,
+        28,
+        16
+      ],
+      "area": 448,
+      "iscrowd": 0
+    },
+    {
+      "id": 52,
+      "image_id": 40,
+      "category_id": 52,
+      "bbox": [
+        641,
+        437,
+        37,
+        35
+      ],
+      "area": 1295,
+      "iscrowd": 0
+    },
+    {
+      "id": 53,
+      "image_id": 40,
+      "category_id": 53,
+      "bbox": [
+        530,
+        439,
+        42,
+        34
+      ],
+      "area": 1428,
+      "iscrowd": 0
+    },
+    {
+      "id": 54,
+      "image_id": 41,
+      "category_id": 54,
+      "bbox": [
+        642,
+        427,
+        25,
+        35
+      ],
+      "area": 875,
+      "iscrowd": 0
+    },
+    {
+      "id": 55,
+      "image_id": 42,
+      "category_id": 55,
+      "bbox": [
+        328,
+        470,
+        43,
+        32
+      ],
+      "area": 1376,
+      "iscrowd": 0
+    },
+    {
+      "id": 56,
+      "image_id": 42,
+      "category_id": 56,
+      "bbox": [
+        176,
+        494,
+        39,
+        26
+      ],
+      "area": 1014,
+      "iscrowd": 0
+    },
+    {
+      "id": 57,
+      "image_id": 42,
+      "category_id": 57,
+      "bbox": [
+        593,
+        496,
+        25,
+        26
+      ],
+      "area": 650,
+      "iscrowd": 0
+    },
+    {
+      "id": 58,
+      "image_id": 43,
+      "category_id": 58,
+      "bbox": [
+        325,
+        299,
+        17,
+        27
+      ],
+      "area": 459,
+      "iscrowd": 0
     }
   ],
   "categories": [
@@ -1089,6 +1230,51 @@
       "id": 49,
       "name": "测谎成功确定",
       "supercategory": ""
+    },
+    {
+      "id": 50,
+      "name": "训练场1",
+      "supercategory": "地图"
+    },
+    {
+      "id": 51,
+      "name": "蜗牛",
+      "supercategory": "怪物"
+    },
+    {
+      "id": 52,
+      "name": "蓝蜗牛1",
+      "supercategory": "怪物"
+    },
+    {
+      "id": 53,
+      "name": "红蜗牛",
+      "supercategory": "怪物"
+    },
+    {
+      "id": 54,
+      "name": "蘑菇1",
+      "supercategory": "怪物"
+    },
+    {
+      "id": 55,
+      "name": "AA",
+      "supercategory": "怪物"
+    },
+    {
+      "id": 56,
+      "name": "BB",
+      "supercategory": "怪物"
+    },
+    {
+      "id": 57,
+      "name": "CC",
+      "supercategory": "怪物"
+    },
+    {
+      "id": 58,
+      "name": "角色灯泡",
+      "supercategory": "角色"
     }
   ]
 }

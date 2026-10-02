@@ -596,7 +596,8 @@ class TestLieDetectorService(unittest.TestCase):
                                 flow_residual=None)  # 首轮即场景结束，跑一帧就退出。
         fake_session = SimpleNamespace(reset=lambda w, h: None, update=lambda crop, fps: ended)
         recorder = MagicMock()  # 假录像器：验证解题循环不再直接 write。
-        self.service._recorder = recorder
+        recorder.captured_frames.return_value = 6  # 提前段已入 6 帧：首喂帧快照应得偏移 5。
+        self.service._recorder = recorder  # 假录像器同样被首喂帧快照偏移，验证 MagicMock/异常计数都不拖垮解题。
         with patch.object(self.service, "_ensure_in_front"), \
                 patch.object(service_module, "ShapeTrackSession", return_value=fake_session), \
                 patch.object(self.service, "_find_trigger", return_value=SimpleNamespace(x=10, y=10, width=50, height=20)), \
@@ -607,6 +608,51 @@ class TestLieDetectorService(unittest.TestCase):
             outcome = self.service._solve(frame, "测谎触发", "测谎坐标框", 0.7)
         self.assertEqual("solved", outcome)  # 场景结束退出。
         recorder.write.assert_not_called()  # 解题循环不再逐帧写录像（改由录像器自采集线程负责）。
+        self.assertEqual(5, self.service._last_feed_start_frame, "首喂帧快照取 captured_frames-1")
+
+    @unittest.skipUnless(service_module.LIE_SOLVER_AVAILABLE, "liedetector optical-flow solver unavailable")
+    def test_solve_records_feed_trace(self):
+        # _solve 把每个真正喂入 session 的 tick 记为一条 FeedStep，收尾交 self._last_feed_trace（供 _stop_recorder 写进边车）：
+        # 验证【接线】——步数≈喂帧数、首步 reset=True 且区域相对裁剪原点归一、update 收到的 fps 落在 [5,60]（按 1/dt 而非恒 30）。
+        frame = np.full((300, 400, 3), 20, dtype=np.uint8)
+        trigger = SimpleNamespace(x=10, y=10, width=50, height=20)
+        region = SimpleNamespace(x=100, y=50, width=200, height=150)
+        state = {"updates": 0, "resets": 0, "fps": []}  # 喂帧计数 / reset 计数 / 捕获 update 收到的 fps。
+        waiting = SimpleNamespace(source="waiting", center=None, contour=None, confidence=0.0,
+                                  border_snr=0.0, tracker_alive=False, white_candidates=0, flow_residual=None)
+        ended = SimpleNamespace(source=service_module.SOURCE_SCENE_ENDED, center=None, contour=None,
+                                confidence=0.0, border_snr=0.0, tracker_alive=False, white_candidates=0, flow_residual=None)
+
+        def fake_update(crop, fps):  # 记录本次 update 收到的 fps，第 5 次喂帧判场景结束退出。
+            state["updates"] += 1
+            state["fps"].append(fps)
+            return ended if state["updates"] >= 5 else waiting
+
+        def fake_reset(w, h):  # 区域首次出现时重置一次。
+            state["resets"] += 1
+
+        fake_session = SimpleNamespace(reset=fake_reset, update=fake_update)
+        self.service._recorder = SimpleNamespace(captured_frames=lambda: 47)  # 假录像器：起录→开题提前段已录 47 帧，首喂帧应快照偏移 46。
+        with patch.object(self.service, "_ensure_in_front"), \
+                patch.object(service_module, "ShapeTrackSession", return_value=fake_session), \
+                patch.object(self.service, "_find_trigger", return_value=trigger), \
+                patch.object(self.service, "_get_region_box", return_value=region), \
+                patch.object(self.service, "_update_vision"), \
+                patch.object(self.service, "_idle_sleep"), \
+                patch.object(self.service, "_capture", return_value=None):
+            outcome = self.service._solve(frame, "测谎触发", "测谎坐标框", 0.7)
+        self.assertEqual("solved", outcome)  # 场景结束退出。
+        trace = self.service._last_feed_trace
+        self.assertEqual(state["updates"], len(trace), "喂帧日程步数应等于实际喂入 session 的帧数")
+        self.assertEqual(46, self.service._last_feed_start_frame, "起点偏移应=首喂帧时录像器已入帧数-1（跳过起录→开题提前段）")
+        self.assertEqual(1, state["resets"], "区域恒定时仅首帧重置一次")
+        self.assertTrue(trace[0].reset, "首步应标记 reset（区域首次出现）")
+        self.assertFalse(any(step.reset for step in trace[1:]), "后续同区域不应重复 reset")
+        self.assertEqual((0, 0, 200, 150), trace[0].rect, "首步相对区域应为裁剪原点偏移 (0,0,w,h)")
+        self.assertTrue(all(isinstance(step.dt_ms, int) for step in trace), "dt_ms 应为整数毫秒")
+        # 接线关键：update 收到的 fps 均来自 compute_effective_fps（夹到 [5,60]），不再写死 30。
+        self.assertTrue(all(5.0 <= f <= 60.0 for f in state["fps"]), "每帧 fps 应落在共用夹取区间 [5,60]")
+        self.assertTrue(all(isinstance(step.source, str) for step in trace), "source 应如实记录")
 
     def test_make_recorder_capture_clones_wgc_independent_session(self):
         # 当前采集方式为 WGC 时：_make_recorder_capture 必须克隆一个独立 WGC 会话（release 非空 => independent_capture=True），

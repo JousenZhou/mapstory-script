@@ -99,6 +99,68 @@ class TestMapStore(unittest.TestCase):
         self.assertEqual(22, reloaded['Search Range'])
         self.assertEqual('我的地图', reloaded['Minimap Feature'])
 
+    def test_recording_meta_defaults_present(self):  # 键盘捕获录制的默认参数齐全（录制与界面都要能直接读到）。
+        map_store.create_map('keys', self._blank_map())
+        meta = map_store.load_meta('keys')
+        self.assertTrue(meta['Record Use Keys'])  # 默认开键盘捕获。
+        self.assertTrue(meta['Record Auto Goal'])  # 默认自动补终点。
+        self.assertEqual('left', meta['Record Left Keys'])  # 默认方向键。
+        self.assertEqual('', meta['Record Teleport Keys'])  # 默认不用瞬移。
+        self.assertAlmostEqual(0.25, meta['Record Action Tap Window'])  # 默认动作窗。
+
+    def test_route_events_sidecar_roundtrip(self):  # 事件流写入/读回：坐标、时刻、指令与 gap(null) 都能原样取回。
+        map_store.create_map('ev', self._blank_map(120, 80))
+        route = map_store.add_route('ev')
+        self.assertEqual(os.path.join(self.temp_dir, 'ev', 'route1.keys.json'),  # sidecar 与 PNG 同目录同前缀。
+                         map_store.route_events_path('ev', route))
+        events = [[0.0, 10, 20, 'right none none'], [0.5, 30, 20, None], [1.0, 40, 25, 'none none jump']]  # 含 gap。
+        map_store.save_route_events('ev', route, events, canvas=(120, 80), thickness=3)  # 落盘。
+        data = map_store.load_route_events('ev', route)  # 读回。
+        self.assertEqual(1, data['version'])  # 格式版本。
+        self.assertEqual([120, 80], data['canvas'])  # 画布尺寸。
+        self.assertEqual(3, data['thickness'])  # 录制时粗细。
+        self.assertEqual(events, data['events'])  # 事件逐字段一致（gap 仍是 None）。
+        self.assertTrue(map_store.has_route_events('ev', route))  # 存在性可查。
+
+    def test_load_route_events_missing_or_corrupt(self):  # 无 sidecar 或内容损坏时返回 None，不抛异常。
+        map_store.create_map('none_ev', self._blank_map())
+        route = map_store.add_route('none_ev')
+        self.assertIsNone(map_store.load_route_events('none_ev', route))  # 从未写过。
+        self.assertFalse(map_store.has_route_events('none_ev', route))  # 不存在。
+        with open(map_store.route_events_path('none_ev', route), 'w', encoding='utf-8') as f:  # 写脏数据。
+            f.write('{not json')
+        self.assertIsNone(map_store.load_route_events('none_ev', route))  # 损坏→None。
+
+    def test_route_events_short_rows_are_padded(self):  # 旧数据只有三列时补 None，调用方可安全解包。
+        map_store.create_map('short', self._blank_map())
+        route = map_store.add_route('short')
+        with open(map_store.route_events_path('short', route), 'w', encoding='utf-8') as f:  # 直接伪造 JSON。
+            f.write('{"version": 1, "events": [[1.0, 2, 3]]}')
+        data = map_store.load_route_events('short', route)  # 读回。
+        self.assertEqual([[1.0, 2, 3, None]], data['events'])  # 末尾补 null。
+
+    def test_list_routes_ignores_sidecar_and_backup(self):  # sidecar 与 .bak 不得混进路线列表（否则回放会读到假路线）。
+        map_store.create_map('polluted', self._blank_map())
+        route = map_store.add_route('polluted')
+        map_store.save_route_events('polluted', route, [[0.0, 1, 1, 'left none none']], canvas=(120, 80), thickness=2)  # 写 sidecar。
+        map_store.backup_route_image('polluted', route)  # 写 route1.png.bak。
+        self.assertEqual(['route1.png'], map_store.list_routes('polluted'))  # 列表仍只有 PNG。
+        self.assertTrue(os.path.isfile(map_store.route_path('polluted', route) + '.bak'))  # 备份确实存在。
+
+    def test_delete_route_removes_image_sidecar_and_backup(self):  # 删路线时三个文件一起消失。
+        map_store.create_map('gone', self._blank_map())
+        route = map_store.add_route('gone')
+        map_store.save_route_events('gone', route, [[0.0, 1, 1, 'left none none']], canvas=(120, 80), thickness=2)  # sidecar。
+        map_store.backup_route_image('gone', route)  # 备份。
+        map_store.delete_route('gone', route)  # 删除。
+        self.assertFalse(os.path.isfile(map_store.route_path('gone', route)))  # PNG 没了。
+        self.assertFalse(os.path.isfile(map_store.route_events_path('gone', route)))  # sidecar 没了。
+        self.assertFalse(os.path.isfile(map_store.route_path('gone', route) + '.bak'))  # 备份也没了。
+
+    def test_backup_route_image_without_source_returns_none(self):  # 原图不存在时不造假备份。
+        map_store.create_map('nobak', self._blank_map())
+        self.assertIsNone(map_store.backup_route_image('nobak', 'route9.png'))  # 无原图。
+
 
 if __name__ == '__main__':
     unittest.main()

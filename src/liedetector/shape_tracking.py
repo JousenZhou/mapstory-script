@@ -284,9 +284,12 @@ def detect_white_shapes(
     """在一帧里找出所有「低饱和高亮」的白色候选目标，按面积*置信度降序返回。
 
     测谎弹窗里的倒计时数字同样是白色（带蓝灰冷色边框阴影），会被白色掩码检成候选，
-    甚至与目标图形粘连成单一轮廓拉偏质心。这里用冷色光环特征加两道防线剔除它：
-    防线一在形态学前删掉贴着光环的白像素（吃数字本体、切粘连桥），防线二把大光环连通域
-    的 bbox 外扩成排除区，中心落在区内的候选（数字核心残片）直接丢弃。
+    甚至与目标图形粘连成单一轮廓拉偏质心。这里用冷色光环特征加三道防线剔除它：
+    防线零把真光环连通域填成「数字足迹」（凸包），形态学前整块删掉足迹内白像素——
+    粗笔画数字本体被连核心一并移除、数字↔图形粘连桥被切断（旧版仅向白像素吃入 2px，
+    够不到粗笔画核心，数字与图形粘连轮廓的质心被图形拽离排除区、被误学成畸形模板）；
+    防线一再从光环膨胀蚀除残留薄桥，防线二把大光环连通域的 bbox 外扩成排除区，
+    中心落在区内的候选（数字核心残片）直接丢弃。
     """
 
     height, width = frame.shape[:2]  # 帧的高和宽。
@@ -303,13 +306,17 @@ def detect_white_shapes(
     ).astype(np.uint8)
     _, halo_labels, halo_stats, _ = cv2.connectedComponentsWithStats(halo, 8)  # 冷色光环连通域（8 邻域）。
     halo_clean = np.zeros_like(halo)  # 通过面积+填充率门槛的真光环：防线一只从它膨胀。
+    digit_block = np.zeros_like(halo)  # 防线零数字足迹：真光环闭合圈的凸包实心域，罩住整条粗笔画数字本体。
     zones = []  # 防线二排除区：真光环 bbox 外扩一圈，防线一吃剩的数字核心残片会落在里面。
     for label, stat in enumerate(halo_stats[1:], start=1):  # 跳过背景连通域。
         halo_area = float(stat[cv2.CC_STAT_AREA])  # 连通域面积。
         halo_fill = halo_area / max(1.0, stat[cv2.CC_STAT_WIDTH] * stat[cv2.CC_STAT_HEIGHT])  # 填充率。
         if halo_area < HALO_MIN_AREA or halo_fill < HALO_MIN_FILL:  # 散点噪声/整帧级噪声连通域不入防线。
             continue  # 跳过。
-        halo_clean[halo_labels == label] = 1  # 保留真光环供防线一蚀除。
+        halo_clean[halo_labels == label] = 1  # 保留真光环供防线一膨胀。
+        halo_points = cv2.findNonZero((halo_labels == label).astype(np.uint8))  # 本光环全部像素坐标。
+        if halo_points is not None:  # 防线零：把闭合光环的凸包填成数字足迹（环+被圈住的数字本体）。
+            cv2.fillConvexPoly(digit_block, cv2.convexHull(halo_points), 1)  # 凸包实心域≈罩住数字本体的圆盘。
         zones.append(  # 记录一个排除区（bbox 四界外扩）。
             (
                 int(stat[cv2.CC_STAT_LEFT]) - HALO_ZONE_PAD,  # 左界外扩。
@@ -318,7 +325,8 @@ def detect_white_shapes(
                 int(stat[cv2.CC_STAT_TOP]) + int(stat[cv2.CC_STAT_HEIGHT]) + HALO_ZONE_PAD,  # 下界外扩。
             )
         )
-    mask[  # 防线一：删掉贴着蓝灰阴影的白像素，数字本体被从外向内吃掉、数字↔图形粘连桥被切断。
+    mask[digit_block > 0] = 0  # 防线零：整块删掉数字足迹内的白像素，粗笔画数字本体与粘连桥一并移除，星形（在光环外）保持干净。
+    mask[  # 防线一：再删掉贴着蓝灰阴影的白像素，吃掉足迹外溢出的数字边缘与残余薄桥。
         cv2.dilate(halo_clean, np.ones((HALO_DILATE_SIZE, HALO_DILATE_SIZE), np.uint8)) > 0
     ] = 0
     margin_x = max(2, int(width * 0.012))  # 左右边距，避开画面边框高光。
@@ -432,20 +440,43 @@ def estimate_detection_angle(
     return angle % template.symmetry_period, distance  # 角度折回对称周期域，同时返回形状距离。
 
 
+def choose_template_detection(detections: list[ShapeDetection]) -> ShapeDetection:
+    """从选窗窗口内的检测序列里挑一条最稳定的轮廓学模板：先按面积中位数挡住双向离群，再取组内置信度最高。
+
+    小目标开局的首帧常被倒计时数字粘连桥拽大（面积虚高），个别帧又被数字足迹削矮（面积偏小），
+    都是窗口里的少数帧；面积中位数天然剔除双向畸形，置信度（白度/亮度/实心度/延展度加权）
+    在正常形态组内越高说明轮廓越干净。
+    """
+
+    areas = sorted(item.area for item in detections)  # 面积排序，准备取中位数。
+    mid_index = len(areas) // 2  # 中位数下标。
+    median_area = 0.5 * (areas[mid_index] + areas[mid_index - 1]) if len(areas) % 2 == 0 else areas[mid_index]  # 中位面积。
+    near = [item for item in detections if 0.80 * median_area <= item.area <= 1.25 * median_area]  # 贴近中位的正常形态组（粘连/被削的离群帧落在组外）。
+    if not near:  # 容差带内一个都没有（面积全在跳变）。
+        near = list(detections)  # 退回全集，由置信度兜底选优。
+    return max(near, key=lambda item: item.confidence)  # 组内置信度最高的一条。
+
+
 def choose_shape_candidate(
     candidates: list[ShapeDetection],
     template: ShapeTemplate | None,
     center: np.ndarray | None,
     confidence: float,
+    size_floor: float = 0.0,
 ) -> ShapeDetection | None:
-    """从白色候选里挑出最可能是被跟踪目标的那一个。"""
+    """从白色候选里挑出最可能是被跟踪目标的那一个。
+
+    距离窗口按 ``max(模板标称尺寸, size_floor)`` 缩放：小目标（如小面积星星）若继续
+    按自身尺寸等比缩窗，目标稍微一跳就落在窗外被丢，颜色强测量白白浪费。
+    """
 
     if not candidates:  # 本帧没有任何白色候选。
         return None  # 返回空。
     if template is None or center is None:  # 还没学到模板，或没有位置先验。
         return candidates[0]  # 直接取排序第一（面积*置信度最大）的候选，用于初始化学习。
+    size_ref = max(float(template.nominal_size), float(size_floor or 0.0))  # 阈值基准：小目标抬到绝对下限。
     plausible: list[tuple[float, ShapeDetection]] = []  # 收集通过尺度/距离窗口筛选的候选及其得分。
-    allowed_distance = template.nominal_size * (1.5 if confidence >= 0.25 else 3.5)  # 置信度高时窗口收紧，丢失后放宽。
+    allowed_distance = size_ref * (1.5 if confidence >= 0.25 else 3.5)  # 置信度高时窗口收紧，丢失后放宽。
     for candidate in candidates:  # 逐个候选判定。
         scale = candidate.nominal_size / max(template.nominal_size, 1.0)  # 相对模板的尺度比。
         if not 0.68 <= scale <= 1.38:  # 尺度差太多，不可能是同一个目标。
@@ -459,7 +490,7 @@ def choose_shape_candidate(
         match = float(cv2.matchShapes(candidate.contour, template.points.reshape(-1, 1, 2), cv2.CONTOURS_MATCH_I1, 0.0))  # Hu 矩形状相似度，越小越像。
         score = (  # 综合打分：置信度为主，距离/形状差为惩罚。
             candidate.confidence  # 白色检测置信度。
-            - 0.18 * distance / max(template.nominal_size, 1.0)  # 归一化距离惩罚。
+            - 0.18 * distance / max(size_ref, 1.0)  # 归一化距离惩罚（与窗口同基准，小目标不被惩罚主导）。
             - 0.16 * min(match, 2.0)  # Hu 矩形状惩罚，截断避免异常值主导。
             - 0.10 * shape_distance  # 循环对齐残差惩罚。
         )
@@ -589,6 +620,7 @@ class ParticleShapeTracker:
         coarse_top: int = 30,  # 粗扫后进入精扫的 top-K 邻域数。
         refine_per_top: int = 8,  # 每个粗扫邻域生成的精扫拖尾候选数。
         relocation_cooldown: int = 15,  # 两次全局重定位之间的最小间隔帧数（限频）。
+        min_size_floor: float = 0.0,  # 阈值类尺寸的绝对下限（处理尺度像素）：小目标不再把窗口/限速/抖动等比缩窄。
         backend=None,  # 打分后端（gpu_shape_backend.ShapeScoreBackend），None 时用 NumPy 后端。
     ):
         self.template = template  # 保存模板。
@@ -605,6 +637,10 @@ class ParticleShapeTracker:
         self.coarse_top = coarse_top  # 保存粗扫 top-K。
         self.refine_per_top = refine_per_top  # 保存每邻域精扫候选数。
         self.relocation_cooldown = relocation_cooldown  # 保存重定位冷却帧数。
+        # 阈值基准尺寸：几何类（粒子扩散/边界余量/尺度测量）仍用模板真实尺寸，
+        # 窗口/限速/半径/抖动/似然宽度这类阈值用 size_ref，小目标抬到绝对下限，
+        # 否则 nominal_size 越小重定位越容易失败，恰好是小星星难解的主因之一。
+        self.size_ref = max(float(template.nominal_size), float(min_size_floor or 0.0), 4.0)  # 下限 4 像素防除零。
         self.scale = 1.0  # 当前估计的目标缩放，初值 1。
         # 随机数一律在 NumPy 侧生成（保住 random_seed 的可复现契约），整块搬上设备后不再回主存。
         states = np.zeros((particle_count, 6), dtype=np.float32)  # 粒子状态矩阵。
@@ -626,7 +662,7 @@ class ParticleShapeTracker:
         self.frames_since_relocation = relocation_cooldown  # 距上次重定位的帧数，初始即满允许首次立即重定位。
         self.last_border_score = 0.0  # 上一次边界加权得分，供诊断输出。
         self.last_border_snr = 0.0  # 上一次边界信噪比，供诊断输出。
-        self.search_radius = template.nominal_size * 0.5  # 当前搜索半径，供诊断输出。
+        self.search_radius = self.size_ref * 0.5  # 当前搜索半径，供诊断输出。
 
     def _estimate_device(self):  # 在后端设备上算出全部加权估计量，不做任何主存同步。
         """返回 ``(center, velocity, cosine, sine, plain_mean)``，全部是设备上的张量。
@@ -682,7 +718,7 @@ class ParticleShapeTracker:
         vel_y = xp.where(top, xp.maximum(vel_y, 0.0), vel_y)  # 上界处不允许继续向上的速度。
         pos_y = xp.where(bottom, xp.full_like(pos_y, max_y), pos_y)  # 钳回下边界。
         vel_y = xp.where(bottom, xp.minimum(vel_y, 0.0), vel_y)  # 下界处不允许继续向下的速度。
-        max_speed = self.template.nominal_size * self.max_speed_ratio  # 单帧最大位移。
+        max_speed = self.size_ref * self.max_speed_ratio  # 单帧最大位移（小目标抬到下限，不被限速锁死）。
         speed = xp.linalg_norm(xp.concatenate([vel_x, vel_y], axis=1), axis=1)  # 当前速度大小 (count,)。
         too_fast = speed > max_speed  # 超速的粒子。
         # 超速的按 max_speed/speed 等比缩放（保留方向），其余乘 1 保持原样；
@@ -733,7 +769,7 @@ class ParticleShapeTracker:
             angle_distance = periodic_angle_difference(  # 周期域角度偏差。
                 angles, detection.angle, self.template.symmetry_period  # 粒子角度 vs 检测角度。
             )
-            position_sigma = max(5.0, self.template.nominal_size * 0.22)  # 位置似然标准差，随尺寸自适应。
+            position_sigma = max(5.0, self.size_ref * 0.22)  # 位置似然标准差，随阈值基准尺寸自适应（小目标有下限）。
             angle_sigma = max(8.0, self.template.symmetry_period * 0.15)  # 角度似然标准差，随对称周期自适应。
             likelihood = xp.exp(-0.5 * (distance / position_sigma) ** 2)  # 位置高斯似然。
             # 对称/接近圆形的轮廓携带的角度信息很弱，必须降低角度项权重。
@@ -777,7 +813,7 @@ class ParticleShapeTracker:
         self.frames_since_reliable = 0  # 可靠计数归零。
         self.last_border_score = 0.0  # 清零边界诊断值。
         self.last_border_snr = 0.0  # 清零信噪比诊断值。
-        self.search_radius = self.template.nominal_size * 0.5  # 搜索半径回到默认值。
+        self.search_radius = self.size_ref * 0.5  # 搜索半径回到默认值。
         self._resample_if_needed(force=False)  # 按需重采样，不强制。
 
     def _proposal_states(self, reference_center: np.ndarray, velocity: np.ndarray, current_angle: float) -> np.ndarray:
@@ -791,10 +827,10 @@ class ParticleShapeTracker:
 
         proposal_count = self.global_proposals  # 候选总数。
         lost = max(1, self.frames_since_reliable)  # 已丢失帧数，下限 1 避免除零。
-        max_speed = self.template.nominal_size * self.max_speed_ratio  # 单帧最大位移。
+        max_speed = self.size_ref * self.max_speed_ratio  # 单帧最大位移（与限速约束同基准）。
         radius = min(  # 局部搜索半径：丢失越久半径越大，但不超过画面对角线。
             math.hypot(self.frame_width, self.play_height),  # 上限：画面对角线。
-            self.template.nominal_size * 0.55 + lost * max_speed,  # 基础半径 + 丢失期间可走的最大距离。
+            self.size_ref * 0.55 + lost * max_speed,  # 基础半径 + 丢失期间可走的最大距离。
         )
         self.search_radius = radius  # 记录搜索半径供诊断输出。
         local_count = max(120, int(proposal_count * 0.30))  # 局部候选数，至少 120 个。
@@ -877,7 +913,7 @@ class ParticleShapeTracker:
         coarse_result = score_shape_contours_on_backend(  # 粗扫只在 1.0 尺度下打分，结果留在设备上。
             temporal_map, coarse_states, self.template, 1.0, self.play_height, self.backend  # 证据图、候选、模板、尺度、有效高度与打分后端。
         )
-        prior_radius = self.template.nominal_size * (  # 距离先验半径：丢失越久容忍越宽。
+        prior_radius = self.size_ref * (  # 距离先验半径：丢失越久容忍越宽（小目标抬到下限，重定位不被先验锁死）。
             0.55 + 0.060 * min(self.frames_since_reliable, 10)  # 基础 0.55，每丢失一帧 +0.06，上限 10 帧。
         )
         coarse_distance = xp.linalg_norm(  # 候选到预测中心的距离。
@@ -890,7 +926,7 @@ class ParticleShapeTracker:
         bases = xp.to_numpy(xp.take(coarse_states, top_indices)).astype(np.float32)  # 一次 D2H：只把 top-K 行拉回主存做拖尾抖动。
 
         period = self.template.symmetry_period  # 对称周期。
-        position_jitter = max(4.0, self.template.nominal_size * 0.14)  # 位置抖动标准差：标称尺寸的 14%。
+        position_jitter = max(4.0, self.size_ref * 0.14)  # 位置抖动标准差：阈值基准的 14%（小目标有下限）。
         angle_jitter = max(6.0, period * 0.10)  # 角度抖动标准差：周期的 10%。
         refined_list: list[np.ndarray] = []  # 收集每个邻域的抖动候选组。
         for base in bases:  # 遍历粗扫 top-K 邻域（顺序即排序得分降序，随机数消耗次序与改造前一致）。
@@ -1067,7 +1103,7 @@ class ParticleShapeTracker:
             center = xp.astype(self._estimate_device()[0], xp.float32)  # 加权后的新中心。
             correction = xp.astype(xp.linalg_norm(center - predicted_device), xp.float64)  # 本帧修正幅度。
             maximum_correction = max(  # 允许的最大单帧修正。
-                20.0, self.template.nominal_size * self.max_correction_ratio  # 下限 20 像素，否则按标称尺寸比例。
+                20.0, self.size_ref * self.max_correction_ratio  # 下限 20 像素，否则按阈值基准尺寸比例。
             )
             evidence_confidence = evidence_confidence * xp.exp(  # 修正幅度越大，置信度扣得越狠（软惩罚）。
                 -0.5 * (correction / max(maximum_correction * 0.75, 1.0)) ** 2  # 高斯惩罚，标准差为上限的 75%。

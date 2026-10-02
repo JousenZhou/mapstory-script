@@ -23,10 +23,14 @@ from ok import og  # 读取当前截图设备画面，用于从实时画面导�
 
 from src.map_store import (  # 地图资产存取层。
     DEFAULT_COLOR_CODE, DEFAULT_COLOR_CODE_UP_DOWN, MAP_META_DEFAULTS,
-    add_route, create_map, delete_map, delete_route, get_default_map, list_maps,
-    list_routes, load_map_image, load_meta, load_route_image, map_size, rename_map,
-    save_map_image, save_meta, save_route_image, set_default_map, validate_routes)
-from src.map_recorder import MapRecorder, compute_map_rect, detect_yellow_dot  # 路线录制线程与实时定位纯函数。
+    add_route, backup_route_image, create_map, delete_map, delete_route, get_default_map, has_route_events,
+    list_maps, list_routes, load_map_image, load_meta, load_route_events, load_route_image, map_size,
+    rename_map, save_map_image, save_meta, save_route_image, set_default_map, validate_routes)
+from src import route_palette  # 指令色表反查（重绘路线与未知色提示）。
+from src.key_capture import KeyCapture  # 按键自检用的全局键盘捕获器。
+from src.map_recorder import (  # 路线录制线程与指令推导/重绘纯函数。
+    DOT_SAT_MIN, DOT_VAL_MIN, MapRecorder, bindings_from_meta, compute_map_rect, detect_yellow_dot_detail,
+    render_route_from_events)
 from src.dashboard_store import SUPER_MONSTER, load_annotations_by_supercategory  # 复用标注按类别读取。
 from src.ui.route_canvas import RouteCanvas  # 内嵌路线图绘制控件。
 from src.ui.spin_wheel_guard import DoubleSpinBox, SpinBox  # 需点击聚焦后才响应滚轮的数框。
@@ -479,23 +483,43 @@ class MapTab(CustomTab):  # 地图资产与配置管理页签。
 
     # ------------------------------------------------------------------ 卡片 3.5：实时路线录制
 
-    def _build_record_card(self):  # 录制控制卡：选目标路线 + 当前指令色实时描线 + 试定位校验。
+    def _build_record_card(self):  # 录制控制卡：选目标路线 + 键盘捕获开关/自检 + 试定位校验 + 事件流重绘。
         container = QWidget()
-        row = QHBoxLayout(container)
+        outer = QVBoxLayout(container)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(6)
+        row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
         self.record_route_check = SwitchButton()  # 开=录到当前选中路线（不新建），关=自动新建一条路线再录。
         row.addWidget(BodyLabel("录到当前路线:"))
         row.addWidget(self.record_route_check)
         row.addSpacing(12)
+        self.record_keys_switch = SwitchButton()  # 开=被动监听真实按键自动上色（不用点色块），关=用当前画笔色手描。
+        self.record_keys_switch.setChecked(True)
+        self.record_keys_switch.checkedChanged.connect(lambda: self._refresh_idle_hint())  # 切换模式时立刻回显键位/手描提示。
+        row.addWidget(BodyLabel("键盘捕获:"))
+        row.addWidget(self.record_keys_switch)
+        row.addSpacing(12)
+        self.key_test_btn = PushButton(FluentIcon.MARKET, "按键自检(3秒)")
+        self.key_test_btn.clicked.connect(self.on_key_self_test)  # 确认全局钩子能否收到按键。
+        row.addWidget(self.key_test_btn)
         self.try_locate_btn = PushButton(FluentIcon.SEARCH, "试定位当前帧")
         self.try_locate_btn.clicked.connect(self.on_try_locate)  # 单帧验证小地图/黄点几何。
         row.addWidget(self.try_locate_btn)
+        self.replay_btn = PushButton(FluentIcon.UPDATE, "重绘路线")
+        self.replay_btn.clicked.connect(self.on_replay_route)  # 用事件流 + 当前色表/粗细离线重画本条路线。
+        row.addWidget(self.replay_btn)
         self.record_btn = PrimaryPushButton(FluentIcon.PLAY, "开始录制")
         self.record_btn.clicked.connect(self.on_toggle_record)  # 开始/停止切换。
         row.addWidget(self.record_btn)
         row.addStretch(1)
         self.record_status = BodyLabel("未录制")  # 录制状态/统计文本（由轮询刷新）。
         row.addWidget(self.record_status, 2)
+        outer.addLayout(row)
+        self.record_hint = BodyLabel("")  # 键盘捕获提示行（当前推导指令与落色，录制中由轮询刷新）。
+        self.record_hint.setStyleSheet("color:#888;")
+        outer.addWidget(self.record_hint)
+        self._key_test = None  # 按键自检期间的临时捕获器（不能为 None，否则会被回收停钩子）。
         self.add_card("实时路线录制", container)
 
     def _is_recording(self):  # 是否有运行中的录制线程。
@@ -511,7 +535,7 @@ class MapTab(CustomTab):  # 地图资产与配置管理页签。
         if not self.current_map:  # 未选地图。
             self.record_status.setText("请先选择或新建地图。")  # 提示。
             return
-        meta = load_meta(self.current_map)  # 读取定位参数快照。
+        meta = load_meta(self.current_map)  # 读取定位与色表参数快照。
         feature_name = str(meta.get('Minimap Feature') or '').strip()  # 小地图模板名。
         if not feature_name:  # 未配小地图模板。
             self.record_status.setText("请先在参数卡设置小地图模板名。")  # 提示。
@@ -522,6 +546,16 @@ class MapTab(CustomTab):  # 地图资产与配置管理页签。
         if self._capture_current_frame() is None:  # 取不到画面。
             self.record_status.setText("无画面：请先连接游戏窗口再录制。")  # 提示。
             return
+        use_keys = bool(self.record_keys_switch.isChecked())  # 本次录制是否键盘捕获（开关绑 meta Record Use Keys）。
+        bindings = bindings_from_meta(meta)  # {角色: [规范键名...]}，未填的键位为空列表。
+        if use_keys:  # 键盘捕获要多两道校验。
+            if not any(bindings.get(role) for role in ('left', 'right', 'up', 'down')):  # 四组方向键全空。
+                self.record_status.setText("键盘捕获已开但左右上下键位全空：请去参数卡填键位，或关闭键盘捕获改用手选画笔色。")  # 提示。
+                return
+            running = getattr(getattr(og, 'executor', None), 'current_task', None)  # 正在跑的任务。
+            if running is not None:  # 任务自己会按键，会被当成用户操作录进去。
+                self.record_status.setText(f"有任务在跑（{getattr(running, 'name', running)}），它合成的按键会被误捕获，请先停止任务再录制。")  # 提示。
+                return
         # 确定目标路线图：开关开则用当前选中路线（空则新建），关则总是新建一条。
         if self.record_route_check.isChecked() and self.current_route:  # 录到当前路线。
             target_route = self.current_route  # 用选中路线。
@@ -534,20 +568,25 @@ class MapTab(CustomTab):  # 地图资产与配置管理页签。
             idx = self.route_combo.findText(target_route)  # 定位新路线。
             if idx >= 0:
                 self.route_combo.setCurrentIndex(idx)  # 切换过去。
+        mode_text = "按你实际键位走一圈即可自动上色（色表没有的组合会自动新增颜色）" if use_keys \
+            else "按当前画笔色描轨迹（换动作需先点色块）"  # 两种模式的确认文案。
         confirm = QMessageBox.question(
             self, "开始录制",
-            f"录制将重建地图 '{self.current_map}' 的底图 map.png 与路线 {target_route}，"
-            f"并边移动边按当前指令色描轨迹。确定开始？",
+            f"录制将重建地图 '{self.current_map}' 的底图 map.png 与路线 {target_route}，{mode_text}。确定开始？",
             QMessageBox.Yes | QMessageBox.No)  # 破坏性操作先确认。
         if confirm != QMessageBox.Yes:  # 取消。
             return
-        self._recorder = MapRecorder(self.current_map, target_route, meta, lambda: self._brush_rgb)  # 创建线程，当前色通过回调实时取。
+        self._recorder = MapRecorder(  # 创建线程：键盘模式下色表由录制端推导，画笔模式仍实时取当前色。
+            self.current_map, target_route, meta, lambda: self._brush_rgb,
+            bindings=bindings, use_keys=use_keys,
+            auto_goal=bool(self.auto_goal_switch.isChecked()),
+            tap_window=float(self.tap_window_spin.value()))
         self._recorder.start()  # 启动。
         self._rec_timer.start()  # 开始轮询。
         self.record_btn.setText("停止录制")  # 按钮切换为停止。
-        self.record_route_check.setEnabled(False)  # 录制中锁定选项。
-        self.record_status.setText(f"录制中→ {target_route}，请在游戏里控角色沿 intended 路线走一圈...")  # 提示。
-        self.logger.info(f'start map recording: {self.current_map}/{target_route}')  # 日志。
+        self._set_recording_locked(True)  # 锁定会与录制冲突的控件。
+        self.record_status.setText(f"录制中→ {target_route}，请在游戏里控角色沿计划路线走一圈...")  # 提示。
+        self.logger.info(f'start map recording: {self.current_map}/{target_route} use_keys={use_keys}')  # 日志。
 
     def _stop_recorder(self):  # 请求停止录制（不阻塞，落盘由线程收尾，轮询检测 finished 后回载）。
         if self._recorder is not None:  # 有线程。
@@ -560,19 +599,124 @@ class MapTab(CustomTab):  # 地图资产与配置管理页签。
         if rec is None:  # 无录制。
             self._rec_timer.stop()  # 停轮询。
             return
-        self.record_status.setText(f"录制中：{rec.status}  贴图{rec.stats['pasted']} 落点{rec.stats['located']} 丢失{rec.stats['lost']}")  # 实时展示（仅读线程属性，跨线程安全）。
+        self.record_status.setText(f"录制中：{rec.status}  贴图{rec.stats['pasted']} 落点{rec.stats['located']} 丢失{rec.stats['lost']}")  # 实时展示（仅读线程属性，不发信号也不改线程状态）。
+        self.record_hint.setText(self._live_cmd_text(rec))  # 实时回显本拍推导的指令与落色。
         if rec.finished:  # 线程已结束并完成落盘。
             self._rec_timer.stop()  # 停轮询。
             self.record_btn.setEnabled(True)  # 恢复按钮。
             self.record_btn.setText("开始录制")  # 恢复文案。
-            self.record_route_check.setEnabled(True)  # 解锁。
+            self._set_recording_locked(False)  # 解锁录制期间禁用的控件。
             if rec.saved:  # 成功落盘。
-                self.record_status.setText(f"已录制完成：{rec.status} 落点{rec.stats['located']}。")  # 提示。
+                extra = f" 新增色表{len(rec.color_additions)}项" if rec.color_additions else ''  # 自动扩色提示。
+                warn = f" 告警{len(rec.errors)}：{rec.errors[0]}" if rec.errors else ''  # 非致命问题只报首条。
+                self.record_status.setText(f"已录制完成：{rec.status} 落点{rec.stats['located']}{extra}。{warn}")  # 提示。
             else:  # 未落盘。
                 self.record_status.setText(f"录制未产生资产：{rec.error or '无数据'}。")  # 提示。
             self._reload_assets()  # 重新加载底图/路线，录制结果直接可见。
-            self.logger.info(f'map recording finished saved={rec.saved} err={rec.error}')  # 日志。
+            self.logger.info(f'map recording finished saved={rec.saved} err={rec.error} errors={rec.errors}')  # 日志。
             self._recorder = None  # 释放引用。
+        self._refresh_idle_hint()  # 非录制态（含刚结束）把提示行回到键位摘要。
+
+    def _live_cmd_text(self, rec):  # 录制期间的提示行文本：当前拍推导出的指令与实际落色（非键盘模式只说明当前画笔）。
+        if not rec.use_keys:  # 手点画笔模式。
+            return f"手描模式：当前画笔 RGB{self._brush_rgb}（换动作需先点色块）"  # 提示。
+        cmd = rec.current_cmd  # 本拍指令三元组或 None。
+        if cmd is None:  # 无指令（站着不动/定位失败）。
+            return "未检测到按键（站着不动不描线） 绑定: " + self._bindings_text(rec.bindings)  # 提示。
+        return f"当前指令: {route_palette.command_text(*cmd)}  落色: RGB{rec.current_rgb}"  # 展示线程属性，不反调线程方法。
+
+    def _bindings_text(self, bindings):  # 把键位绑定拼成简短可读文本，用于录制卡提示行。
+        parts = []  # 逐项。
+        for role in ('left', 'right', 'up', 'down', 'jump', 'teleport'):  # 固定顺序。
+            keys = bindings.get(role) or []  # 该角色键位。
+            parts.append(f"{role}:{','.join(keys) if keys else '-'}")  # 未绑定用 - 占位。
+        return ' '.join(parts)  # 拼接。
+
+    def _refresh_idle_hint(self):  # 非录制态刷新提示行：键盘捕获开关与键位摘要，让用户先看一眼再去走图。
+        if self._is_recording():  # 录制中由轮询接手，不覆盖。
+            return
+        if not self.record_keys_switch.isChecked():  # 手描模式。
+            self.record_hint.setText(f"手描模式：录制时按当前画笔色描轨迹，换动作需先点色块（键盘捕获可用按键自检确认钩子是否收得到）。")  # 提示。
+            return
+        bindings = bindings_from_meta(load_meta(self.current_map)) if self.current_map else {}  # 当前地图键位。
+        self.record_hint.setText("键盘捕获：走图时自动推导指令上色，色表没有的组合会自动新增颜色并写回本地图 meta。绑定: "
+                                 + self._bindings_text(bindings))  # 提示。
+
+    def _set_recording_locked(self, locked):  # 录制期间禁用会与落盘冲突的控件（保存/调色板/路线切换/自检/重绘），结束后逐一恢复。
+        enabled = not locked  # 锁定时控件不可用。
+        self.record_route_check.setEnabled(enabled)
+        self.save_button.setEnabled(enabled)
+        self.route_combo.setEnabled(enabled)
+        self.try_locate_btn.setEnabled(enabled)
+        self.key_test_btn.setEnabled(enabled)
+        self.replay_btn.setEnabled(enabled)
+        self.eraser_btn.setEnabled(enabled)
+        for btn in self._swatch_buttons:  # 调色板色块（录制中改画笔色无效，容易误导）。
+            btn.setEnabled(enabled)
+
+    KEY_SELF_TEST_SECONDS = 3  # 按键自检时长（秒），足够用户随手按几个键。
+
+    def on_key_self_test(self):  # 按键自检：临时装钩子几秒，验证全局键盘捕获能否收到按键。
+        if self._is_recording():  # 录制中钩子已占用。
+            self.record_status.setText("录制进行中，请先停止录制再做按键自检。")  # 提示。
+            return
+        if self._key_test is not None:  # 自检已在跑，避免叠装钩子。
+            return
+        capture = KeyCapture()  # 临时捕获器（不拦截，仅监听）。
+        if not capture.start():  # 启动失败。
+            self.record_status.setText(f"按键自检启动失败：{capture.error}（pynput 不可用？）请检查依赖。")  # 提示。
+            return
+        self._key_test = capture  # 持有引用，否则监听线程会被回收。
+        self.key_test_btn.setEnabled(False)  # 防重复点。
+        self.record_status.setText(f"按键自检：{self.KEY_SELF_TEST_SECONDS} 秒内请随便按几个键...")  # 提示。
+        QTimer.singleShot(int(self.KEY_SELF_TEST_SECONDS * 1000), self._finish_key_self_test)  # 到时回收（不阻塞界面）。
+
+    def _finish_key_self_test(self):  # 自检到时：停钩子并根据是否收到过事件给结论（钩子收不到键通常是游戏完整性级别更高）。
+        capture = self._key_test  # 临时引用。
+        self._key_test = None  # 先摘除，允许再次自检。
+        self.key_test_btn.setEnabled(not self._is_recording())  # 恢复按钮。
+        if capture is None:  # 已被其他路径清掉。
+            return
+        seen = capture.seen_keys()  # 先取到收到过的键名再停（stop 会 reset）。
+        capture.stop()  # 释放钩子。
+        if seen:  # 收到了按键。
+            self.record_status.setText(f"按键自检 OK：收到 {len(seen)} 个键（{', '.join(seen[:8])}），键盘捕获可用。")  # 提示。
+            return
+        self.record_status.setText(
+            f"按键自检失败：{self.KEY_SELF_TEST_SECONDS} 秒内一个键都没收到。通常是游戏以更高权限运行，"
+            "全局钩子收不到；请用管理员身份启动本程序，或关闭键盘捕获改用手点画笔色。")  # 提示。
+
+    def on_replay_route(self):  # 用录制时存的按键事件流 + 当前色表/粗细离线重画本条路线图（覆盖前先备份 .bak）。
+        if self._is_recording():  # 录制中不能碰资产。
+            self.record_status.setText("录制进行中，请停止后再重绘路线。")  # 提示。
+            return
+        if not self.current_map or not self.current_route:  # 未选路线。
+            self.record_status.setText("请先选择要重绘的路线。")  # 提示。
+            return
+        data = load_route_events(self.current_map, self.current_route)  # 读 sidecar。
+        if data is None or not data.get('events'):  # 无事件流（手描录的或旧数据）。
+            self.record_status.setText(f"路线 {self.current_route} 没有按键事件流：只有开着键盘捕获录制的路线才能重绘。")  # 提示。
+            return
+        size = map_size(self.current_map)  # 重绘尺寸以当前底图为准。
+        if size is None:  # 无底图。
+            self.record_status.setText("缺底图，无法确定重绘尺寸。")  # 提示。
+            return
+        w, h = size  # 宽高。
+        meta = load_meta(self.current_map)  # 取当前色表（含自动扩出的新色）。
+        lookup = route_palette.build_reverse(meta.get('Color Code') or {}, meta.get('Color Code Up Down') or {})  # {指令串: 色}。
+        thickness = max(1, int(self.trace_thickness_spin.value()))  # 用界面上的粗细，方便改粗细后立刻看效果。
+        img, warnings = render_route_from_events(data['events'], w, h, thickness, lookup)  # 纯函数重绘。
+        backup = backup_route_image(self.current_map, self.current_route)  # 覆盖前备份旧图，重绘不满意可手工改回。
+        save_route_image(self.current_map, self.current_route, img)  # 写回路线文件。
+        self.canvas.set_images(load_map_image(self.current_map), load_route_image(self.current_map, self.current_route))  # 重载预览。
+        self._update_preview_info()  # 未知色统计变了。
+        tip = f"已按事件流重绘 {self.current_route}：{len(data['events'])} 个事件，粗细 {thickness}"
+        if backup:  # 告知备份位置。
+            tip += f"，旧图备份 {os.path.basename(backup)}"
+        if warnings:  # 缺色/越界等跳过项。
+            tip += f"，{len(warnings)} 条跳过（首条：{warnings[0]}）"
+        self.record_status.setText(tip + "。")  # 提示。
+        self.logger.info(f'replay route {self.current_map}/{self.current_route} events={len(data["events"])} warnings={len(warnings)}')  # 日志。
 
     def on_try_locate(self):  # 单帧试定位：验证小地图模板与黄点几何是否可正确提取（录制前置检查）。
         if not self.current_map:  # 未选地图。
@@ -591,12 +735,15 @@ class MapTab(CustomTab):  # 地图资产与配置管理页签。
         rx, ry, rw, rh = compute_map_rect(box.x, box.y, box.width, box.height, str(meta.get('Map Rect') or ''))  # 实际地图区域。
         rx = max(0, rx); ry = max(0, ry)  # 夹到画面内。
         rw = min(rw, frame.shape[1] - rx); rh = min(rh, frame.shape[0] - ry)  # 防越界。
-        dot = detect_yellow_dot(frame, (rx, ry, rw, rh), int(meta.get('Dot Hue Min') or 18),  # 检测黄点。
-                                int(meta.get('Dot Hue Max') or 38), max(1, int(meta.get('Dot Min Pixels') or 4)))
-        if dot is None:  # 未找到黄点。
-            self.record_status.setText(f"试定位：小地图 {rw}x{rh} @({rx},{ry})，但未检测到黄点（调色相）。")  # 提示。
+        detail = detect_yellow_dot_detail(frame, (rx, ry, rw, rh), int(meta.get('Dot Hue Min') or 18),  # 检测黄点（带生效阈值档）。
+                                          int(meta.get('Dot Hue Max') or 38), max(1, int(meta.get('Dot Min Pixels') or 4)),
+                                          int(meta.get('Dot Sat Min') or DOT_SAT_MIN), int(meta.get('Dot Val Min') or DOT_VAL_MIN))
+        if detail is None:  # 未找到黄点。
+            self.record_status.setText(f"试定位：小地图 {rw}x{rh} @({rx},{ry})，但未检测到黄点（可调黄点色相/饱和/亮度下限）。")  # 提示。
             return
-        self.record_status.setText(f"试定位 OK：小地图 {rw}x{rh} @({rx},{ry})，黄点@({dot[0]},{dot[1]}) 面积{dot[2]}。可开始录制。")  # 成功。
+        dot, tier = detail[:3], detail[3]  # 黄点与实际生效的阈值档。
+        self.record_status.setText(f"试定位 OK：小地图 {rw}x{rh} @({rx},{ry})，黄点@({dot[0]},{dot[1]}) 面积{dot[2]} "
+                                   f"阈值饱和>={tier[0]} 亮度>={tier[1]}。请核对黄点坐标是不是角色，不对就调黄点阈值。")  # 成功。
 
     def _feature_ready(self, feature_name):  # 检查模板页是否已标注指定分类（不可用时返回 False）。
         executor = getattr(og, 'executor', None)  # 取执行器。
@@ -700,11 +847,34 @@ class MapTab(CustomTab):  # 地图资产与配置管理页签。
         self.dot_hue_max_spin.setRange(0, 179)
         self.dot_min_spin = SpinBox()
         self.dot_min_spin.setRange(1, 500)
+        self.dot_sat_spin = SpinBox()  # 黄点饱和度下限：地形抢走黄点时调高它
+        self.dot_sat_spin.setRange(0, 255)
+        self.dot_val_spin = SpinBox()  # 黄点亮度下限：标记被半透明遮罩压暗时调低它
+        self.dot_val_spin.setRange(0, 255)
         # —— 录制参数（仅地图页签路线录制使用）——
         self.canvas_size_edit = LineEdit()
         self.canvas_size_edit.setPlaceholderText("1600,1200 拼接画布预分配尺寸 宽,高")
         self.trace_thickness_spin = SpinBox()
         self.trace_thickness_spin.setRange(1, 20)
+        # —— 键盘捕获键位（每项支持逗号分隔多键同义，如 "a, left"）——
+        self.rec_left_edit = LineEdit()
+        self.rec_left_edit.setPlaceholderText("left 或 a,left")
+        self.rec_right_edit = LineEdit()
+        self.rec_right_edit.setPlaceholderText("right 或 d,right")
+        self.rec_up_edit = LineEdit()
+        self.rec_up_edit.setPlaceholderText("up 或 w,up")
+        self.rec_down_edit = LineEdit()
+        self.rec_down_edit.setPlaceholderText("down 或 s,down")
+        self.rec_jump_edit = LineEdit()
+        self.rec_jump_edit.setPlaceholderText("space")
+        self.rec_teleport_edit = LineEdit()
+        self.rec_teleport_edit.setPlaceholderText("瞬移技能键，留空=不用瞬移")
+        self.tap_window_spin = DoubleSpinBox()
+        self.tap_window_spin.setRange(0.05, 2.0)
+        self.tap_window_spin.setSingleStep(0.05)
+        self.tap_window_spin.setDecimals(2)
+        self.tap_window_spin.setSuffix(" s")
+        self.auto_goal_switch = SwitchButton()
         form.addRow("搜索半径(px)", self.search_range_spin)
         form.addRow("边缘保护色RGB", self.edge_color_edit)
         form.addRow("行走也用瞬移", self.teleport_walk_switch)
@@ -714,8 +884,17 @@ class MapTab(CustomTab):  # 地图资产与配置管理页签。
         form.addRow("地图区域(%)", self.map_rect_edit)
         form.addRow("黄点色相下/上", self._pair_widget(self.dot_hue_min_spin, self.dot_hue_max_spin))
         form.addRow("黄点最小面积", self.dot_min_spin)
+        form.addRow("黄点饱和/亮度下限", self._pair_widget(self.dot_sat_spin, self.dot_val_spin))
         form.addRow("拼接画布尺寸", self.canvas_size_edit)
         form.addRow("描线粗细", self.trace_thickness_spin)
+        form.addRow("录左键", self.rec_left_edit)
+        form.addRow("录右键", self.rec_right_edit)
+        form.addRow("录上键", self.rec_up_edit)
+        form.addRow("录下键", self.rec_down_edit)
+        form.addRow("跳跃键", self.rec_jump_edit)
+        form.addRow("瞬移键", self.rec_teleport_edit)
+        form.addRow("动作窗口(s)", self.tap_window_spin)
+        form.addRow("自动补终点", self.auto_goal_switch)
 
         right = QVBoxLayout()  # 右列：怪物特征 + 保存。
         self.monster_combo = EditableComboBox()  # 怪物特征（类别=怪物的标注，供特殊地图覆盖看板）。
@@ -748,8 +927,21 @@ class MapTab(CustomTab):  # 地图资产与配置管理页签。
         self.dot_hue_min_spin.setValue(int(meta.get('Dot Hue Min', 18)))
         self.dot_hue_max_spin.setValue(int(meta.get('Dot Hue Max', 38)))
         self.dot_min_spin.setValue(max(1, int(meta.get('Dot Min Pixels', 4))))
+        self.dot_sat_spin.setValue(int(meta.get('Dot Sat Min', DOT_SAT_MIN)))
+        self.dot_val_spin.setValue(int(meta.get('Dot Val Min', DOT_VAL_MIN)))
         self.canvas_size_edit.setText(str(meta.get('Record Canvas Size', '1600,1200')))
         self.trace_thickness_spin.setValue(max(1, int(meta.get('Record Trace Thickness', 2))))
+        # —— 键盘捕获参数（与录制卡里的开关一起决定本次录制怎么上色）——
+        self.record_keys_switch.setChecked(bool(meta.get('Record Use Keys', True)))
+        self.auto_goal_switch.setChecked(bool(meta.get('Record Auto Goal', True)))
+        self.rec_left_edit.setText(str(meta.get('Record Left Keys', 'left')))
+        self.rec_right_edit.setText(str(meta.get('Record Right Keys', 'right')))
+        self.rec_up_edit.setText(str(meta.get('Record Up Keys', 'up')))
+        self.rec_down_edit.setText(str(meta.get('Record Down Keys', 'down')))
+        self.rec_jump_edit.setText(str(meta.get('Record Jump Keys', 'space')))
+        self.rec_teleport_edit.setText(str(meta.get('Record Teleport Keys', '') or ''))
+        self.tap_window_spin.setValue(float(meta.get('Record Action Tap Window', 0.25) or 0.25))
+        self._refresh_idle_hint()  # 键位与开关变化后同步录制卡提示行。
         self.monster_combo.clear()
         try:
             monster_names = sorted((load_annotations_by_supercategory().get(SUPER_MONSTER) or {}).keys())
@@ -781,8 +973,20 @@ class MapTab(CustomTab):  # 地图资产与配置管理页签。
         meta['Dot Hue Min'] = int(self.dot_hue_min_spin.value())
         meta['Dot Hue Max'] = int(self.dot_hue_max_spin.value())
         meta['Dot Min Pixels'] = int(self.dot_min_spin.value())
+        meta['Dot Sat Min'] = int(self.dot_sat_spin.value())  # 黄点饱和度下限（排除抢黄点的地形块）
+        meta['Dot Val Min'] = int(self.dot_val_spin.value())  # 黄点亮度下限
         meta['Record Canvas Size'] = self.canvas_size_edit.text().strip() or '1600,1200'
         meta['Record Trace Thickness'] = int(self.trace_thickness_spin.value())
+        # —— 键盘捕获参数 ——
+        meta['Record Use Keys'] = bool(self.record_keys_switch.isChecked())
+        meta['Record Auto Goal'] = bool(self.auto_goal_switch.isChecked())
+        meta['Record Left Keys'] = self.rec_left_edit.text().strip()
+        meta['Record Right Keys'] = self.rec_right_edit.text().strip()
+        meta['Record Up Keys'] = self.rec_up_edit.text().strip()
+        meta['Record Down Keys'] = self.rec_down_edit.text().strip()
+        meta['Record Jump Keys'] = self.rec_jump_edit.text().strip()
+        meta['Record Teleport Keys'] = self.rec_teleport_edit.text().strip()
+        meta['Record Action Tap Window'] = round(float(self.tap_window_spin.value()), 2)
         meta['Monster Features'] = self._combo_value(self.monster_combo)
         meta['Color Code'] = read_color_table(self.main_table)
         meta['Color Code Up Down'] = read_color_table(self.ud_table)
@@ -806,6 +1010,26 @@ class MapTab(CustomTab):  # 地图资产与配置管理页签。
                 f"路线 {len(routes)} 条  默认地图: {default or '无'}")
         if self.current_route:
             text += f"  正在编辑: {self.current_route}"
+        with_events = [r for r in routes if has_route_events(self.current_map, r)]  # 带按键事件流的可离线重绘。
+        if with_events:
+            text += f"\n↺ 可重绘（含按键事件流）: {len(with_events)}/{len(routes)} 条"
+        unknown = self._unknown_colors_report()  # 当前路线上色表未定义的色。
+        if unknown:
+            text += f"\n⚠ 路线含色表未定义的色（回放时会被忽略，可重绘路线或补色表）: {', '.join(unknown[:6])}"
         if problems:
             text += "\n⚠ 尺寸校验: " + "; ".join(problems)
         self.preview_info.setText(text)
+
+    def _unknown_colors_report(self):  # 当前编辑路线图里出现但色表/边缘色未定义的颜色串列表。
+        if not self.current_route:  # 无路线。
+            return []
+        route_img = load_route_image(self.current_map, self.current_route)  # 读路线。
+        if route_img is None:  # 读不到。
+            return []
+        meta = load_meta(self.current_map)  # 取色表。
+        edge = route_palette.rgb_from_key(str(meta.get('Edge Color') or ''))  # 边缘色（留空则 None）。
+        try:  # 色表被改坏时不应影响概要刷新。
+            return route_palette.unknown_route_colors(route_img, meta.get('Color Code') or {},
+                                                      meta.get('Color Code Up Down') or {}, edge_rgb=edge)
+        except Exception:  # 异常。
+            return []

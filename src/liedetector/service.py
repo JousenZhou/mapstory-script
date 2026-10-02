@@ -40,6 +40,7 @@ from ok import Logger, TriggerTask, og  # 导入日志器、触发任务类型�
 
 from src.dashboard_store import load_dashboard_config, save_dashboard_config  # 看板共享配置读写：测谎参数以看板为单一数据源，急停时也要回写总开关。
 from src.liedetector.recorder import LieRecorder  # 测谎触发录像器：触发->解除全过程录原始帧 + 边车记录，供验证页签复算。
+from src.liedetector.feed import FeedStep, compute_effective_fps, should_reset  # 逐帧喂入层：实时与回放共用的 fps 口径换算、区域 reset 判定、喂帧日程记录。
 from src.autologin.flow import DOUBLE_CLICK_GAP, AutoLoginFlow  # 导入自动重登流程状态机与双击间隔常量（掉线触发后执行全桌面重登序列）。
 
 try:  # 解测谎依赖可选：稠密光流 + 粒子滤波在线编排，缺失时服务照常运行，仅禁用自动解测谎。
@@ -94,29 +95,8 @@ STATE_IDLE = "idle"  # 服务空闲监控态。
 STATE_SOLVING = "solving"  # 服务正在解测谎态。
 STATE_RELOGGING = "relogging"  # 服务正在执行掉线重登态。
 
-try:  # 复用框框 Pynput 交互的按键名映射（如 lshift -> shift_l），保证急停键与任务按键用同一套命名。
-    from ok.device.interaction_methods.pynput import PynputInteraction as _PynputInteraction
-    _KEY_NAME_MAP = _PynputInteraction.KEY_MAP  # ok-script 按键名 -> pynput 按键名（只收录需要改名的键）。
-except Exception:  # 框框结构变化时降级为空映射，急停键仍按原名比较。
-    _KEY_NAME_MAP = {}
-
-# pynput 监听回调报出的键名 -> 规范名：pynput 不区分左右修饰键（Key.shift_l.name 也是 'shift'），
-# 且命名风格与看板配置不同（page_up vs pageup），故两侧都归一到同一规范名再比较。
-_KEY_NAME_ALIAS = {
-    'shift_l': 'shift', 'shift_r': 'shift', 'ctrl_l': 'ctrl', 'ctrl_r': 'ctrl',
-    'alt_l': 'alt', 'alt_r': 'alt', 'alt_gr': 'alt', 'cmd_l': 'cmd', 'cmd_r': 'cmd',
-    'page_up': 'pageup', 'page_down': 'pagedown', 'caps_lock': 'capslock',
-    'num_lock': 'numlock', 'scroll_lock': 'scrolllock', 'print_screen': 'printscreen',
-    'return': 'enter',
-}
-
-
-def normalize_key_name(value):  # 把看板配置的按键名或 pynput 报出的按键名归一到同一规范名，供急停键匹配比较。
-    name = str(value or '').strip().lower()  # 统一小写并去空格。
-    if not name:  # 未配置。
-        return ''
-    name = _KEY_NAME_MAP.get(name, name)  # 先按框框映射转成 pynput 名（表里没有的键原样保留，如 f8）。
-    return _KEY_NAME_ALIAS.get(name, name)  # 再收敛左右修饰键与命名风格差异。
+# 按键名归一逻辑已抽到 src/keynames.py（路线录制的键盘捕获同样要用），这里 re-export 保持既有调用点与单测可用。
+from src.keynames import normalize_key_name, _KEY_NAME_MAP, _KEY_NAME_ALIAS  # noqa: F401  急停键匹配沿用同一口径。
 
 
 class _LieFramePump:  # 解测谎专用采集线程：后台按游戏帧率抓最新帧存入单槽，解题循环取帧不再串行等待新帧到达。
@@ -193,6 +173,8 @@ class LieDetectorService:  # 独立测谎监控服务：后台守护线程值守
         self._gpu_transient_warned = False  # 显卡匹配与 CUDA Graph 流捕获瞬时冲突是否已告警：只提示一次，不永久降级但避免逐帧刷日志。
         self._watch_names = None  # 本轮值守要在同一帧上匹配的全部分类名，单点调用匹配时沿用同一组模板避免反复重建。
         self._recorder = None  # 当前测谎录像器（LieRecorder）：触发确认时起录、finally 收尾；非解题期为 None。
+        self._last_feed_trace = []  # 最近一局 _solve 的喂帧日程（list[FeedStep]），由 _stop_recorder 读出交给录像写进边车。
+        self._last_feed_start_frame = 0  # 最近一局首次喂帧对应的 mp4 帧号（起录→开题的提前段偏移），随喂帧日程一并写进边车供回放仿实时对齐起点。
         self._abort_event = threading.Event()  # 急停标志：敲击看板配置的急停键后置位，解题与延迟等待循环每帧检查并立即退出。
         self._abort_key = ''  # 规范化后的急停按键名，空字符串表示未启用急停（也不装全局键盘钩子）。
         self._abort_listener = None  # pynput 全局键盘监听器，仅在配置了急停键时启动。
@@ -452,7 +434,9 @@ class LieDetectorService:  # 独立测谎监控服务：后台守护线程值守
         if recorder is None:  # 本局未起录（录像不可用或启动失败）。
             return
         try:  # 收尾异常不影响主流程。
-            recorder.stop(outcome)  # 排空写线程、关流、写边车、滚动保留。
+            recorder.stop(outcome, self._last_feed_trace, self._last_feed_start_frame)  # 排空写线程、关流、写边车（含本局喂帧日程与首喂帧起点偏移）、滚动保留。
+            self._last_feed_trace = []  # 喂帧日程随本局交接后清空，避免残留到下一局误写。
+            self._last_feed_start_frame = 0  # 对齐偏移同样交接后复位。
         except Exception as e:  # 收尾异常。
             logger.warning(f"Lie record stop failed: {e}. 测谎录像收尾失败。")
 
@@ -779,6 +763,9 @@ class LieDetectorService:  # 独立测谎监控服务：后台守护线程值守
         seg_match_n = seg_flow_n = seg_overlay_n = seg_wait_n = 0  # 各段累计次数（overlay 受节流非每 tick，其它每 tick 都计时，故分别取均值）。
         last_diag_perf = solve_start  # 上次诊断的 perf_counter 时刻，用于算 pump_fps 的窗口秒数。
         last_diag_seq = 0  # 上次诊断时采集线程已交付的帧序号(pump._seq)，差值即本窗口实际供帧数。
+        feed_trace = []  # 本局喂帧日程：每个真正喂入 session 的 tick 记一条 FeedStep，收尾交录像写进边车供回放仿实时复现。
+        crop_origin = None  # 首个有效区域原点 (x0, y0)（整帧坐标），后续喂帧记录的区域都相对它归一，保证在已裁剪的 mp4 上正确复切。
+        feed_start_frame = None  # 首次喂帧时快照录像器已入帧数：录像在触发确认即起录、解题要再等报警+触发延迟才开题，mp4 前段已录 K 帧；不记这个偏移，回放仿实时会从第 0 帧起喂、全程错位跑不出轨迹。
         pump, pump_release = self._start_solve_pump()  # 独立采集线程+最新帧槽：采集与处理并行，去掉「睡 33ms 再等新帧」的串行等待。
         try:
             while not self._exit_event.is_set():  # 循环直到触发标注持续消失、场景结束、兜底超时、用户急停或进程退出。
@@ -819,17 +806,31 @@ class LieDetectorService:  # 独立测谎监控服务：后台守护线程值守
                         if new_frame is not None:  # 取到新帧才替换；numpy 数组不能用 or 判真值，必须显式判 None。
                             frame = new_frame  # 更新当前帧，取不到沿用旧帧。
                         continue  # 进入下一轮检查。
-                elif region is None or any(abs(new_region[i] - region[i]) > LIE_REGION_SHIFT_PIXELS for i in range(4)):  # 区域首次出现或位置/尺寸明显变化（任一边超阈值）。
+                    reset_this_tick = False  # 沿用旧区域、未采到新区域：本帧不重置，喂帧日程记 rect=None（回放据此复用上一次的子区域）。
+                    rect_for_trace = None
+                else:  # 本帧采到坐标框：用共用 should_reset 判定是否重置（首帧或任一边位移/尺寸超阈值），与回放同口径。
+                    reset_this_tick = should_reset(region, new_region, LIE_REGION_SHIFT_PIXELS)
                     region = new_region  # 更新区域。
-                    session.reset(region[2], region[3])  # 重置光流会话：清空光流历史、模板与粒子跟踪器，避免上一局污染。
-                    mouse_pos = None  # 鼠标目标点重新校准。
-                else:  # 区域位置稳定。
-                    region = new_region  # 刷新区域（尺寸可能微调）。
+                    if reset_this_tick:  # 需要重置：以新尺寸重建光流会话并重新校准鼠标。
+                        session.reset(region[2], region[3])  # 重置光流会话：清空光流历史、模板与粒子跟踪器，避免上一局污染。
+                        mouse_pos = None  # 鼠标目标点重新校准。
+                        if crop_origin is None:  # 首个有效区域原点即录像裁剪基准，后续区域相对它归一。
+                            crop_origin = (region[0], region[1])
+                    rect_for_trace = (region[0] - crop_origin[0], region[1] - crop_origin[1], region[2], region[3])  # 相对裁剪原点的子区域 (x,y,w,h)。
                 # 录像由录像器的独立采集线程按真 30FPS 抓帧（见 _start_recorder 的独立 capture），解题循环不再逐帧写，避免与自采集重复喂帧。
                 crop = frame[region[1]:region[1] + region[3], region[0]:region[0] + region[2]]  # 裁出谎言检测图形区域。
                 _t_flow = time.perf_counter()  # 计时起点：稠密光流+粒子滤波（extreme 档主力耗时）。
-                result = session.update(crop, fps)  # 喂入光流粒子滤波会话，返回单帧跟踪结果（区域局部坐标）。
+                result = session.update(crop, compute_effective_fps(dt, fps))  # 喂入光流粒子滤波会话：fps 口径按真实帧间隔 1/dt 换算（不再写死 30），与回放仿实时同源。
+                if feed_start_frame is None:  # 首次喂帧：快照录像器此刻已入帧数（减 1：当前画面≈录像最新一帧）作为 mp4 起点对齐偏移，回放仿实时据此跳过「起录→开题」提前段。
+                    recorder_now = self._recorder  # 录像器可能启动失败为 None（此时偏移记 0，回放退化为从第 0 帧喂，不报错）。
+                    try:  # 快照最佳努力：计数/减法任何异常都记 0，绝不影响解题主流程。
+                        feed_start_frame = max(0, int(recorder_now.captured_frames()) - 1) if recorder_now is not None else 0
+                    except (TypeError, ValueError, AttributeError):
+                        feed_start_frame = 0
                 seg_flow += (time.perf_counter() - _t_flow) * 1000.0; seg_flow_n += 1  # 累计本段毫秒与次数。
+                feed_trace.append(FeedStep(  # 记录本 tick 的喂帧日程：dt/相对区域/是否重置/命中 source 与置信度，供边车与回放仿实时逐帧复现。
+                    dt_ms=int(round(dt * 1000.0)), rect=rect_for_trace, reset=reset_this_tick,
+                    source=result.source, conf=float(result.confidence)))
                 if result.tracker_alive and result.center is not None:  # 有有效跟踪输出时才移动光标。
                     abs_center = (region[0] + float(result.center[0]), region[1] + float(result.center[1]))  # 目标中心由区域局部坐标换算为画面绝对坐标。
                     mouse_pos = self._move_mouse_toward(mouse_pos, abs_center, dt)  # 按帧间真实秒数缩放步长：光标追赶速度与实测帧率无关。
@@ -868,6 +869,8 @@ class LieDetectorService:  # 独立测谎监控服务：后台守护线程值守
                     frame = new_frame  # 更新当前帧。
         finally:
             self._stop_solve_pump(pump, pump_release)  # 收尾：停采集线程并释放独立采集实例，绝不泄漏会话/GDI。
+            self._last_feed_trace = feed_trace  # 无论正常结束/兑底超时/急停退出都带出喂帧日程，供紧随其后的 _stop_recorder 写入边车。
+            self._last_feed_start_frame = feed_start_frame or 0  # 首喂帧对齐偏移同步带出；从未喂过帧则为 0。
         return outcome  # 返回结束原因（solved/timeout/gone/aborted），供录像边车记录。
 
     def _settle_lie_result(self, threshold):  # 解测谎结算：触发标注消失后开 LIE_SETTLE_WAIT 秒窗口，出现【测谎成功】则成功并点确定收尾，窗口内未出现则失败。

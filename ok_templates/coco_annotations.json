@@ -227,6 +227,12 @@
       "file_name": "37.png",
       "width": 1366,
       "height": 768
+    },
+    {
+      "id": 44,
+      "file_name": "38.png",
+      "width": 1366,
+      "height": 768
     }
   ],
   "annotations": [
@@ -983,6 +989,19 @@
       ],
       "area": 459,
       "iscrowd": 0
+    },
+    {
+      "id": 59,
+      "image_id": 44,
+      "category_id": 59,
+      "bbox": [
+        7,
+        71,
+        171,
+        97
+      ],
+      "area": 16587,
+      "iscrowd": 0
     }
   ],
   "categories": [
@@ -1275,6 +1294,11 @@
       "id": 58,
       "name": "角色灯泡",
       "supercategory": "角色"
+    },
+    {
+      "id": 59,
+      "name": "射手村东",
+      "supercategory": ""
     }
   ]
 }

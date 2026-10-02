@@ -26,6 +26,7 @@ from src.liedetector.shape_tracking import (  # 算法内核，纯计算无 I/O�
     ShapeTemplate,  # 学习到的形状模板。
     build_shape_template,  # 从白色轮廓构建模板。
     choose_shape_candidate,  # 从白色候选里挑出被跟踪目标。
+    choose_template_detection,  # 选窗窗口内挑最稳定的一条检测学模板（最佳帧学习）。
     detect_white_shapes,  # 白色目标检测。
     resize_for_processing,  # 缩放到处理尺度。
     transformed_contour,  # 按当前姿态还原轮廓点集。
@@ -159,6 +160,9 @@ class ShapeTrackParams:
     max_gap_seconds: float = 1.25  # 允许回看修正的最长低置信区间（秒）。
     max_correction_ratio: float = 0.24  # 单帧证据修正上限（相对形状尺寸的比例），超限整体回滚。
     max_speed_ratio: float = 0.16  # 单帧中心移动速度上限（相对形状尺寸的比例）。
+    template_learn_window: float = 0.4  # 开局最佳帧选窗时长（秒）：先攒一个窗口的检测再挑最干净的一条学模板，避免首帧被倒计时粘连/削顶污染。
+    min_size_floor: float = 36.0  # 小目标阈值下限（处理尺度像素）：距离窗/限速/重定位半径/抖动/似然宽度按 max(标称尺寸, 此值) 缩放，
+    # 否则小面积星星（nominal≈29）把所有窗口等比缩窄，目标稍一快跳就丢——大目标（≥此值）行为完全不变。
     random_seed: int = 20260902  # 随机种子，保证同一局录像结果可复现。
     gpu_scoring: bool = True  # 显卡开关：True 时探测 torch CUDA，可用则打分与光流都跑显卡，否则自动回落 NumPy + cv2 DIS（双编译结构）。仅决定后端，不改精度档。
     precision_tier: str = PRECISION_TIER_DEFAULT  # 精度档 key（low/medium/high/ultra/extreme）：由 GUI 精度下拉选定，无 N 卡时重载档运行时回落 medium。
@@ -239,6 +243,8 @@ class ShapeTrackSession:
         self.stagnant_scene_run = 0  # 连续「残差过小」帧数，用于判定画面静止。
         self.scene_ended = False  # 场景是否已结束，结束后不再输出跟踪。
         self.last_color_frame = -1  # 上一次测到白色轮廓的帧号，-1 表示从未测到。
+        self._learn_buffer = []  # 最佳帧选窗的检测缓存（未学模板前逐帧攒）。
+        self._prelearn_gone_run = 0  # 选窗期间检测缺失的连续帧数，白相过短时据此兜底学习。
         self.frame_index = 0  # 本局已处理帧数。
         self.source_counts: dict[str, int] = {}  # 各 source 的出现次数，收尾时输出分布。
         self.region_width = 0  # 最近一次 reset 传入的区域宽，诊断用。
@@ -299,6 +305,8 @@ class ShapeTrackSession:
         self.stagnant_scene_run = 0  # 清零静止计数。
         self.scene_ended = False  # 场景结束标记复位。
         self.last_color_frame = -1  # 白色轮廓帧号复位。
+        self._learn_buffer = []  # 清空最佳帧选窗缓存。
+        self._prelearn_gone_run = 0  # 选窗缺失计数复位。
         self.frame_index = 0  # 帧计数复位。
         self.source_counts = {}  # 统计复位。
         self.region_width = int(region_w)  # 记录新区域宽。
@@ -340,6 +348,7 @@ class ShapeTrackSession:
             self.template,  # 已学模板（None 时直接取排序第一用于学习）。
             center_hint,  # 位置先验。
             self.tracker.confidence if self.tracker is not None else 0.0,  # 置信度决定距离窗口松紧。
+            size_floor=self.params.min_size_floor,  # 小目标距离窗抬到绝对下限，强测量不被窄窗白白丢弃。
         )
         color_has_been_gone = (  # 第 5 步：目标是否已经消失超过一秒。
             self.tracker is not None  # 已经建过跟踪器。
@@ -358,8 +367,27 @@ class ShapeTrackSession:
             ):
                 self.scene_ended = True  # 判定场景结束。
             detection = None  # 强制丢弃检测，防止把 SUCCESS 文字当成目标重新初始化。
-        if not self.scene_ended and self.tracker is None and detection is not None:  # 第 6 步：首次学习。
-            self.template = build_shape_template(detection.contour)  # 从白色轮廓构建模板。
+        learn_required = max(5, int(fps * self.params.template_learn_window))  # 最佳帧选窗需攒够的检测数（默认约 0.4 秒，至少 5 条才能算中位数）。
+        if self.tracker is None and self._learn_buffer:  # 选窗尚未学模板：统计检测缺失的连续帧。
+            self._prelearn_gone_run = self._prelearn_gone_run + 1 if detection is None else 0  # 缺检测累加，有检测归零。
+        if not self.scene_ended and self.tracker is None and detection is not None:  # 第 6 步：首次学习改为最佳帧选窗，不再拿第一帧当场学模板。
+            self._learn_buffer.append(detection)  # 缓存本帧检测，等窗口攒满再定夺。
+            if len(self._learn_buffer) >= learn_required:  # 选窗攒够。
+                detection = choose_template_detection(self._learn_buffer)  # 挑窗口内最干净的一条轮廓来学（首帧常被倒计时粘连拽大）。
+                self._learn_buffer = []  # 清空缓存。
+                self._prelearn_gone_run = 0  # 缺失计数复位。
+            else:
+                detection = None  # 窗口未满，本帧先不给出跟踪结论（source 保持 waiting）。
+        elif (  # 兜底：白相过短，选窗未攒满目标就消失，用已缓存的检测学习，不丢模板学习机会。
+            not self.scene_ended
+            and self.tracker is None
+            and self._learn_buffer
+            and self._prelearn_gone_run >= max(3, int(fps * 0.3))
+        ):
+            detection = choose_template_detection(self._learn_buffer)  # 同样从缓存里挑最佳。
+            self._learn_buffer = []  # 清空缓存。
+        if not self.scene_ended and self.tracker is None and detection is not None:  # 第 6 步（续）：定下学习源，构建模板与跟踪器。
+            self.template = build_shape_template(detection.contour)  # 从选中的白色轮廓构建模板。
             self.tracker = ParticleShapeTracker(  # 用首个可靠检测初始化粒子跟踪器。
                 detection,  # 初始检测。
                 self.template,  # 刚学到的模板。
@@ -374,13 +402,14 @@ class ShapeTrackSession:
                 coarse_top=self.params.coarse_top,  # 精扫 top-K 邻域数。
                 refine_per_top=self.params.refine_per_top,  # 每邻域精扫候选数。
                 relocation_cooldown=self.params.relocation_cooldown_frames,  # 重定位限频间隔。
+                min_size_floor=self.params.min_size_floor,  # 小目标阈值绝对下限：窗口/限速/半径/抖动不随小尺寸等比缩窄。
                 backend=self.backend,  # 打分后端（torch CUDA 或 NumPy）。
             )
             source = SOURCE_COLOR  # 本帧来源为白色强测量。
             self.last_color_frame = self.frame_index  # 记录测到颜色的帧号。
             self._log(  # 输出学习结果，便于与外部脚本回归对照。
                 f"SHAPE learned area={self.template.area:.1f} points={len(self.template.points)} "
-                f"symmetry={self.template.symmetry_period:g}deg "
+                f"symmetry={self.template.symmetry_period:g}deg window={learn_required:02d}帧选优 "
                 f"model={'rectangle' if self.template.use_rectangle_model else 'contour'}"
             )
         elif not self.scene_ended and self.tracker is not None:  # 第 7 步：已学习，逐帧观测。

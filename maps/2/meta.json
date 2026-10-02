@@ -13,9 +13,7 @@
         "255,0,127": "none up teleport",
         "127,0,255": "none down teleport",
         "0,127,0": "left none teleport",
-        "139,69,19": "right none teleport",
-        "0,255,0": "right up none",
-        "255,255,255": "none up jump"
+        "139,69,19": "right none teleport"
     },
     "Color Code Up Down": {
         "127,127,127": "none up none",
@@ -24,7 +22,7 @@
     "Edge Color": "255,127,127",
     "Use Teleport To Walk": false,
     "Teleport Cooldown": 1.0,
-    "Minimap Feature": "射手村东",
+    "Minimap Feature": "完整小地图",
     "Minimap Threshold": 0.8,
     "Map Rect": "",
     "Dot Hue Min": 18,
@@ -32,14 +30,5 @@
     "Dot Min Pixels": 4,
     "Record Canvas Size": "1600,1200",
     "Record Trace Thickness": 2,
-    "Monster Features": "",
-    "Record Use Keys": true,
-    "Record Auto Goal": true,
-    "Record Left Keys": "left",
-    "Record Right Keys": "right",
-    "Record Up Keys": "up",
-    "Record Down Keys": "down",
-    "Record Jump Keys": "alt",
-    "Record Teleport Keys": "",
-    "Record Action Tap Window": 0.25
+    "Monster Features": ""
 }

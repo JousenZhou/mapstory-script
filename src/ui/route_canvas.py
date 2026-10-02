@@ -18,10 +18,12 @@ MAX_UNDO = 24  # 撤销栈最大深度，限制内存占用。
 
 
 def _bgr_to_qimage(img):  # BGR ndarray -> QImage（拷贝数据，避免底层缓冲区回收后失效）。
-    rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    rgb = np.ascontiguousarray(rgb)
-    h, w, _ = rgb.shape
-    return QImage(rgb.data, w, h, QImage.Format_RGB888).copy()
+    # 必须转成 4 字节/像素并显式传行距：RGB888 每行 w*3 字节，宽度非 4 倍数（如 1366）时不满足 Qt 的 4 字节对齐行距，
+    # 缺省构造会让每行错位若干字节，显示为整幅斜切条纹的花屏。
+    bgra = cv2.cvtColor(img, cv2.COLOR_BGR2BGRA)
+    bgra = np.ascontiguousarray(bgra)
+    h, w, _ = bgra.shape
+    return QImage(bgra.data, w, h, w * 4, QImage.Format_RGB32).copy()
 
 
 class RouteCanvas(QWidget):
@@ -34,6 +36,7 @@ class RouteCanvas(QWidget):
         self._map = None      # 底图 BGR（np.uint8, HxWx3）。
         self._route = None    # 可编辑路线图 BGR，与底图同尺寸。
         self._composite = None  # 缓存的叠加显示图，route 变动时重建，避免每次 paint 全图混合。
+        self._composite_pm = None  # 缓存的合成图 QPixmap，与 _composite 同生命周期，避免每次 paint 重复做全图颜色转换。
         self._scale = 1.0     # 图像到控件的等比缩放系数。
         self._offset = (0, 0)  # 居中留白偏移 (x, y)。
         self._brush_color = (255, 0, 0)  # 当前画笔色（BGR 之外的 RGB 指令色），由页签设置。
@@ -94,6 +97,7 @@ class RouteCanvas(QWidget):
 
     def _invalidate(self):  # 标记缓存失效并重绘。
         self._composite = None
+        self._composite_pm = None
         self._update_scale()
         self.update()
 
@@ -106,16 +110,26 @@ class RouteCanvas(QWidget):
         disp_w, disp_h = w * self._scale, h * self._scale
         self._offset = (max(0, (cw - disp_w) / 2), max(0, (ch - disp_h) / 2))
 
-    def _rebuild_composite(self):  # 把路线非黑像素叠加到底图上，缓存结果。
+    def _rebuild_composite(self):  # 把路线非黑像素叠加到底图上，缓存结果（合成为供显示的 BGR）。
         if self._map is None:
             return
         if self._route is None:
             self._composite = self._map.copy()
             return
-        comp = self._map.copy()
+        comp = self._map.copy()  # 底图来自 cv2 截图/imread，通道序是 BGR。
         mask = np.any(self._route != 0, axis=2)  # 非黑像素即有指令色。
-        comp[mask] = self._route[mask]
+        # 路线图通道序是指令色表同序的 RGB（录制端 trace 与画笔都直写 r,g,b），叠到 BGR 底图前必须交换通道，
+        # 否则选红色笔会显示成青色，与调色板按钮颜色不一致。
+        comp[mask] = self._route[mask][:, ::-1]  # RGB 转 BGR 后落到底图副本上。
         self._composite = comp
+
+    def _ensure_pixmap(self):  # 取得合成图的 QPixmap，仅在 route/底图变动后才重建。
+        if self._composite_pm is None:
+            if self._composite is None:
+                self._rebuild_composite()
+            self._composite_pm = QPixmap.fromImage(_bgr_to_qimage(self._composite))
+            self._composite = None  # ndarray 副本已转成 QPixmap，释放以省内存。
+        return self._composite_pm
 
     def resizeEvent(self, event):  # 尺寸变化时重算缩放。
         super().resizeEvent(event)
@@ -126,11 +140,9 @@ class RouteCanvas(QWidget):
         if self._map is None:
             painter.end()
             return
-        if self._composite is None:
-            self._rebuild_composite()
-        pixmap = QPixmap.fromImage(_bgr_to_qimage(self._composite))
-        target_w = int(self._composite.shape[1] * self._scale)
-        target_h = int(self._composite.shape[0] * self._scale)
+        pixmap = self._ensure_pixmap()
+        target_w = int(pixmap.width() * self._scale)
+        target_h = int(pixmap.height() * self._scale)
         scaled = pixmap.scaled(target_w, target_h, Qt.KeepAspectRatio, Qt.FastTransformation)
         painter.drawPixmap(int(self._offset[0]), int(self._offset[1]), scaled)
         painter.end()

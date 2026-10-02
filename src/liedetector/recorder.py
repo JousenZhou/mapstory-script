@@ -32,6 +32,8 @@ import numpy as np  # 采集去重：判定相邻帧是否完全相同（游戏�
 
 from ok.util.logger import Logger  # 框架日志器，与 dashboard_store 一致。
 
+from src.liedetector.feed import encode_trace  # 逐帧喂入层：实时喂帧日程紧凑序列化写进边车（feed.py 仅依赖标准库，无循环导入）。
+
 logger = Logger.get_logger(__name__)
 
 LIE_RECORD_DIR = "lie_records"  # 录像目录（相对项目根，已在 .gitignore 忽略，不入库）。
@@ -353,7 +355,14 @@ class LieRecorder:
         except Exception as e:  # 单帧写入失败（编码异常等）。
             logger.warning(f"Lie record write frame failed: {e}. 测谎录像写入单帧失败，已跳过该帧。")
 
-    def stop(self, outcome="solved"):  # 收尾：停采集线程 -> 排空并回灌写线程 -> 关流 -> 释放采集实例 -> 写边车 JSON -> 滚动保留。outcome ∈ success/failure/solved/timeout/gone/abandoned/aborted。
+    def captured_frames(self):  # 当前已「入库」的帧数（已写 + 标定缓冲 + 队列排队）：供实时解题首次喂帧时快照，写进边车作回放仿实时的 mp4 起点对齐偏移（录像早于解题开题，不补这段会全程错位）。最佳努力：多线程下为瞬时近似值，对齐精度±几帧可接受。
+        try:
+            queued = self._queue.qsize() if self._queue is not None else 0  # qsize 为估算值，仅作对齐起点用。
+            return int(self._frames) + len(self._calib) + int(queued)
+        except Exception:  # 任何异常回退已写计数，绝不外溢影响解题。
+            return int(self._frames)
+
+    def stop(self, outcome="solved", feed_trace=None, feed_start_frame=None):  # 收尾：停采集线程 -> 排空并回灌写线程 -> 关流 -> 释放采集实例 -> 写边车 JSON -> 滚动保留。outcome ∈ success/failure/solved/timeout/gone/abandoned/aborted；feed_trace 为本局实时喂帧日程（list[FeedStep]），feed_start_frame 为首次喂帧对应的 mp4 帧号（起录→开题提前段），写进边车供回放仿实时复现（均可为 None）。
         with self._lock:
             if not self._running and self._writer is None and not self._calib:  # 从未起录或已收尾。
                 self._release_capture()  # 仍幂等释放采集资源。
@@ -378,7 +387,7 @@ class LieRecorder:
             self._release_writer()  # 关闭并释放 mp4 写入流。
             self._release_capture()  # 释放独立采集实例的 GDI 资源（DC/bitmap）。
             if frames > 0:  # 有帧才写边车。
-                self._write_sidecar(outcome, frames)
+                self._write_sidecar(outcome, frames, feed_trace, feed_start_frame)
             self._prune()  # 滚动保留最近 LIE_RECORD_KEEP 组。
             if path:  # 起流成功且写过帧才记收尾日志。
                 logger.info(f"Lie record stopped: {path} outcome={outcome} frames={frames} dropped={dropped} fps={self._fps_written} measured_fps={measured_fps}. 测谎录像已结束。")
@@ -412,7 +421,7 @@ class LieRecorder:
             return round(float(self._fps_written), 3)
         return float(LIE_RECORD_FPS)
 
-    def _write_sidecar(self, outcome, frames):  # 写与 mp4 同名的 .json 边车：时间戳/触发分/精度档/结果/帧数/容器帧率/实测帧率/容器时长/真实墙钟/分辨率/区域。
+    def _write_sidecar(self, outcome, frames, feed_trace=None, feed_start_frame=None):  # 写与 mp4 同名的 .json 边车：时间戳/触发分/精度档/结果/帧数/容器帧率/实测帧率/容器时长/真实墙钟/分辨率/区域/喂帧日程/首喂帧偏移。
         if not self._path:  # 未起流成功，无录像可记。
             return
         try:
@@ -423,6 +432,10 @@ class LieRecorder:
             real_duration = 0.0  # 首末帧真实时间跨度（诊断用）。
             if self._first_ts is not None and self._last_ts is not None and self._last_ts >= self._first_ts:
                 real_duration = round(self._last_ts - self._first_ts, 3)
+            try:  # 首次喂帧的 mp4 起点偏移：夹到 [0, 总帧数]，非法/缺失回退 0（旧行为，回放仿实时自动含提前段）。
+                feed_offset = max(0, min(int(feed_start_frame or 0), int(frames)))
+            except (TypeError, ValueError):
+                feed_offset = 0
             data = {  # 边车记录字段。
                 "video": os.path.basename(self._path),  # mp4 文件名，供 list_records 与目录无关地重建路径。
                 "path": self._path,  # 录制时的路径（相对项目根）。
@@ -438,6 +451,8 @@ class LieRecorder:
                 "width": int(self._width),  # 分辨率宽（有裁剪区域时为区域宽）。
                 "height": int(self._height),  # 分辨率高（有裁剪区域时为区域高）。
                 "region": list(self._crop) if self._crop else None,  # 录像裁剪区域 [x,y,w,h]（整帧坐标系），None 表示录整帧。
+                "feed_trace": encode_trace(feed_trace or []),  # 实时喂帧日程紧凑数组（[dt_ms,x,y,w,h,reset,source,conf]，相对裁剪原点）：回放“仿实时”据此重喂同一帧子集/同一 dt；旧记录无此字段或为空表示无日程。
+                "feed_start_frame": feed_offset,  # 解题首次喂帧对应的 mp4 帧号：录像在触发确认即起录、解题要再等报警+触发延迟，前段 K 帧不在喂帧日程里；回放仿实时据此对齐起点，无此字段（旧记录）缺省 0。
             }
             with open(json_path, "w", encoding="utf-8") as f:  # 写边车。
                 json.dump(data, f, ensure_ascii=False, indent=2)

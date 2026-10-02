@@ -25,6 +25,7 @@ MAP_INDEX_FILE = os.path.join(MAPS_ROOT, '_index.json')  # 索引文件路径。
 MAP_META_FILE = 'meta.json'  # 地图配置文件名（相对地图目录）。
 MAP_IMAGE_FILE = 'map.png'  # 全局小地图文件名。
 ROUTE_PREFIX = 'route'  # 路线图文件名前缀（route1.png / route_rest.png）。
+ROUTE_EVENTS_SUFFIX = '.keys.json'  # 按键事件流 sidecar 后缀（routeN.png -> routeN.keys.json）。
 
 # 主指令色表（RGB -> "左右 上下 动作"），移植自参考库 MapleStoryAutoLevelUp 的 config_default.yaml。
 # 三元组语义：左右 ∈ {left,right,none}，上下 ∈ {up,down,none}，动作 ∈ {none,jump,teleport,goal,stop}。
@@ -71,9 +72,21 @@ MAP_META_DEFAULTS = {
     'Dot Hue Min': 18,                  # 角色黄点 HSV 色相下限（0-179）。
     'Dot Hue Max': 38,                  # 角色黄点 HSV 色相上限（0-179）。
     'Dot Min Pixels': 4,                # 黄点最小连通块面积（像素），更小视为噪点。
+    'Dot Sat Min': 200,                 # 黄点 HSV 饱和度下限：角色标记是纯黄，调高可排除地形的橙黄块。
+    'Dot Val Min': 180,                 # 黄点 HSV 亮度下限：调高可排除偏暗地形，标记发暗时再调低。
     # —— 录制参数（仅"地图"页签的路线录制工具使用）——
     'Record Canvas Size': '1600,1200',  # 录制期预分配拼接画布尺寸 "宽,高"（像素），停止时按内容外接矩形裁剪。
     'Record Trace Thickness': 2,        # 录制描线粗细（画布像素），越大轨迹越粗、 nearest_color 越易命中。
+    # —— 键盘捕获录制参数（开着"键盘捕获"时录制才推导指令，否则退回手点画笔色）——
+    'Record Use Keys': True,            # 是否被动监听真实按键自动上色（关闭则用 GUI 当前画笔色）。
+    'Record Auto Goal': True,           # 停止录制时在末点自动补一个 goal 色，省得手动标记终点。
+    'Record Left Keys': 'left',         # 左移键位，逗号分隔可配多个（如 a, left）。
+    'Record Right Keys': 'right',       # 右移键位。
+    'Record Up Keys': 'up',             # 上（爬梯）键位。
+    'Record Down Keys': 'down',         # 下（下梯）键位。
+    'Record Jump Keys': 'space',        # 跳跃键位。
+    'Record Teleport Keys': '',         # 瞬移技能键位，留空表示该地图不用瞬移。
+    'Record Action Tap Window': 0.25,   # 点按动作有效窗（秒）：录制帧拍推导时，该时长内的点按仍算生效。
     # —— 打怪参数（默认从看板继承，特殊地图可覆盖）——
     'Monster Features': '',             # 该地图怪物标注分类名，英文逗号分隔；留空表示运行时取看板共享值。
 }
@@ -292,10 +305,16 @@ def add_route(name):  # 新建一条与 map.png 同尺寸的全黑路线图，�
     return file_name
 
 
-def delete_route(name, route_file):  # 删除一条路线图（禁止删到只剩零条由调用方保证）。
+def delete_route(name, route_file):  # 删除一条路线图及其按键事件流 sidecar（禁止删到只剩零条由调用方保证）。
     path = route_path(name, route_file)
     if os.path.isfile(path):
         os.remove(path)
+    events = route_events_path(name, route_file)  # 同步清理 sidecar，避免残留事件流与新路线对不上。
+    if os.path.isfile(events):
+        os.remove(events)
+    backup = path + '.bak'  # 重绘前的旧图备份也一并清掉，不让它泄露在列表之外。
+    if os.path.isfile(backup):
+        os.remove(backup)
 
 
 def load_route_image(name, route_file):  # 读取路线图 BGR 矩阵。
@@ -312,6 +331,55 @@ def load_map_image(name):  # 读取 map.png BGR 矩阵。
 
 def save_map_image(name, img):  # 保存 map.png（导入截图覆盖时使用）。
     return _imwrite_unicode(map_image_path(name), img)
+
+
+# ---------------------------------------------------------------- 按键事件流 sidecar
+#
+# 录制时除了描出 PNG，还把每拍的 (时刻, 全局坐标, 指令) 存下来：改描线粗细/改色表/自动扩色后，
+# 可以离线重绘路线图而不必重走地图；cmd 为 None 表示那一拍没有指令（定位失败/站着不动），重绘时在此断线。
+
+def route_events_path(name, route_file):  # routeN.png 对应的事件流路径 routeN.keys.json。
+    stem = os.path.splitext(os.path.basename(route_file))[0]
+    return os.path.join(map_dir(name), stem + ROUTE_EVENTS_SUFFIX)
+
+
+def has_route_events(name, route_file):  # 该路线图是否带事件流 sidecar。
+    return os.path.isfile(route_events_path(name, route_file))
+
+
+def backup_route_image(name, route_file):  # 重绘覆盖前备份旧图为 routeN.png.bak，返回备份路径；无原图返回 None。
+    path = route_path(name, route_file)
+    if not os.path.isfile(path):
+        return None
+    backup = path + '.bak'
+    shutil.copyfile(path, backup)
+    return backup
+
+
+def save_route_events(name, route_file, events, canvas=None, thickness=None):  # 写事件流，返回落盘路径或 None。
+    payload = {
+        'version': 1,  # 格式版本，后续加字段可据此兼容读取。
+        'canvas': [int(canvas[0]), int(canvas[1])] if canvas else None,  # 事件坐标所处画布尺寸。
+        'thickness': int(thickness) if thickness else None,  # 录制时的描线粗细。
+        'events': [[round(float(e[0]), 3), int(e[1]), int(e[2]), e[3]] for e in (events or [])],  # [时刻s, x, y, 指令或 null]
+    }
+    path = route_events_path(name, route_file)
+    _write_json_atomic(path, payload)
+    return path
+
+
+def load_route_events(name, route_file):  # 读事件流，返回 {version, canvas, thickness, events}；缺失或损坏返回 None。
+    data = _read_json_utf8(route_events_path(name, route_file))
+    if not isinstance(data, dict) or not isinstance(data.get('events'), list):
+        return None
+    events = []  # 归一化每行：旧数据多余元素丢弃、不足补 null，保证调用方可安全解包。
+    for item in data['events']:
+        if not isinstance(item, (list, tuple)) or len(item) < 3:
+            continue
+        cmd = item[3] if len(item) > 3 else None
+        events.append([float(item[0]), int(item[1]), int(item[2]), cmd])
+    return {'version': int(data.get('version') or 1), 'canvas': data.get('canvas'),
+            'thickness': data.get('thickness'), 'events': events}
 
 
 def validate_routes(name):  # 校验所有路线图与 map.png 尺寸一致，返回 [(route_file, 错误说明 或 None)]。

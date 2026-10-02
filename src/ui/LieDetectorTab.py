@@ -40,6 +40,7 @@ from src.liedetector.shape_session import (  # 在线编排。
     ShapeTrackParams, ShapeTrackSession, PRECISION_TIER_DEFAULT, PRECISION_TIER_KEYS,
     SOURCE_BORDER, SOURCE_COLOR, SOURCE_INTERPOLATED, SOURCE_PREDICTION, SOURCE_SCENE_ENDED)
 from src.liedetector.recorder import LIE_RECORD_DIR, delete_record, list_records  # 测谎录像历史：列举 lie_records 边车记录供下拉复算，并支持删除选中记录。
+from src.liedetector.feed import decode_trace, iter_replay_plan, should_reset  # 逐帧喂入层：回放“仿实时”按实时喂帧日程重喂同一帧子集/同一 dt（与实时同源）；should_reset 为两路共用的区域重置判定。
 
 
 class _EmitLogger:  # 把检测器内部日志转发成 Qt 信号的适配器。
@@ -103,11 +104,13 @@ class LieDetectorWorker(QThread):  # 工作线程：在线分析 + 实时预览�
     algorithm_ready = Signal(str, str)  # 算法准备就绪信号：(徽标文案, 日志参数摘要)。
     finished_result = Signal(bool, str)  # 结束信号：(是否通过, 结果描述)。
 
-    def __init__(self, video_path, tier="high", parent=None, delay=0.0):
+    def __init__(self, video_path, tier="high", parent=None, delay=0.0, mode="ceiling", sidecar=None):
         super().__init__(parent)
         self.video_path = video_path  # 录像路径。
         self.tier = tier  # 复算精度档：由页签精度下拉传入，与线上服务同档验证。
         self.delay = max(0.0, float(delay))  # 触发延迟秒数：定位到弹窗后先等待再解题，与线上服务一致；<=0 表示不延迟。
+        self.mode = str(mode or "ceiling")  # 复算模式：'ceiling'=算法上限逐帧（现有）；'live'=按边车 feed_trace 日程仿实时复现。
+        self.sidecar = sidecar or {}  # 选中录像的完整边车 dict（含 feed_trace/tier/fps），仅 'live' 模式使用。
         self.frame_queue = queue.Queue(maxsize=2)  # 只保留最新帧，避免 UI 积压。
         self._stopped = threading.Event()  # 停止标志。
 
@@ -143,6 +146,13 @@ class LieDetectorWorker(QThread):  # 工作线程：在线分析 + 实时预览�
         timeout_ticks = max(budget_ticks, frame_count + int(round(src_fps))) if frame_count > 0 else budget_ticks
         self.log_message.emit(
             f"video {frame_w}x{frame_h} opened 视频已打开 src_fps={src_fps:.1f} 源帧率 frames={frame_count} timeout={timeout_ticks} ticks")
+        if self.mode == "live":  # 仿实时模式：不逐帧、不按原速播放，而是严格按边车 feed_trace 复现实时的喂帧子集/dt/区域重置（与实时同口径）。
+            trace = decode_trace(self.sidecar.get("feed_trace"))
+            if not trace:  # 旧记录无喂帧日程：无法仿实时，告警并自动回落逐帧上限模式。
+                self.log_message.emit("no feed_trace in sidecar, fallback to ceiling 边车无喂帧日程，自动回落“算法上限(逐帧)”复算")
+            else:
+                self._run_live_replay(cap, frame_w, frame_h, src_fps, trace)
+                return
         region_finder = LieDetectorRegion()  # 多尺度模板定位器。
         try:  # 前置流程（模板缩小/探测/定位器构造）异常时也要正常收尾，避免线程静默死亡卡死 UI。
             locate_scale = min(1.0, LOCATE_MAX_SIDE / max(frame_w, frame_h, 1))  # 定位缩帧系数：按最长边封顶。
@@ -336,11 +346,9 @@ class LieDetectorWorker(QThread):  # 工作线程：在线分析 + 实时预览�
                                 time.sleep(next_deadline - now)
                             continue  # 本帧不解题，读下一帧。
                     rx, ry, rw, rh = region
-                    # 区域首次出现或位移超阈值时 reset 状态机（清空光流历史、模板、跟踪器）。
-                    if last_region is None or abs(rw - last_region[2]) > 4 or abs(rh - last_region[3]) > 4:
-                        session.reset(rw, rh)  # 区域尺寸变化：必须清空全部状态。
-                    elif abs(rx - last_region[0]) > 4 or abs(ry - last_region[1]) > 4:
-                        session.reset(rw, rh)  # 区域位移：也必须清空，否则坐标偏移。
+                    # 区域首次出现或位移/尺寸超阈值时 reset 状态机（清空光流历史、模板、跟踪器）——与实时解题共用 feed.should_reset，杜绝两份手写漂移。
+                    if should_reset(last_region, region, 4):  # 首帧或未记录过区域、或任一边变化 >4px 才重置（new_region 为空不重置，但此处 region 已有效）。
+                        session.reset(rw, rh)  # 重置光流会话：以新尺寸重建，避免上一段历史污染。
                     last_region = region
                     crop = frame[ry:ry + rh, rx:rx + rw]  # 裁出图形区域。
                     t_track = time.perf_counter()  # 跟踪计时起点。
@@ -383,6 +391,81 @@ class LieDetectorWorker(QThread):  # 工作线程：在线分析 + 实时预览�
             result_msg = "stopped by user 用户手动停止"
         self.finished_result.emit(result_ok, result_msg)
 
+    def _run_live_replay(self, cap, frame_w, frame_h, src_fps, trace):  # 仿实时回放：严格按实时喂帧日程重放——跳到日程指定的 mp4 帧、用该步真实 dt 换算的 fps 喂入、按记录的区域 reset，复现实时的掉帧与时间阈值行为。
+        try:  # 任何异常不拖垮 UI，按失败收尾；cap 由 run() 的 finally 统一释放（此处只读到结束）。
+            try:  # 起点对齐偏移：录像在触发确认即起录、解题要再等报警+触发延迟才开题，不补这段会在「弹窗未开题」的画面上喂帧、全程错位跑不出轨迹。
+                start_frame = max(0, int(self.sidecar.get("feed_start_frame") or 0))
+            except (TypeError, ValueError):
+                start_frame = 0
+            if "feed_start_frame" not in self.sidecar:  # 旧记录无该字段：只能从第 0 帧起喂（含提前段），告警提示结果可能偏差。
+                self.log_message.emit("no feed_start_frame in sidecar 边车无首喂帧偏移（旧记录），仿实时从第 0 帧起喂，时间线可能含起录提前段")
+            tier = str(self.sidecar.get("tier") or self.tier or PRECISION_TIER_DEFAULT).strip()  # 精度档取边车 tier（与实时同档，忠实复现），缺失回退页签档/默认档。
+            if tier not in PRECISION_TIER_KEYS:  # 非法档位防御。
+                tier = PRECISION_TIER_DEFAULT
+            params = ShapeTrackParams(precision_tier=tier)  # 与线上解测谎同档装配会话。
+            logger_adapter = _EmitLogger(self.log_message.emit)  # 日志适配器。
+            session = ShapeTrackSession(params=params, logger=logger_adapter)  # 光流粒子滤波在线会话。
+            session.reset(frame_w, frame_h)  # 先以整帧尺寸建会话，保证首步未带 reset 也能安全 update（reset 口径为 (w, h)）。
+            self.algorithm_ready.emit(
+                f"光流+粒子滤波（仿实时 {ENGINE_TAGS.get(session.aligner.engine_name, session.aligner.engine_name)}）",
+                f"仿实时复现 tier={params.precision_tier} 日程={len(trace)} 步 src_fps={src_fps:.1f} 起点帧={start_frame}")
+            tick = 0  # 已喂入的日程步数。
+            last_target_tick = 0  # 最近一次有效跟踪的步号。
+            fps_sum = 0.0  # 各步有效帧率累加，收尾求均值（应与实时 diag 的 fps 口径一致）。
+            last_index = start_frame - 1  # 最近一步消费的 mp4 帧序号（从起点前算起），用于估算“复现丢弃帧数”。
+            last_rect = None  # 最近一次有效子区域：实时 rect=None 的语义是「未采到坐标框、沿用旧区域」，回放同样沿用，绝不退整帧（否则裁取尺寸突变、跟踪器发散）。
+            planned = len(trace)  # 计划喂入的日程步数（= 实时真正喂入 session 的帧数）。
+            result = None  # 最近一帧跟踪结果（供循环外兜底引用）。
+            for step in iter_replay_plan(trace, src_fps, start_frame):  # 按日程逐步驱动：起点=首喂帧偏移，游标按 dt 跳帧复现实时掉帧。
+                if self._stopped.is_set():  # 用户手动停止。
+                    break
+                if step.frame_index > last_index:  # 只在前进到新帧时 seek（避免同一帧重复 seek，日程允许步内不前进的极端情形）。
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, step.frame_index)  # 跳到该步对应的 mp4 帧。
+                    last_index = step.frame_index
+                ok, frame = cap.read()  # 读该帧。
+                if not ok:  # 越界或播完。
+                    break
+                tick += 1
+                rx, ry = 0, 0  # 子区域左上角（mp4 帧内绝对坐标：step.rect 已相对裁剪原点=mp4 原点）。
+                rw, rh = frame_w, frame_h  # 默认整帧（仅当从未有过 rect 的极端旧记录才用到）。
+                if step.rect is not None:  # 该步记录了相对子区域：更新沿用基准并按它复切夹到帧内。
+                    last_rect = step.rect
+                if last_rect is not None:  # 沿用最近有效区域（含 rect=None 的「未采到坐标框」步，与实时语义一致）。
+                    x, y, w, h = last_rect
+                    rx = max(0, min(int(x), frame_w - 1))
+                    ry = max(0, min(int(y), frame_h - 1))
+                    rw = max(1, min(int(w), frame_w - rx))
+                    rh = max(1, min(int(h), frame_h - ry))
+                crop = frame[ry:ry + rh, rx:rx + rw]  # 裁出图形区域。
+                if step.reset:  # 该步实时做过区域重置：复现 session.reset 清空历史。
+                    session.reset(crop.shape[1], crop.shape[0])  # reset 口径 (w, h)。
+                result = session.update(crop, step.fps)  # 用该步真实 dt 换算的 fps 喂入（与实时同一口径函数）。
+                fps_sum += step.fps  # 累计有效帧率。
+                if result.source in (SOURCE_COLOR, SOURCE_BORDER, SOURCE_INTERPOLATED):  # 有效跟踪。
+                    last_target_tick = tick
+                if tick % 30 == 1:  # 诊断：每约 30 步报一次，与实时逐帧口径对照。
+                    self.log_message.emit(
+                        f"live-replay tick {tick}/{planned}: source={result.source} conf={result.confidence:.2f} "
+                        f"fps={step.fps:.1f} reset={step.reset} rect=({rx},{ry},{rw},{rh})")
+                draw_shape_overlay(frame, (rx, ry, rw, rh), result, tick, "", planned,
+                                   f"LIVE {fps_sum / tick:.0f}/{src_fps:.0f}FPS" if tick else "", "LIVE")  # 叠加绘制并推送预览。
+                self._push_frame(frame)
+            spanned = max(0, last_index + 1)  # 日程在 mp4 上跨越的总帧数（含起录→开题提前段）。
+            dropped = max(0, spanned - planned - start_frame)  # 复现的“实时因处理慢而丢弃的中间帧”估计（扣除提前段，只算解题窗口内）。
+            avg_fps = (fps_sum / tick) if tick else 0.0  # 平均有效帧率。
+            self.log_message.emit(
+                f"live-replay done 仿实时结束：计划喂入 {planned} 帧/实际喂入 {tick} 帧、跨越 {spanned} 帧、复现丢弃约 {dropped} 帧、平均有效 fps={avg_fps:.1f}")
+            source_counts = session.source_counts if session is not None else {}  # source 分布。
+            self.log_message.emit(f"source counts: {source_counts} 仿实时 source 分布")
+            result_ok = last_target_tick > 0  # 只要全程有过有效跟踪即判“可复现跟踪”（与 crop 上限模式判定口径一致）。
+            if self._stopped.is_set():
+                self.finished_result.emit(False, "stopped by user 用户手动停止（仿实时）")
+            else:
+                self.finished_result.emit(result_ok, f"live-replay: tracked {last_target_tick}/{planned} 仿实时跟踪至第 {last_target_tick} 步")
+        except Exception as exc:  # 流水线异常按失败收尾，不静默死亡。
+            self.log_message.emit(f"live-replay error 仿实时异常: {exc}")
+            self.finished_result.emit(False, f"live-replay error: {exc}")
+
 
 class LieDetectorTab(CustomTab):  # 测谎检验页签：上传录像验证谎言检测器求解流水线。
 
@@ -391,6 +474,8 @@ class LieDetectorTab(CustomTab):  # 测谎检验页签：上传录像验证谎�
         self.icon = FluentIcon.LIBRARY
         self.worker = None
         self.video_path = ""
+        self._selected_record = None  # 当前选中历史录像的完整边车 dict（含 feed_trace/tier/fps），仿实时模式据此复现；手选视频时为 None。
+        self._history_by_path = {}  # 路径 -> 边车 dict 映射，供 _on_history_selected 取回完整记录（下拉 itemData 仍只存路径）。
 
         control = QWidget()
         layout = FlowLayout(control, needAni=False)  # 自适应流式布局：控件按可用宽度自动换行，不再全挤在一行。
@@ -410,6 +495,11 @@ class LieDetectorTab(CustomTab):  # 测谎检验页签：上传录像验证谎�
         self.precision_combo = ComboBox()  # 复算精度档下拉（低/中等/高/极高，GPU 门控），与看板 Dashboard.json 同键，改动即合并写回并通知服务。
         self.precision_combo.setMinimumWidth(90)  # 保证档位中文可见。
         self.precision_combo.currentIndexChanged.connect(self._persist_lie_settings)  # 用户改档即持久化（加载期由 _loading 守卫屏蔽）。
+        self.mode_label = BodyLabel("复算模式")  # 复算模式下拉标签。
+        self.mode_combo = ComboBox()  # 复算模式：算法上限(逐帧) / 仿实时(按录像日程)；后者需选中带 feed_trace 的录像。
+        self.mode_combo.setMinimumWidth(150)  # 保证模式中文可见。
+        self.mode_combo.addItem("算法上限(逐帧)", None, "ceiling")  # 默认：逐帧、按 src_fps 口径，作为算法上限参照。
+        self.mode_combo.addItem("仿实时(按录像日程)", None, "live")  # 按选中录像边车的 feed_trace 复现实时喂帧节奏。
         self.backend_label = BodyLabel("运算后端: --")  # 只读显示当前测谎打分后端（GPU/CPU），按显卡可用性刷新。
         self.delay_label = BodyLabel("触发延迟")  # 触发延迟标签。
         self.delay_spin = DoubleSpinBox()  # 触发延迟秒数，与看板 Dashboard.json 同键，改动即合并写回并通知服务。
@@ -431,6 +521,7 @@ class LieDetectorTab(CustomTab):  # 测谎检验页签：上传录像验证谎�
         layout.addWidget(self.pick_button)
         layout.addWidget(self._flow_group(self.history_combo, self.refresh_history_button, self.delete_history_button))
         layout.addWidget(self._flow_group(self.precision_label, self.precision_combo))
+        layout.addWidget(self._flow_group(self.mode_label, self.mode_combo))  # 复算模式（算法上限/仿实时）与精度档并列。
         layout.addWidget(self.backend_label)
         layout.addWidget(self._flow_group(self.delay_label, self.delay_spin))
         layout.addWidget(self._flow_group(self.start_button, self.stop_button))
@@ -474,6 +565,7 @@ class LieDetectorTab(CustomTab):  # 测谎检验页签：上传录像验证谎�
     def _reload_history(self):  # 用 list_records 重建历史下拉：首项占位，其余每条录像一项（摘要 label，data=mp4 路径）。
         current = self.video_path  # 记录当前视频路径，重建后尽量保持选中。
         records = list_records()  # 扫描 lie_records 边车，按时间倒序（新->旧）。
+        self._history_by_path = {rec.get("path"): rec for rec in records}  # 缓存路径->完整边车，供仿实时取 feed_trace/tier/fps。
         self.history_combo.blockSignals(True)  # 重建期间屏蔽信号（activated 本就只在用户点选时发，双保险）。
         self.history_combo.clear()  # 清空旧项。
         self.history_combo.addItem("历史记录", None, None)  # 首项占位，data=None 表示未选具体录像。
@@ -482,6 +574,7 @@ class LieDetectorTab(CustomTab):  # 测谎检验页签：上传录像验证谎�
         self.history_combo.blockSignals(False)  # 恢复信号。
         index = self.history_combo.findData(current) if current else -1  # 定位当前视频对应项。
         self.history_combo.setCurrentIndex(index if index >= 0 else 0)  # 命中则选中，否则回占位首项。
+        self._selected_record = self._history_by_path.get(current) if index and index >= 0 else None  # 重建后同步选中记录（供仿实时）；回占位项则清空。
 
     def _format_history_label(self, rec):  # 把一条记录格式化成下拉摘要：MM-DD HH:MM 分X.XX 档 结果。
         ts = str(rec.get("timestamp") or "")  # ISO 起录时间戳。
@@ -503,6 +596,7 @@ class LieDetectorTab(CustomTab):  # 测谎检验页签：上传录像验证谎�
         if not path:  # 占位项或无路径，忽略。
             return
         self.video_path = path  # 设为当前待验证视频。
+        self._selected_record = self._history_by_path.get(path)  # 同步选中记录的完整边车（含 feed_trace），供仿实时复现。
         self.path_label.setText(os.path.basename(path))  # 显示文件名。
         self.append_log(f"history selected 已选择历史录像: {path}")  # 记日志。
 
@@ -603,6 +697,7 @@ class LieDetectorTab(CustomTab):  # 测谎检验页签：上传录像验证谎�
             "Video Files (*.mp4 *.avi *.mkv *.mov *.webm)")
         if path:
             self.video_path = path
+            self._selected_record = self._history_by_path.get(path)  # 手选视频：能对上已有边车则取（可仿实时），否则 None（仿实时会自动回落逐帧）。
             self.path_label.setText(os.path.basename(path))
             self.append_log(f"video selected 已选择视频: {path}")
 
@@ -615,14 +710,19 @@ class LieDetectorTab(CustomTab):  # 测谎检验页签：上传录像验证谎�
         self.log_edit.clear()
         tier = self.precision_combo.currentData() or 'high'  # 用页签精度下拉当前档复算，与线上服务同档验证。
         delay = float(self.delay_spin.value())  # 触发延迟：验证时同样在定位到弹窗后等待该秒数再解题，与线上服务一致。
-        self.worker = LieDetectorWorker(self.video_path, tier, self, delay=delay)  # delay 走关键字，保持 (path, tier, parent) 位置参数不变。
+        mode = self.mode_combo.currentData() or 'ceiling'  # 复算模式：ceiling=算法上限逐帧；live=按边车 feed_trace 仿实时。
+        sidecar = self._selected_record or {}  # 选中录像的完整边车（含 feed_trace/tier/fps）；未选/无则空，仿实时会自动回落逐帧。
+        self.worker = LieDetectorWorker(self.video_path, tier, self, delay=delay, mode=mode, sidecar=sidecar)  # delay 走关键字，保持 (path, tier, parent) 位置参数不变。
         self.worker.log_message.connect(self.append_log)
         self.worker.algorithm_ready.connect(self.on_algorithm_ready)
         self.worker.finished_result.connect(self.on_finished)
         self.start_button.setEnabled(False)
         self.pick_button.setEnabled(False)
         self.stop_button.setEnabled(True)
-        self.append_log(f"start verifying at source fps 开始按原速验证（精度 {tier}，触发延迟 {delay:.1f}s，画面右上角显示实测/源 FPS）")
+        if mode == 'live':  # 仿实时：不逐帧、不按原速，严格复现实时喂帧日程；fps 取边车 tier（与实时同档）。
+            self.append_log(f"start verifying in LIVE mode 开始仿实时复现（边车精度 {sidecar.get('tier') or tier}，日程步数 {len(sidecar.get('feed_trace') or [])}；无日程自动回落逐帧）")
+        else:
+            self.append_log(f"start verifying at source fps 开始按原速逐帧验证（算法上限，精度 {tier}，触发延迟 {delay:.1f}s，画面右上角显示实测/源 FPS）")
         self.worker.start()
 
     def stop(self):  # 请求停止工作线程。

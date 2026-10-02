@@ -16,6 +16,7 @@ import numpy as np
 
 from src.liedetector import recorder as recorder_module  # 被测模块：patch 其 LIE_RECORD_DIR / LIE_RECORD_KEEP。
 from src.liedetector.recorder import LieRecorder, delete_record, list_records, mp4v_available, LIE_RECORD_FPS  # 录像器、历史列举/删除、编码器探测与帧率常量。
+from src.liedetector.feed import FeedStep, decode_trace  # 喂帧日程：验证 stop 传入的 trace 落进边车且可还原（回放仿实时的数据来源）。
 
 
 def _frame(value, height=120, width=160):
@@ -187,6 +188,98 @@ class TestLieRecorder(unittest.TestCase):
         self.assertEqual(50, data["width"], "边车宽应为区域宽")
         self.assertEqual(60, data["height"], "边车高应为区域高")
         self.assertEqual(6, data["frames"], "写入帧数应等于实际录帧数")
+
+    def test_stop_with_feed_trace_writes_decodable_field(self):
+        # 实时把喂帧日程交给 stop：边车应落 feed_trace 紧凑数组，且 decode_trace 能逐条还原 dt/rect/reset/source/conf。
+        if not mp4v_available():
+            self.skipTest("mp4v 编码器不可用，跳过真实录像产出用例")
+        trace = [
+            FeedStep(dt_ms=33, rect=(0, 0, 50, 60), reset=True, source="color", conf=0.81),
+            FeedStep(dt_ms=50, rect=(2, 3, 50, 60), reset=False, source="border", conf=0.42),
+            FeedStep(dt_ms=40, rect=None, reset=False, source="waiting", conf=0.0),  # 沿用旧区域：rect=None。
+        ]
+        rec = LieRecorder()
+        rec.start((120, 160), {"score": 0.7, "tier": "high"})
+        for i in range(5):
+            rec.write(_frame(i * 10))
+        rec.stop("solved", trace)  # 关键：把本局喂帧日程随收尾交给录像器写进边车。
+        jsons = [n for n in os.listdir(self.tmp) if n.endswith(".json")]
+        self.assertEqual(1, len(jsons))
+        with open(os.path.join(self.tmp, jsons[0]), encoding="utf-8-sig") as f:
+            data = json.load(f)
+        self.assertIn("feed_trace", data, "边车应含 feed_trace 字段")
+        self.assertEqual(3, len(data["feed_trace"]), "feed_trace 行数应等于喂入步数")
+        back = decode_trace(data["feed_trace"])
+        self.assertEqual(len(trace), len(back), "decode 后步数一致")
+        self.assertEqual(33, back[0].dt_ms)
+        self.assertEqual((0, 0, 50, 60), back[0].rect, "首步相对区域应可还原")
+        self.assertTrue(back[0].reset, "首步 reset 标志透传")
+        self.assertEqual("color", back[0].source)
+        self.assertIsNone(back[2].rect, "rect=None 往返仍为 None")
+
+    def test_feed_trace_defaults_empty_and_old_record_decodes_empty(self):
+        # 不传 feed_trace（旧调用/无日程）：边车仍写空列表，不报错；旧记录缺字段时 decode 得空列表（向后兼容）。
+        if not mp4v_available():
+            self.skipTest("mp4v 编码器不可用，跳过真实录像产出用例")
+        rec = LieRecorder()
+        rec.start((120, 160), {"score": 0.5, "tier": "high"})
+        rec.write(_frame(10))
+        rec.stop("solved")  # 不传 feed_trace。
+        jsons = [n for n in os.listdir(self.tmp) if n.endswith(".json")]
+        with open(os.path.join(self.tmp, jsons[0]), encoding="utf-8-sig") as f:
+            data = json.load(f)
+        self.assertEqual([], data["feed_trace"], "无日程时边车 feed_trace 应为空列表")
+        self.assertEqual([], decode_trace(data["feed_trace"]), "空列表 decode 得空")
+        # 旧记录完全没有 feed_trace 字段：以 .get 取到 None，decode 仍安全得空列表（仿实时据此自动回落逐帧）。
+        legacy = {"outcome": "solved"}  # 模拟改动前落盘的旧边车。
+        self.assertEqual([], decode_trace(legacy.get("feed_trace")), "旧记录无字段 decode 得空、不报错")
+
+    def test_stop_with_feed_start_frame_records_offset(self):
+        # 首喂帧起点偏移：录像早于解题开题（报警+触发延迟提前段），边车应如实落 feed_start_frame，供仿实时游标对齐。
+        if not mp4v_available():
+            self.skipTest("mp4v 编码器不可用，跳过真实录像产出用例")
+        rec = LieRecorder()
+        rec.start((60, 80), {"score": 0.5, "tier": "high"})
+        for i in range(10):
+            rec.write(_frame(i * 10, height=60, width=80))
+        rec.stop("failure", feed_trace=None, feed_start_frame=4)  # 失败局也照常带偏移写入。
+        jsons = [n for n in os.listdir(self.tmp) if n.endswith(".json")]
+        with open(os.path.join(self.tmp, jsons[0]), encoding="utf-8-sig") as f:
+            data = json.load(f)
+        self.assertEqual(4, data["feed_start_frame"], "边车应记录首喂帧对应的 mp4 帧号")
+        self.assertEqual([], data["feed_trace"], "未传日程时 feed_trace 仍为空列表")
+
+    def test_feed_start_frame_clamped_to_frames(self):
+        # 偏移非法或超过总帧数：夹取到 [0, frames]，旧记录缺字段时边车仍写 0（回放仿实时退化为从第 0 帧喂）。
+        if not mp4v_available():
+            self.skipTest("mp4v 编码器不可用，跳过真实录像产出用例")
+        rec = LieRecorder()
+        rec.start((60, 80), {"score": 0.5, "tier": "high"})
+        for i in range(3):
+            rec.write(_frame(i * 10, height=60, width=80))
+        rec.stop("solved", feed_start_frame=999)  # 远超总帧数 → 夹到 3。
+        jsons = [n for n in os.listdir(self.tmp) if n.endswith(".json")]
+        with open(os.path.join(self.tmp, jsons[0]), encoding="utf-8-sig") as f:
+            data = json.load(f)
+        self.assertEqual(3, data["feed_start_frame"], "越界偏移应夹到总帧数")
+        rec2 = LieRecorder()
+        rec2.start((60, 80), {"score": 0.5, "tier": "high"})
+        rec2.write(_frame(1, height=60, width=80))
+        rec2.stop("solved", feed_start_frame="bad")  # 非法值回退 0，不报错。
+        jsons2 = sorted(n for n in os.listdir(self.tmp) if n.endswith(".json"))
+        with open(os.path.join(self.tmp, jsons2[-1]), encoding="utf-8-sig") as f:
+            self.assertEqual(0, json.load(f)["feed_start_frame"], "非法偏移应回退 0")
+
+    def test_captured_frames_counts_written_buffered_and_queued(self):
+        # captured_frames ≈ 已写 + 标定缓冲 + 队列排队：未起录时为 0，供解题首喂帧快照起点偏移；异常也不外溢。
+        rec = LieRecorder()
+        self.assertEqual(0, rec.captured_frames(), "未起录时应为 0不抛")
+        rec._frames = 7  # 直接造内部计数：已写 7 + 缓冲 2 + 队列 3。
+        rec._calib = [(1.0, None), (2.0, None)]
+        rec._queue = __import__("queue").Queue()
+        for _ in range(3):
+            rec._queue.put((1.0, None))
+        self.assertEqual(12, rec.captured_frames(), "三段计数应相加")
 
     def test_crop_out_of_bounds_falls_back_to_full_frame(self):
         # 裁剪区域完全越界：夹取后退化，回退录整帧，边车 region 为 None。

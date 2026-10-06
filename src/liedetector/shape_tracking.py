@@ -19,6 +19,7 @@ np.random.default_rng(seed) 保证。
 from __future__ import annotations
 
 import math  # 数学函数：三角、开方、弧度角度互转。
+from collections import deque  # 定长队列：旋转见证器保存多帧窗灰度缓冲以算长基线光流。
 from dataclasses import dataclass  # 数据类装饰器，承载算法中间结果。
 
 import cv2  # OpenCV：HSV 转换、形态学、轮廓、光流、重映射。
@@ -597,6 +598,378 @@ def score_shape_contours_on_backend(
     )
 
 
+# 旋转见证器（RotationWitness）常量：分割形态学核、连通域下限与关联门限，全部处理尺度。
+# 参数取自诊断探针 _diag_lie_rotation.py 在失败录像 20261001_190829 上的实测（lag=12 档可分性成立）：
+# 闭运算合并同一图形的碎片边缘、再膨胀把断开的面包屑连成环，旋转体质心才稳定；
+# 关联门限 16px 比平移体留得更宽，因为星形环带碎片的质心抖动更大。
+WITNESS_CLOSE_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))  # 闭运算核：合并同一图形边缘。
+WITNESS_DILATE_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))  # 膨胀核：把面包屑连成稳定环。
+WITNESS_MIN_BLOB_AREA = 40  # 连通域最小面积（处理尺度像素）：以下视为噪点。
+WITNESS_ASSOC_GATE = 16.0  # 质心+恒速预测关联门限（处理尺度像素）。
+WITNESS_QUANTILE = 0.995  # 分位阈值：与绝对下限取大者，高分位只留最强响应（水面噪声下更稳）。
+# 多帧窗光流参数：与诊断探针 _diag_lie_rotation.py 完全一致（lag=12 短基线可分性实测成立）。
+# 重要：透明图形的时序残差只来自运动本身，lag=1 相邻帧的切向位移不到 1 像素、Farneback 基本测不到
+# （实测 lag=1 会把旋转低估 ~12 倍、目标与干扰物排名颠倒），必须用 ~12 帧窗的长基线才能分。证据链
+# 只保留 max(lags)+1(=5) 帧历史，取不到 12 帧基线，因此见证器自维一个灰度环形缓冲、每检查点算一次长基线光流。
+WITNESS_FLOW_SPAN = 12  # 光流时间基线（帧）：切向位移在此基线上才足够显著。
+WITNESS_FLOW_PARAMS = dict(pyr_scale=0.5, levels=3, winsize=15, iterations=2, poly_n=5, poly_sigma=1.2, flags=0)  # 与诊断同参。
+WITNESS_CLUSTER_RADIUS = 24.0  # 证据簇聚合半径（处理尺度像素，约 0.8 倍目标尺寸）：同一物理目标的碎裂轨迹在此范围内。
+WITNESS_CLUSTER_RATE_TOL = 0.35  # 入簇速率容差：成员折算速率不得低于种子的该倍率，防把静止碎片/慢漂干扰并进同一簇稀释速率。
+WITNESS_CANDIDATE_MIN_AGE = 12.0  # 折算速率的年龄下限（帧），与 _WitnessTrack.candidate 的 min_age 同口径。
+
+
+def _witness_farneback(prev_gray, curr_gray):  # 默认长基线光流：cv2 Farneback（与诊断实测同一实现），返回 (H,W,2) float32。
+    return cv2.calcOpticalFlowFarneback(prev_gray, curr_gray, None, **WITNESS_FLOW_PARAMS)
+
+
+@dataclass
+class RotationCandidate:
+    """见证器输出的一路旋转候选团块轨迹（处理尺度）。"""
+
+    center: np.ndarray  # 当前质心 (2,)，处理尺度坐标系。
+    signed_angle: float  # 累计带符号转角（度），正负表旋转方向。
+    abs_angle: float  # 累计绝对转角（度）。
+    direction_consistency: float  # 方向一致性：多数符号采样占比 0~1。
+    samples: int  # 有效 ω 采样数。
+    age: float  # 轨迹累计存在时长（帧）。
+    windowed_deg: float  # 折算到参考窗内的转角（度）= |累计| × rate_window / 年龄；对轨迹碎裂不敏感的旋转速率判据。
+    score: float  # 综合质量分：折算窗内转角 × 方向一致性 × 采样可信度。
+
+
+class _WitnessTrack:
+    """见证器内部的一条团块轨迹：质心恒速模型 + 累计旋转量。"""
+
+    def __init__(self, track_id, center, tick):
+        self.id = track_id  # 轨迹编号。
+        self.center = np.asarray(center, dtype=np.float64)  # 当前质心（处理尺度）。
+        self.velocity = np.zeros(2, dtype=np.float64)  # 恒速模型速度（像素/帧）。
+        self.birth = tick  # 建档时刻（帧）。
+        self.last_seen = tick  # 最后一次关联到的时刻（帧）。
+        self.frames = 0  # 关联帧计数。
+        self.signed_angle = 0.0  # 累计带符号转角（度）。
+        self.abs_angle = 0.0  # 累计绝对转角（度）。
+        self.sign_pos = 0  # ω>0 采样数。
+        self.sign_neg = 0  # ω<0 采样数。
+        self.samples = 0  # 有效 ω 采样数。
+
+    def match(self, center, tick):
+        """关联到新观测：更新恒速模型与质心（速度按经帧数归一为“像素/帧”）。"""
+
+        gap = max(1.0, float(tick - self.last_seen))  # 距上次关联的帧数（检查间隔>1 时一步位移跨多帧）。
+        step = np.asarray(center, dtype=np.float64) - self.center  # 本区间位移。
+        self.velocity = 0.5 * self.velocity + 0.5 * (step / gap)  # 平滑速度（像素/帧）。
+        self.center = np.asarray(center, dtype=np.float64)  # 新质心。
+        self.last_seen = tick  # 刷新可见时刻。
+        self.frames += 1  # 计数。
+
+    def add_rotation(self, deg_per_frame, dt):
+        """记录一次每帧角速度估计（度/帧），按经过帧数 dt 折算成累计转角。"""
+
+        self.signed_angle += deg_per_frame * dt  # 带符号累计（区间内匀速假设）。
+        self.abs_angle += abs(deg_per_frame) * dt  # 绝对值累计。
+        if deg_per_frame >= 0.0:  # 符号投票，只计方向不计幅度。
+            self.sign_pos += 1
+        else:
+            self.sign_neg += 1
+        self.samples += 1  # 采样计数。
+
+    @property
+    def direction_consistency(self):
+        """方向一致性：多数符号采样占比（无采样时为 0）。"""
+
+        if self.samples == 0:
+            return 0.0
+        return max(self.sign_pos, self.sign_neg) / self.samples  # 单一定向旋转期望接近 1。
+
+    def candidate(self, rate_window=60.0, min_age=12.0):
+        """导出对外候选记录。
+
+        旋转判据用「折算到参考窗 rate_window 帧内的转角」而非生命周期累计：透明相位真目标
+        的残差星环会碎裂、轨迹频繁重建，单纯累加 signed_angle 会因碎裂而长期偏低；除以轨迹年龄
+        得到旋转速率再乘参考窗，对碎裂不敏感（目标速率高、平移干扰/水面几近 0）。年龄下限取
+        min_age 防刚建档的短轨迹把小角过度外推。
+        """
+
+        age = max(0.0, self.last_seen - self.birth)  # 存在时长（帧）。
+        windowed = abs(self.signed_angle) * float(rate_window) / max(float(age), float(min_age))  # 折算窗内转角。
+        trust = min(1.0, self.samples / 12.0)  # 采样可信度：12 次以上视为满信。
+        score = windowed * self.direction_consistency * trust  # 综合质量分（基于速率判据）。
+        return RotationCandidate(
+            center=self.center.astype(np.float32),  # 质心。
+            signed_angle=self.signed_angle,  # 累计带符号转角。
+            abs_angle=self.abs_angle,  # 累计绝对转角。
+            direction_consistency=self.direction_consistency,  # 方向一致性。
+            samples=self.samples,  # 采样数。
+            age=age,  # 存在时长。
+            windowed_deg=windowed,  # 折算窗内转角。
+            score=score,  # 质量分。
+        )
+
+
+class RotationWitness:
+    """旋转见证器：从时序残差证据图 + 多帧窗光流独立识别「唯一在旋转」的团块。
+
+    测谎场景只有目标旋转、干扰物仅平移，背景动态水面使「边界强度」不可信，只有旋转量
+    能区分目标与干扰。本类纯 NumPy/cv2 侧、处理尺度，与粒子跟踪器解耦：每 `check_interval`
+    帧由会话喂一次证据图与当前帧灰度，自己算一次 ~flow_span 帧基线的 Farneback 光流，做
+    分割→连通域→恒速关联→切向最小二乘估 ω→累计转角，供会话侧「低置信重锚」与「防假锁复查」
+    两条规则查询。旋转速率单位约定：光流在 `span` 帧基线上估出总旋转，`deg_per_frame = 度/span`，
+    再按本检查区间经过的 `dt` 帧折算成累计转角。
+    """
+
+    def __init__(  # 构造见证器。
+        self,
+        threshold: float,  # 证据绝对阈值下限（与高分位取大者），进参数。
+        check_interval: int = 5,  # 每次 update 之间经过的帧数（默认节奏，用于缺省 dt）。
+        lost_frames: float = 60.0,  # 丢失容忍帧数（~1.5s）：透明相位目标残差环间歇可见，0.5s 会把真目标轨迹拆断（照诊断实测）。
+        min_blob_area: int = WITNESS_MIN_BLOB_AREA,  # 连通域最小面积。
+        assoc_gate: float = WITNESS_ASSOC_GATE,  # 关联门限。
+        min_track_samples: int = 6,  # 成为候选所需的最少 ω 采样数。
+        min_track_age: float = 12.0,  # 成为候选所需的最短年龄（帧）：与采样下限配套，压制刚建档的单点碎片。
+        cluster_radius: float = WITNESS_CLUSTER_RADIUS,  # 证据簇聚合半径（处理尺度像素）。
+        cluster_min_samples: int = 3,  # 簇候选的采样下限：多条独立碎片在同一处同向同速转本身就是交叉验证，不必等同单轨迹的 6 次。
+        cluster_enabled: bool = True,  # 是否按空间簇聚合轨迹后再卡门槛（关掉即退回旧的逐轨迹口径，供回滚对比）。
+        flow_span: int = WITNESS_FLOW_SPAN,  # 光流时间基线（帧）。
+        rate_window: float = 60.0,  # 旋转速率折算参考窗（帧，~1.5s）：累计转角除以年龄再乘此窗。
+        flow_fn=None,  # 长基线光流函数 (prev_gray,curr_gray)->(H,W,2)；None 用默认 cv2 Farneback。
+    ):
+        self.threshold = float(threshold)  # 保存证据阈值下限。
+        self.check_interval = max(1, int(check_interval))  # 保存检查节奏。
+        self.lost_frames = float(lost_frames)  # 保存丢失容忍。
+        self.min_blob_area = int(min_blob_area)  # 保存最小团块面积。
+        self.assoc_gate = float(assoc_gate)  # 保存关联门限。
+        self.min_track_samples = int(min_track_samples)  # 保存最小采样数。
+        self.min_track_age = max(0.0, float(min_track_age))  # 保存最小年龄（帧）。
+        self.cluster_radius = max(1.0, float(cluster_radius))  # 保存聚合半径。
+        self.cluster_min_samples = max(1, int(cluster_min_samples))  # 保存簇采样下限。
+        self.cluster_enabled = bool(cluster_enabled)  # 保存聚合开关。
+        self.flow_span = max(2, int(flow_span))  # 保存光流基线（下限 2 帧）。
+        self.rate_window = max(1.0, float(rate_window))  # 保存速率折算参考窗（帧）。
+        self.flow_fn = flow_fn if flow_fn is not None else _witness_farneback  # 保存光流函数。
+        self.tracks: list[_WitnessTrack] = []  # 全部轨迹（含已关闭）。
+        self.tick = 0.0  # 单调时钟（帧），每 update 前进 dt。
+        self.next_id = 0  # 轨迹编号发放器。
+        self._matched = []  # 最近一次 update 的 (轨迹, 掩码) 匹配视图，供估 ω 复用。
+        # 灰度环形缓冲：存 (tick, gray uint8)，够跨一个 flow_span 即可；按检查节奏最多存几帧就能回到 12 帧前。
+        keep = max(3, int(math.ceil(self.flow_span / max(1, self.check_interval))) + 2)
+        self._grays = deque(maxlen=keep)  # (tick, 处理尺度灰度)。
+
+    def reset(self) -> None:  # 清空全部轨迹、灰度缓冲与时钟（会话 reset 时调用）。
+        self.tracks = []  # 丢弃轨迹。
+        self._matched = []  # 丢弃匹配视图。
+        self._grays.clear()  # 丢弃灰度缓冲。
+        self.tick = 0.0  # 时钟归零。
+        self.next_id = 0  # 编号重置。
+
+    def update(self, evidence_np, gray_np, dt=None) -> None:  # 喂一帧（或一个检查点）。
+        """阈值分割→连通域→恒速关联→对关联成功团块在多帧窗光流上估 ω 并累计转角。gray 缺省时只关联不估旋。"""
+
+        evidence = np.asarray(evidence_np, dtype=np.float32)  # 统一主存 float32。
+        dt = float(self.check_interval if dt is None else dt)  # 距上次检查经过帧数。
+        self.tick += dt  # 推进时钟。
+        # 长基线光流：从灰度环形缓冲取“约 flow_span 帧前”的那一帧，与当前帧算一次 Farneback。
+        flow, span = None, 0.0
+        if gray_np is not None:
+            gray = np.asarray(gray_np, dtype=np.uint8)  # 处理尺度灰度。
+            self._grays.append((self.tick, gray))  # 入缓（满则弹旧）。
+            anchor = self._pick_baseline_gray(self.tick - self.flow_span)  # 取不晚于目标基线、且尽量接近的一帧。
+            if anchor is not None and self.tick - anchor[0] >= max(2.0, self.flow_span * 0.5):  # 基线足够长才算。
+                flow = np.asarray(self.flow_fn(anchor[1], gray), dtype=np.float32)  # (H,W,2)。
+                span = float(self.tick - anchor[0])  # 实际基线帧数。
+        # 分割：高分位与绝对下限取大者，闭运算合并碎片边缘、再膨胀连成稳定环（照诊断实测）。
+        cut = max(self.threshold, float(np.quantile(evidence, WITNESS_QUANTILE)))  # 自适应阈值。
+        mask = (evidence >= cut).astype(np.uint8)  # 二值分割。
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, WITNESS_CLOSE_KERNEL)  # 闭运算。
+        mask = cv2.dilate(mask, WITNESS_DILATE_KERNEL)  # 膨胀。
+        count, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, 8)  # 8 邻域连通域。
+        blobs = []  # 本帧团块列表：(质心, 标签掩码)。
+        for label in range(1, count):  # 跳过背景标签 0。
+            if stats[label, cv2.CC_STAT_AREA] < self.min_blob_area:  # 噪点丢弃。
+                continue
+            blobs.append((centroids[label], labels == label))  # 收集质心与该团块掩码。
+        self._associate(blobs)  # 恒速关联：更新既有轨迹、为新团块建档。
+        if flow is None:  # 尚无足够长的光流：只做关联不估旋转。
+            return
+        for track, blob_mask in self._matched:  # 只对当帧关联成功（含新建）的团块估 ω。
+            deg_per_frame = self._estimate_omega(track, blob_mask, flow, span)  # 每帧角速度（度/帧）。
+            if deg_per_frame is not None:  # 拟合成功。
+                track.add_rotation(deg_per_frame, dt)  # 按区间帧数累计。
+
+    def _pick_baseline_gray(self, target_tick):  # 取缓冲里时刻不晚于 target_tick、且最接近它的那帧 (tick, gray)。
+        best = None  # 候选锚帧。
+        for tick, gray in self._grays:  # 旧→新遍历。
+            if tick <= target_tick:  # 不晚于目标基线。
+                best = (tick, gray)  # 越往后越接近，持续覆盖。
+        return best  # 找不到（开局缓冲未跨基线）时为 None。
+
+    def _associate(self, blobs):  # 质心+恒速预测贪心关联，返回本帧 (轨迹, 掩码) 匹配视图。
+        live = [t for t in self.tracks if self.tick - t.last_seen <= self.lost_frames]  # 存活集。
+        # 预测位置按「距上次关联经过的帧数」外推恒速模型（检查间隔大，一帧预测会漏关联）。
+        predicted = np.array(  # 每条存活轨迹的外推预测质心。
+            [t.center + t.velocity * (self.tick - t.last_seen) for t in live]
+        ) if live else np.zeros((0, 2))
+        pairs = []  # (距离, 轨迹下标, 团块下标)。
+        for b, (center, _) in enumerate(blobs):  # 每个团块对所有未占用存活轨迹求距离。
+            for i, track in enumerate(live):  # 遍历存活轨迹。
+                if track.last_seen == self.tick:  # 本帧已被别的团块占用。
+                    continue
+                distance = float(np.linalg.norm(predicted[i] - center))  # 预测距离。
+                if distance <= self.assoc_gate:  # 门限内候选配对。
+                    pairs.append((distance, i, b))
+        pairs.sort()  # 距离升序贪心。
+        matched = []  # 本帧关联成功的 (轨迹, 掩码)。
+        taken_tracks, taken_blobs = set(), set()  # 已撮合标记。
+        for _, i, b in pairs:  # 逐个撮合。
+            if i in taken_tracks or b in taken_blobs:  # 任一已占用则跳过。
+                continue
+            taken_tracks.add(i)  # 标记轨迹。
+            taken_blobs.add(b)  # 标记团块。
+            live[i].match(blobs[b][0], self.tick)  # 更新轨迹质心/速度/计数。
+            matched.append((live[i], blobs[b][1]))  # 入匹配视图。
+        for b, (center, blob_mask) in enumerate(blobs):  # 未匹配团块建档。
+            if b in taken_blobs:  # 已撮合的跳过。
+                continue
+            track = _WitnessTrack(self.next_id, center, self.tick)  # 新轨迹。
+            self.next_id += 1  # 发号。
+            self.tracks.append(track)  # 入册。
+            matched.append((track, blob_mask))  # 入匹配视图（新建团块也参与本帧 ω 估计）。
+        self._matched = matched  # 暂存供 update 里估 ω 复用。
+        return matched
+
+    @staticmethod
+    def _estimate_omega(track, blob_mask, flow, span):  # 切向最小二乘估 ω，返回度/帧；像素不足或退化返回 None。
+        """扣除平移中位数后，ω = Σ w·perp(p)·r / Σ w·|perp(p)|²（rad），权重 w=|r| 幅值。
+
+        强边缘像素主导拟合、弱水面噪声近乎不参与；刚体旋转速度场 = ω×p，故用切向基 perp(p) 投影。
+        与诊断探针同一套数学；flow 为 ~span 帧长基线光流，其位移是这段时间的总位移，故最小二乘
+        得到的是区间总转角（rad），除以 span 折成每帧（度/帧）——透明图形旋转只有长基线才可分。
+        """
+
+        ys, xs = np.nonzero(blob_mask)  # 团块像素坐标。
+        if len(xs) < 30:  # 像素太少，形状不可靠。
+            return None
+        p = np.stack([xs - track.center[0], ys - track.center[1]], axis=1).astype(np.float64)  # 相对质心。
+        f = flow[ys, xs].astype(np.float64)  # 光流向量（区间总位移）。
+        r = f - np.median(f, axis=0)  # 平移中位数扣除（区分旋转与整体平移）。
+        perp = np.stack([-p[:, 1], p[:, 0]], axis=1)  # 切向基。
+        w = np.linalg.norm(r, axis=1)  # 幅值权重。
+        lever = float(np.sum(w * np.sum(perp * perp, axis=1)))  # Σ w·|perp|²。
+        if lever < 1e-6:  # 退化团块。
+            return None
+        omega = float(np.sum(w * np.sum(perp * r, axis=1)) / lever)  # 区间总转角（rad）。
+        span = max(1.0, float(span))  # 基线帧数下限 1 防除零。
+        return math.degrees(omega) / span  # 度/帧。
+
+    def _live_tracks(self):  # 当前存活轨迹集合。
+        return [t for t in self.tracks if self.tick - t.last_seen <= self.lost_frames]  # 按时钟过滤。
+
+    @staticmethod
+    def _rate(track):  # 单条轨迹的折算速率（度/帧）：转角除以带下限的年龄。
+        age = max(float(track.last_seen - track.birth), WITNESS_CANDIDATE_MIN_AGE)  # 年龄下限防小角高倍外推。
+        return abs(track.signed_angle) / age  # 速率。
+
+    def _clusters(self):  # 把存活轨迹聚成「同一物理目标一个证据簇」，返回未排序的 RotationCandidate 列表。
+        """透明相位真目标的残差星环会碎成多条短轨迹（实测同期存活 44~50 条、真目标那条只关联到 3~4 次），
+        逐条卡 min_track_samples 会把真目标挡在候选之外；按空间簇聚合后，采样数与旋转量都按同一目标累计。
+
+        速率用 Σ|转角| / Σ带下限年龄 的加权平均：碎片并入时分子分母同比增大，对碎裂不敏感。若改用
+        「累计转角 / 簇跨度」，簇跨度会被时段不同的成员拉长，速率被稀释（实测会把真目标打到阈值之下）。
+        入簇条件：空间邻近、与种子同向、折算速率不低于种子的 WITNESS_CLUSTER_RATE_TOL 倍 —— 只收
+        「确实在同样快转」的轨迹，静止碎片与慢漂干扰物各自成簇。
+        """
+
+        live = [t for t in self._live_tracks() if t.samples >= 1]  # 无旋转采样的轨迹不参与聚合。
+        if not self.cluster_enabled:  # 回滚口径：逐轨迹直接导出候选。
+            return [t.candidate(self.rate_window) for t in live]
+        live.sort(key=lambda t: -self._rate(t))  # 速率高的先当种子，避免被慢轨迹抢走成员。
+        taken = set()  # 已入簇轨迹编号。
+        clusters = []  # 结果。
+        for seed in live:  # 逐种子贪心成簇。
+            if seed.id in taken:
+                continue
+            members = [seed]  # 本簇成员（至少含种子自己）。
+            taken.add(seed.id)  # 标记。
+            seed_rate = self._rate(seed)  # 种子速率。
+            seed_sign = 1.0 if seed.signed_angle >= 0.0 else -1.0  # 种子方向。
+            for other in live:  # 扫剩余轨迹。
+                if other.id in taken:
+                    continue
+                if float(np.linalg.norm(other.center - seed.center)) > self.cluster_radius:
+                    continue  # 不在同一目标尺度内。
+                if (1.0 if other.signed_angle >= 0.0 else -1.0) != seed_sign:
+                    continue  # 反向旋转不是同一个目标。
+                if self._rate(other) < seed_rate * WITNESS_CLUSTER_RATE_TOL:
+                    continue  # 速率差太多，并入只会稀释证据。
+                members.append(other)  # 入簇。
+                taken.add(other.id)  # 标记。
+            clusters.append(self._merge_cluster(members, seed_sign))  # 合成候选。
+        return clusters
+
+    def _merge_cluster(self, members, sign):  # 把一簇轨迹合成一条对外候选。
+        weighted_age = sum(max(float(t.last_seen - t.birth), WITNESS_CANDIDATE_MIN_AGE) for t in members)  # 有效旋转时长。
+        signed = sign * sum(abs(t.signed_angle) for t in members)  # 同向累加的带符号转角。
+        samples = int(sum(t.samples for t in members))  # 采样数求和（这是放开采样下限的关键）。
+        sign_pos = int(sum(t.sign_pos for t in members))  # 正向采样合计。
+        sign_neg = int(sum(t.sign_neg for t in members))  # 反向采样合计。
+        direction = max(sign_pos, sign_neg) / max(1, samples)  # 方向一致性。
+        weights = np.array([max(t.samples, 1) for t in members], dtype=np.float64)  # 采样多的成员定位更可信。
+        centers = np.stack([t.center for t in members]).astype(np.float64)  # 成员质心。
+        center = (centers * weights[:, None]).sum(axis=0) / weights.sum()  # 加权簇质心。
+        windowed = abs(signed) / max(weighted_age, WITNESS_CANDIDATE_MIN_AGE) * self.rate_window  # 折算窗内转角。
+        trust = min(1.0, samples / 12.0)  # 采样可信度（与逐轨迹口径一致）。
+        return RotationCandidate(
+            center=center.astype(np.float32),  # 簇质心。
+            signed_angle=signed,  # 带符号累计转角。
+            abs_angle=float(sum(t.abs_angle for t in members)),  # 绝对累计转角。
+            direction_consistency=direction,  # 方向一致性。
+            samples=samples,  # 合计采样数。
+            age=weighted_age,  # 有效旋转时长（供年龄门槛与调试）。
+            windowed_deg=windowed,  # 折算窗内转角。
+            score=windowed * direction * trust,  # 质量分。
+        )
+
+    def query(self):  # 返回按质量分（折算窗内转角×方向一致×采样可信）降序的候选列表。
+        required = self.cluster_min_samples if self.cluster_enabled else self.min_track_samples  # 簇口径与逐轨迹口径不同下限。
+        candidates = [
+            cluster
+            for cluster in self._clusters()
+            # 采样不足的一律不报，杜绝一闪而过的水面涡；簇聚合后同一目标的碎裂轨迹按合计采样计，
+            # 下限取 cluster_min_samples：取证实测真目标簇 windowed=160（假候选只有 14.5）但合计采样仅 2~5，
+            # 沿用单轨迹的 6 会把它挡到旋转结束（帧 777）之后，等于白测。
+            if cluster.samples >= required
+            and cluster.age >= self.min_track_age
+        ]
+        candidates.sort(key=lambda item: item.score, reverse=True)  # 质量分降序。
+        return candidates  # 交会话侧按条件筛选。
+
+    def cluster_at(self, center, radius):  # 查询某位置处最近的可信证据簇对象本身（无则 None）。
+        """返回半径内最近簇的 ``RotationCandidate``。
+
+        与 ``query()`` 完全同口径（同一采样/年龄下限），区别在于这里要的是**簇对象**而不是标量转角：
+        会话侧的锚点缰绳需要区分「簇仍在但转速衰减」与「簇已碎裂消失」两种情形，前者要钉住中心、
+        后者必须丢弃锚点，只有标量读数无法分辨（0.0 既可能是衰减也可能是消失）。
+        """
+
+        target = np.asarray(center, dtype=np.float64)  # 目标中心（处理尺度）。
+        required = self.cluster_min_samples if self.cluster_enabled else self.min_track_samples  # 与 query 同下限。
+        best = None  # 半径内最近簇。
+        best_distance = float("inf")  # 最近距离。
+        for cluster in self._clusters():  # 遍历证据簇（与候选同一聚合口径）。
+            if cluster.samples < required or cluster.age < self.min_track_age:  # 不可信的不算「自己在转」。
+                continue
+            distance = float(np.linalg.norm(cluster.center - target))  # 到查询点距离。
+            if distance <= radius and distance < best_distance:  # 落半径内且更近。
+                best_distance = distance  # 更新最近。
+                best = cluster  # 记录。
+        return best  # 簇对象或 None。
+
+    def rotation_at(self, center, radius):  # 查询主跟踪器当前位置处的折算窗内转角，与 query 完全同口径。
+        cluster = self.cluster_at(center, radius)  # 复用同一「半径内最近可信簇」检索，保证规则①②口径逐位不变。
+        if cluster is None:  # 该位置无可信团块（例如落在静止干扰物上）。
+            return 0.0  # 视为零旋转。
+        return cluster.windowed_deg  # 返回折算窗内转角（与候选同口径）。
+
+
 class ParticleShapeTracker:
     """多假设粒子跟踪器：6 维状态 (x, y, vx, vy, angle, 角速度) + 权重。
 
@@ -815,6 +1188,36 @@ class ParticleShapeTracker:
         self.last_border_snr = 0.0  # 清零信噪比诊断值。
         self.search_radius = self.size_ref * 0.5  # 搜索半径回到默认值。
         self._resample_if_needed(force=False)  # 按需重采样，不强制。
+
+    def observe_rotation(self, center, confidence: float = 0.7) -> None:
+        """旋转见证器重锚：以给定中心为位置先验重撒粒子，后续由正常 color/border 观测接管。
+
+        不是一次强测量（不像 observe_color 那样贴合到确定中心），而是一次温和的**位置先验重置**：
+        把粒子群重新围绕见证器认定的旋转团块撒开，置信度只抬到温和值（默认 0.7，不拉满），
+        frames_since_reliable 复位以便紧接的边界观测重新确认；位置不确定的那一部分交给搜索半径
+        内的高斯环提案（复用 __init__ 的扩散机制，以 search_radius 为标准差），保证既贴向候选又留探索。
+        """
+
+        center = np.asarray(center, dtype=np.float32)  # 候选中心（处理尺度）。
+        period = self.template.symmetry_period  # 对称周期。
+        spread = max(self.size_ref * 0.5, float(self.search_radius))  # 重摊标准差：至少半个目标尺寸。
+        # 随机数一律 NumPy 侧生成（守住可复现契约），整块上传。
+        states = np.zeros((self.count, 6), dtype=np.float32)  # 粒子状态矩阵。
+        states[:, :2] = center + self.rng.normal(0.0, spread * 0.5, size=(self.count, 2))  # 位置围绕候选中心高斯撒开。
+        states[:, 2:4] = self.rng.normal(0.0, 1.0, size=(self.count, 2))  # 速度小幅重置。
+        states[:, 4] = self.rng.normal(0.0, max(8.0, period * 0.15), self.count) % period  # 角度围绕 0 扰动后折回周期域。
+        states[:, 5] = self.rng.normal(0.0, 0.6, self.count)  # 角速度零均值小初值。
+        self.states = self._apply_bounds(self.backend.to_backend(states))  # 上传并施加边界/限速约束。
+        self.weights = self.backend.to_backend(  # 权重重新均匀（放弃旧假设）。
+            np.full(self.count, 1.0 / self.count, dtype=np.float64)
+        )
+        self.confidence = float(np.clip(confidence, 0.0, 1.0))  # 置信度重置为温和值，不直接拉满。
+        self.last_reliable_center = center.copy()  # 重锚中心当作当前可靠位置。
+        self.pending_reliable_center = center.copy()  # 待定中心同步。
+        self.pending_reliable_hits = 0  # 清零待定命中，需后续观测重新累积才能再确认。
+        self.frames_since_reliable = 0  # 复位不可靠计数，允许后续正常接管。
+        self.search_radius = self.size_ref * 0.5  # 搜索半径回默认。
+        self._resample_if_needed(force=False)  # 按需重采样。
 
     def _proposal_states(self, reference_center: np.ndarray, velocity: np.ndarray, current_angle: float) -> np.ndarray:
         """生成全局重定位候选位姿：30% 局部圆域 + 70% 全画面网格×角度离散。

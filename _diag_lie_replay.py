@@ -6,6 +6,7 @@
     python _diag_lie_replay.py torch         # 改造后
     python _diag_lie_diff.py baseline torch  # 对比两次结果
     python _diag_lie_replay.py t5 2239       # 第二个参数是素材名过滤，只跑名字含 2239 的
+    python _diag_lie_replay.py witness 190829 1000  # 第三个参数是最多帧数（默认 400，验证本局用 1000 全长）
 
 对照实验（隔离「数组库差异」与「算法差异」）：
     set LIE_REPLAY_FORCE_BACKEND=numpy && python _diag_lie_replay.py nfacade
@@ -36,9 +37,12 @@ CASE_DIR = r"D:\workspace\新建文件夹\maoxiandao\test_case"
 RECORD_DIR = "lie_records"
 OUT_DIR = "_diag_out"
 TIERS = ("high", "ultra", "extreme")  # 含默认档 extreme（最强），回归必须覆盖它。
+TIER_ENV = tuple(t.strip() for t in os.environ.get("LIE_REPLAY_TIERS", "").split(",") if t.strip())  # 只跑指定档（扫描多素材时省时，如 LIE_REPLAY_TIERS=extreme）。
 MAX_FRAMES = 400  # 每段录像最多回放帧数，控制总耗时。
 WARMUP_FRAMES = 10  # 预热帧不计入耗时统计（含后端初始化与首帧分配）。
 FORCE_BACKEND = os.environ.get("LIE_REPLAY_FORCE_BACKEND", "").strip().lower()  # 对照实验开关，见模块 docstring。
+ANCHOR_ENV = os.environ.get("LIE_REPLAY_ANCHOR", "").strip().lower()  # 对照实验开关："0" 关闭旋转锚点约束（缰绳）用于零干扰回归。
+CURSOR_ENV = os.environ.get("LIE_REPLAY_CURSOR_MASK", "").strip().lower()  # 对照实验开关："0" 关闭准星足迹掩膜（9s 修复项），与开掩膜的同一轮回放做零扰动对照。
 
 
 def install_forced_backend():
@@ -83,8 +87,8 @@ def collect_videos():
     return items
 
 
-def replay(path, region, tier):
-    """按指定精度档回放一段录像，返回逐帧结果与耗时统计。"""
+def replay(path, region, tier, max_frames=MAX_FRAMES):
+    """按指定精度档回放一段录像，返回逐帧结果与耗时统计。max_frames 默认 400，验证本局长尾可调到 1000。"""
 
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
@@ -94,7 +98,7 @@ def replay(path, region, tier):
     frames = []
     timings = []
     tick = 0
-    while tick < MAX_FRAMES:
+    while tick < max_frames:
         ok, frame = cap.read()
         if not ok:
             break
@@ -105,7 +109,13 @@ def replay(path, region, tier):
             if crop.size == 0:
                 break
         if session is None:
-            session = ShapeTrackSession(params=ShapeTrackParams(precision_tier=tier), logger=None)
+            replay_params = ShapeTrackParams(precision_tier=tier)  # 本轮回放的参数（精度档为准）。
+            if ANCHOR_ENV == "0":  # 对照：关掉锚点约束，只看其他改动的影响。
+                replay_params.witness_anchor_enabled = False
+                replay_params.witness_anchor_lock_enabled = False
+            if CURSOR_ENV == "0":  # 对照：关掉准星足迹掩膜，量它对其他素材的零扰动。
+                replay_params.cursor_mask_enabled = False
+            session = ShapeTrackSession(params=replay_params, logger=None)
             session.reset(crop.shape[1], crop.shape[0])
         started = time.perf_counter()
         result = session.update(crop, float(src_fps))
@@ -113,6 +123,7 @@ def replay(path, region, tier):
         if tick >= WARMUP_FRAMES:
             timings.append(elapsed * 1000.0)
         center = result.center
+        witness = getattr(result, "witness_center", None)  # 旋转见证器最优候选中心（区域全尺度）。
         frames.append([
             tick,
             result.source,
@@ -120,6 +131,9 @@ def replay(path, region, tier):
             None if center is None else round(float(center[1]), 3),
             round(float(result.confidence), 4),
             round(float(result.border_snr), 4),
+            None if witness is None else [round(float(witness[0]), 1), round(float(witness[1]), 1)],  # 见证候选中心。
+            round(float(getattr(result, "witness_cum_deg", 0.0)), 1),  # 见证候选累计转角（度）。
+            bool(getattr(result, "witness_applied", False)),  # 本帧是否重锚。
         ])
         tick += 1
     cap.release()
@@ -146,6 +160,7 @@ def replay(path, region, tier):
 def main():
     tag = sys.argv[1] if len(sys.argv) > 1 else "baseline"
     name_filter = sys.argv[2] if len(sys.argv) > 2 else ""  # 只跑名字含此串的素材，省时。
+    max_frames = int(sys.argv[3]) if len(sys.argv) > 3 else MAX_FRAMES  # 最多帧数：验证本局失败录像用 1000。
     install_forced_backend()  # 对照实验开关（默认空操作）。
     os.makedirs(OUT_DIR, exist_ok=True)
     videos = [item for item in collect_videos() if name_filter in item[0]]
@@ -153,9 +168,9 @@ def main():
         print("no videos found, 未找到任何待回放素材")
         return 1
     for name, path, region in videos:
-        for tier in TIERS:
+        for tier in (TIER_ENV or TIERS):
             started = time.perf_counter()
-            data = replay(path, region, tier)
+            data = replay(path, region, tier, max_frames)
             if data is None:
                 print(f"SKIP {name} {tier} 无法打开或无有效帧")
                 continue

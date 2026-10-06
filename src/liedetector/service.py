@@ -46,7 +46,7 @@ from src.autologin.flow import DOUBLE_CLICK_GAP, AutoLoginFlow  # 导入自动�
 try:  # 解测谎依赖可选：稠密光流 + 粒子滤波在线编排，缺失时服务照常运行，仅禁用自动解测谎。
     from src.liedetector.shape_session import (  # 与测谎检验页签同一套光流解法（无神经网络）。
         ShapeTrackParams, ShapeTrackSession, PRECISION_TIER_DEFAULT, PRECISION_TIER_KEYS,
-        SOURCE_COLOR, SOURCE_BORDER, SOURCE_INTERPOLATED, SOURCE_PREDICTION, SOURCE_SCENE_ENDED)
+        SOURCE_COLOR, SOURCE_BORDER, SOURCE_ROTATION, SOURCE_INTERPOLATED, SOURCE_PREDICTION, SOURCE_SCENE_ENDED)
     LIE_SOLVER_AVAILABLE = hasattr(cv2, "DISOpticalFlow_create")  # CPU 回退引擎依赖 OpenCV DIS；显卡引擎（torch Farneback）不需要，但降级路径必须可用。
 except Exception:  # liedetector 模块缺失或依赖损坏。
     LIE_SOLVER_AVAILABLE = False  # 禁用自动解测谎，运行时日志提示。
@@ -838,6 +838,9 @@ class LieDetectorService:  # 独立测谎监控服务：后台守护线程值守
                     last_diag_time = time.time()  # 记录本次诊断时间。
                     center = result.center  # 目标中心（区域局部坐标）。
                     center_desc = f"({center[0]:.1f},{center[1]:.1f})" if center is not None else "-"  # 中心描述。
+                    witness = getattr(result, "witness_center", None)  # 旋转见证器最优候选中心（区域局部坐标；旧帧/测试 Mock 可能缺字段）。
+                    witness_cum = getattr(result, "witness_cum_deg", 0.0)  # 见证候选折算窗内转角（度）。
+                    witness_desc = f"({witness[0]:.0f},{witness[1]:.0f})cum={witness_cum:.0f}deg" if witness is not None else "-"  # 见证候选与累计转角。
                     inst_fps = (1.0 / dt) if dt > 1e-6 else 0.0  # 本帧瞬时处理帧率，供核对提速效果。
                     avg_wait = seg_wait / seg_wait_n if seg_wait_n else 0.0  # 近 1 秒「等新帧」均耗时(ms)。
                     avg_match = seg_match / seg_match_n if seg_match_n else 0.0  # 近 1 秒「全屏触发匹配」均耗时(ms)。
@@ -850,7 +853,7 @@ class LieDetectorService:  # 独立测谎监控服务：后台守护线程值守
                         pump_fps = (pump._seq - last_diag_seq) / _diag_span if _diag_span > 1e-6 else 0.0  # 本窗口 pump 存入帧数/秒 = 采集线程实际交付帧率。
                         last_diag_perf = _diag_perf  # 滚动诊断窗口基准时刻。
                         last_diag_seq = pump._seq  # 滚动诊断窗口基准序号。
-                    logger.info(f"Lie solve diag: source={result.source} conf={result.confidence:.2f} center={center_desc} cursor={mouse_pos} whites={result.white_candidates} snr={result.border_snr:.2f} tick={tick} fps={inst_fps:.1f} cost_ms wait={avg_wait:.1f} match={avg_match:.1f} flow={avg_flow:.1f} overlay={avg_overlay:.1f}({seg_overlay_n}/s) pump_fps={pump_fps:.1f} 解测谎诊断：帧率与各段单帧耗时(ms)，pump_fps 为采集线程实测供帧率，用于判定 wait 高是采集封顶还是处理封顶。")  # 供排查跟踪为空与帧率不达标。
+                    logger.info(f"Lie solve diag: source={result.source} conf={result.confidence:.2f} center={center_desc} witness={witness_desc} cursor={mouse_pos} whites={result.white_candidates} snr={result.border_snr:.2f} tick={tick} fps={inst_fps:.1f} cost_ms wait={avg_wait:.1f} match={avg_match:.1f} flow={avg_flow:.1f} overlay={avg_overlay:.1f}({seg_overlay_n}/s) pump_fps={pump_fps:.1f} 解测谎诊断：帧率与各段单帧耗时(ms)，pump_fps 为采集线程实测供帧率，用于判定 wait 高是采集封顶还是处理封顶，witness 为旋转见证器当前最强旋转候选。")  # 供排查跟踪为空与帧率不达标。
                     seg_match = seg_flow = seg_overlay = seg_wait = 0.0  # 打印后清零，下一窗口重新累计。
                     seg_match_n = seg_flow_n = seg_overlay_n = seg_wait_n = 0
                 if now - last_vision_time >= VISION_PUSH_INTERVAL:  # overlay 节流到约 12FPS：预览无需跟满解题帧率，省掉每 tick 整帧 copy+绘制。
@@ -1164,6 +1167,8 @@ class LieDetectorService:  # 独立测谎监控服务：后台守护线程值守
                     color = (0, 220, 0)  # 绿色。
                 elif source == SOURCE_BORDER:  # 边界残差证据。
                     color = (0, 220, 255)  # 黄色。
+                elif source == SOURCE_ROTATION:  # 旋转见证器重锚。
+                    color = (255, 0, 255)  # 紫红（独立颜色，区分于黄/红/蓝）。
                 elif source == SOURCE_INTERPOLATED:  # 回看插值帧。
                     color = (255, 170, 0)  # 蓝色。
                 elif source == SOURCE_PREDICTION:  # 纯预测外推。
@@ -1178,6 +1183,11 @@ class LieDetectorService:  # 独立测谎监控服务：后台守护线程值守
                     cv2.circle(canvas, (cx, cy), 5, color, -1, cv2.LINE_AA)  # 半径 5 实心圆。
                     cv2.line(canvas, (cx - 12, cy), (cx + 12, cy), (0, 0, 255), 2)  # 光标横向十字。
                     cv2.line(canvas, (cx, cy - 12), (cx, cy + 12), (0, 0, 255), 2)  # 光标纵向十字。
+                if getattr(result, "witness_center", None) is not None:  # 旋转见证器有候选时画小圆圈+累计度数（区域局部坐标偏移到画面坐标）。
+                    wx, wy = int(result.witness_center[0] + rx), int(result.witness_center[1] + ry)  # 候选画面坐标。
+                    wcolor = (255, 0, 255) if result.witness_applied else (0, 160, 255)  # 重锚命中紫红、仅候选橙色。
+                    cv2.circle(canvas, (wx, wy), 9, wcolor, 2, cv2.LINE_AA)  # 小圆圈标候选。
+                    self.draw_text(canvas, f"ROT {result.witness_cum_deg:.0f}deg", (wx + 10, wy - 4), wcolor)  # 旁边标累计度数。
                 if result.tracker_alive:  # 跟踪输出有效时显示详细参数。
                     text = f"SHAPE {source} conf={result.confidence:.2f} snr={result.border_snr:.2f}"  # 来源/置信度/信噪比。
                 elif source == SOURCE_SCENE_ENDED:  # 场景已结束。

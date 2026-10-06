@@ -48,6 +48,7 @@ class TemporalEvidence:
 
     normalized: object  # 鲁棒归一化后的残差图（单通道 float32 后端数组，显卡时留在显存），边界处响应强。
     raw_mean: float  # 各 lag 归一化前残差均值的最小值，用于判断场景切换/静止。
+    flow: object = None  # 第一 lag 的稠密光流场 (H,W,2) 后端数组（显卡路径为图静态输出，仅下一帧 replay 前有效），旋转见证器消费。
 
 
 def gaussian3x3(xp, data):
@@ -99,6 +100,7 @@ class TensorTemporalAligner:
         self._graph = None  # 捕获好的整图；None 表示当前走 eager。
         self._graph_evidence = None  # 图的静态输出：证据图（下一帧 replay 前有效）。
         self._graph_raw_mean = None  # 图的静态输出：残差均值（0 维）。
+        self._graph_flow = None  # 图的静态输出：第一 lag 光流场 (H,W,2)（同证据图，replay 刷新）。
         self._graph_disabled = False  # 捕获失败一次就永久回退 eager，不再重试。
         self._static_current_color = None  # (H,W,3) 当前帧彩色的固定地址缓冲。
         self._static_current_gray = None  # (H,W) 当前帧灰度的固定地址缓冲。
@@ -169,7 +171,7 @@ class TensorTemporalAligner:
             if self._graph is not None and steady:  # 已捕获且处于稳态：走整图 replay。
                 return self._replay_graph(color, gray)
     
-            combined, raw_mean = self._chain(  # eager 链：与图内跑的是同一份代码。
+            combined, raw_mean, flow = self._chain(  # eager 链：与图内跑的是同一份代码。
                 gray,
                 [self._history[-1 - lag][1] for lag in available],
                 color,
@@ -180,7 +182,7 @@ class TensorTemporalAligner:
             )
             if steady:  # 刚进稳态：把这条链整图捕获，下一帧起生效。
                 self._try_capture(height, width, play_height, play_mask, band_mask)
-            return TemporalEvidence(combined, float(xp.to_numpy(raw_mean)))  # 本帧唯一一次 D2H。
+            return TemporalEvidence(combined, float(xp.to_numpy(raw_mean)), flow)  # 本帧唯一一次 D2H。
     
     def _chain(self, current_gray, history_gray, current_color, history_color, play_mask, band_mask, play_height):
         """证据链本体：多 lag 合批光流 → 重建背景作差 → 鲁棒归一化 → 合并平滑。
@@ -189,7 +191,8 @@ class TensorTemporalAligner:
         ``history_gray`` / ``history_color`` 是「按 lag 顺序排列的单帧数组序列」（灰度 ``(H,W)``、
         彩色 ``(H,W,3)``）；eager 时它们来自历史队列，捕获后来自静态缓冲的固定视图，形状完全相同。
     
-        返回 ``(证据图, 残差均值张量)``；均值故意留成 0 维张量而不提前下载，这样它也能被捕获进图。
+        返回 ``(证据图, 残差均值张量, 第一 lag 光流场)``；均值故意留成 0 维张量而不提前下载，
+        这样它也能被捕获进图。光流场同样留后端数组（旋转见证器需要，CPU 侧消费时才下载）。
         """
     
         xp = self.xp
@@ -217,7 +220,8 @@ class TensorTemporalAligner:
         combined = xp.max(xp.stack(normalized_maps, axis=0), axis=0)  # 逐像素取各 lag 的最大响应。
         combined = gaussian3x3(xp, combined) * band_mask  # 轻度平滑抑制单像素噪声，再压制边缘带。
         # 残差均值取最小，避免单一 lag 的抖动误判场景切换。
-        return combined, xp.min(xp.stack(raw_means, axis=0), axis=0)
+        # 光流取第一个可用 lag 的场（lags 升序，index 0 即 lag=1）：见证器的切向 ω 估计用短基线最稳。
+        return combined, xp.min(xp.stack(raw_means, axis=0), axis=0), xp.select(flows, 0, 0)
     
     # ------------------------------------------------------------------ CUDA Graph
     
@@ -276,11 +280,12 @@ class TensorTemporalAligner:
             torch.cuda.synchronize()  # 捕获前必须无待完成的显卡工作。
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph, capture_error_mode="thread_local"):  # 捕获不执行，输出张量要到首次 replay 才有值；thread_local 让捕获只约束本线程的流，监控线程并发的 CuPy 匹配不会再把捕获打成 cudaErrorStreamCaptureUnsupported（默认 global 模式会因任意线程的并发核而报错）。
-                evidence, raw_mean = body()
+                evidence, raw_mean, flow = body()
             torch.cuda.synchronize()
             self._graph = graph
             self._graph_evidence = evidence
             self._graph_raw_mean = raw_mean
+            self._graph_flow = flow  # 图内派生的光流场（与证据图同理：replay 刷新、当帧消费）。
         except Exception as exc:  # 捕获失败：区分「与并发 CuPy 匹配的瞬时流冲突」与真正不支持捕获。
             self._release_graph()  # 先丢弃半张图与静态缓冲（self._graph 归 None，稳态下一帧会再次尝试捕获）。
             message = str(exc)  # 异常文本，用于判定是否为可自愈的瞬时冲突。
@@ -308,7 +313,11 @@ class TensorTemporalAligner:
     
         self._fill_static(color, gray)
         self._graph.replay()
-        return TemporalEvidence(self._graph_evidence, float(self.xp.to_numpy(self._graph_raw_mean)))
+        return TemporalEvidence(
+            self._graph_evidence,
+            float(self.xp.to_numpy(self._graph_raw_mean)),
+            self._graph_flow,
+        )
     
     def _release_graph(self) -> None:
         """丢弃已捕获的整图与静态缓冲（显存随即归还给 torch 的缓存分配器）。"""
@@ -316,6 +325,7 @@ class TensorTemporalAligner:
         self._graph = None
         self._graph_evidence = None
         self._graph_raw_mean = None
+        self._graph_flow = None
         self._static_current_color = None
         self._static_current_gray = None
         self._static_history_color = None

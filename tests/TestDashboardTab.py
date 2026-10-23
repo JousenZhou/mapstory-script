@@ -92,18 +92,24 @@ class TestDashboardTabWiring(unittest.TestCase):
         finally:
             tab.timer.stop()  # 停掉画面刷新定时器，避免测试结束后回调已销毁控件。
 
-    def test_lie_trigger_delay_spin_wired(self):
-        # 测谎栏应有「触发延迟」输入框：范围 0~60 秒、一位小数，能从看板配置填值。
+    def test_precision_and_delay_controls_removed(self):
+        # lievision 移植后精度五档与触发延迟全面废弃：看板不再暴露相关控件，不再读写相关配置键，旧残留键静默忽略。
+        from unittest.mock import MagicMock, patch
         from src.dashboard_store import DASHBOARD_DEFAULTS
         from src.ui.DashboardTab import DashboardTab
+        self.assertNotIn('Lie Detector Precision', DASHBOARD_DEFAULTS)  # 默认配置字典已删精度键。
+        self.assertNotIn('Lie Detector Trigger Delay', DASHBOARD_DEFAULTS)  # 默认配置字典已删延迟键。
         tab = DashboardTab()
         try:
-            self.assertEqual((0.0, 60.0), (tab.lie_delay_spin.minimum(), tab.lie_delay_spin.maximum()))
-            self.assertEqual(1, tab.lie_delay_spin.decimals())  # 一位小数，与保存时的 round(..., 1) 一致。
-            self.assertEqual(5.0, DASHBOARD_DEFAULTS['Lie Detector Trigger Delay'])  # 看板默认延迟 5 秒。
-            tab.load_config()  # 读 configs/Dashboard.json，缺失键由 load_dashboard_config 补默认值。
-            self.assertGreaterEqual(tab.lie_delay_spin.value(), 0.0)
-            self.assertLessEqual(tab.lie_delay_spin.value(), 60.0)
+            self.assertFalse(hasattr(tab, 'lie_delay_spin'))  # 触发延迟输入框已移除。
+            self.assertFalse(hasattr(tab, 'lie_precision_combo'))  # 精度下拉已移除。
+            with patch('src.ui.DashboardTab.load_dashboard_config', return_value={'Lie Detector Precision': 'ultra', 'Lie Detector Trigger Delay': 5.0}):
+                tab.load_config()  # 旧 Dashboard.json 残留键：加载不报错即可（静默忽略）。
+            with patch('src.ui.DashboardTab.save_dashboard_config', MagicMock()) as save:
+                tab.save()
+            saved = save.call_args[0][0]
+            self.assertNotIn('Lie Detector Precision', saved)  # 保存不再写回精度键。
+            self.assertNotIn('Lie Detector Trigger Delay', saved)  # 保存不再写回延迟键。
         finally:
             tab.timer.stop()  # 同样停掉定时器。
 
@@ -124,61 +130,52 @@ class TestDashboardTabWiring(unittest.TestCase):
         finally:
             tab.timer.stop()  # 同样停掉定时器。
 
-    def test_precision_combo_gpu_populated_and_persisted(self):
-        # GPU（gpu_backend_available=True）下精度下拉五档齐全，save/load 往返 Lie Detector Precision。
+    def test_lie_backend_label_shows_service_backend(self):
+        # 实战服务已就绪时，「后端」标签直接显服务解析出的测谎后端（只读，不可调、不落盘）。
         from unittest.mock import MagicMock, patch
         from src.ui.DashboardTab import DashboardTab
-        with patch('src.ui.DashboardTab.gpu_backend_available', return_value=True):
-            tab = DashboardTab()
-            try:
-                keys = [tab.lie_precision_combo.itemData(i) for i in range(tab.lie_precision_combo.count())]
-                self.assertEqual(['low', 'medium', 'high', 'ultra', 'extreme'], keys)  # GPU 五档齐全，顺序由低到高。
-                self.assertEqual('最强', tab.lie_precision_combo.itemText(4))  # 顶级档中文标签为「最强」。
-                self.assertIn('GPU', tab.lie_backend_label.text())  # 运算后端显示 GPU。
-                tab._set_precision_value('ultra')  # 选极高。
-                self.assertEqual('ultra', tab.lie_precision_combo.currentData())
-                with patch('src.ui.DashboardTab.save_dashboard_config', MagicMock()) as save:
-                    tab.save()
-                self.assertEqual('ultra', save.call_args[0][0]['Lie Detector Precision'])  # 保存写入所选精度档。
-                tab._set_precision_value('extreme')  # 选最强。
-                self.assertEqual('extreme', tab.lie_precision_combo.currentData())
-                with patch('src.ui.DashboardTab.save_dashboard_config', MagicMock()) as save:
-                    tab.save()
-                self.assertEqual('extreme', save.call_args[0][0]['Lie Detector Precision'])  # 最强档同样能落盘。
-                with patch('src.ui.DashboardTab.load_dashboard_config', return_value={'Lie Detector Precision': 'medium'}):
-                    tab.load_config()  # 配置里写 medium，加载后下拉应选中 medium。
-                self.assertEqual('medium', tab.lie_precision_combo.currentData())
-                with patch('src.ui.DashboardTab.load_dashboard_config', return_value={}):
-                    tab.load_config()  # 配置缺键时应回填算法层默认档（最强）。
-                self.assertEqual('extreme', tab.lie_precision_combo.currentData())
-            finally:
-                tab.timer.stop()
+        tab = DashboardTab()
+        try:
+            lie_service = MagicMock()
+            lie_service._backend_desc.return_value = "GPU · TensorRT INT8（缓存引擎）"
+            with patch('src.ui.DashboardTab.og') as og_mock:  # 伪框架全局：my_app.lie_service 指向假服务。
+                og_mock.my_app.lie_service = lie_service
+                tab._refresh_lie_backend()
+            self.assertEqual("后端: GPU · TensorRT INT8（缓存引擎）", tab.lie_backend_label.text())
+            lie_service._backend_desc.return_value = "装配中"
+            with patch('src.ui.DashboardTab.og') as og_mock, \
+                    patch('src.ui.DashboardTab.QTimer.singleShot') as single_shot:  # 装配中瞬态必须自调度补刷新，就绪后才能自动换成生效后端。
+                og_mock.my_app.lie_service = lie_service
+                tab._refresh_lie_backend()
+            self.assertEqual("后端: 装配中", tab.lie_backend_label.text())  # 后台线程未装配完时给预期提示。
+            single_shot.assert_called_once_with(3000, tab, tab._refresh_lie_backend)
+        finally:
+            tab.timer.stop()
 
-    def test_precision_combo_cpu_only_clamps_high_tiers(self):
-        # CPU（gpu_backend_available=False）下精度下拉只剩低/中等，请求高/极高/最强被 clamp 到中等，后端显示 CPU。
+    def test_lie_backend_label_falls_back_to_probe(self):
+        # 服务未启动（无窗口/单测）时按 GPU 三探测给预期后端；探测异常不影响看板。
+        from types import SimpleNamespace
         from unittest.mock import patch
         from src.ui.DashboardTab import DashboardTab
-        with patch('src.ui.DashboardTab.gpu_backend_available', return_value=False):
-            tab = DashboardTab()
-            try:
-                tab._refresh_precision_availability()  # 显式再刷新一次（构造时 load_config 已刷过）。
-                keys = [tab.lie_precision_combo.itemData(i) for i in range(tab.lie_precision_combo.count())]
-                self.assertEqual(['low', 'medium'], keys)  # CPU 移除高/极高/最强。
-                self.assertIn('CPU', tab.lie_backend_label.text())  # 运算后端显示 CPU。
-                tab._set_precision_value('high')  # 请求不可用的高档。
-                self.assertEqual('medium', tab.lie_precision_combo.currentData())  # 回落中等。
-                tab._set_precision_value('ultra')  # 请求不可用的极高档。
-                self.assertEqual('medium', tab.lie_precision_combo.currentData())  # 同样回落中等。
-                tab._set_precision_value('extreme')  # 请求不可用的最强档。
-                self.assertEqual('medium', tab.lie_precision_combo.currentData())  # 同样回落中等。
-                with patch('src.ui.DashboardTab.load_dashboard_config', return_value={'Lie Detector Precision': 'high'}):
-                    tab.load_config()  # CPU 下加载 high 配置也应被 clamp 到 medium。
-                self.assertEqual('medium', tab.lie_precision_combo.currentData())
-                with patch('src.ui.DashboardTab.load_dashboard_config', return_value={}):
-                    tab.load_config()  # CPU 下配置缺键时，默认档（最强）同样必须 clamp 到 medium，不能选中不存在的项。
-                self.assertEqual('medium', tab.lie_precision_combo.currentData())
-            finally:
-                tab.timer.stop()
+        tab = DashboardTab()
+        try:
+            with patch('src.ui.DashboardTab.og') as og_mock, \
+                    patch('src.liedetector.vision.device.gpu_option_state', return_value=SimpleNamespace(enabled=True, reason="")):
+                og_mock.my_app = None  # 没起实战服务：走探测分支。
+                tab._refresh_lie_backend()
+            self.assertIn("GPU · TensorRT INT8", tab.lie_backend_label.text())  # GPU 可用给待装配预期。
+            with patch('src.ui.DashboardTab.og') as og_mock, \
+                    patch('src.liedetector.vision.device.gpu_option_state', return_value=SimpleNamespace(enabled=False, reason="无 NVIDIA 显卡\n细节")):
+                og_mock.my_app = None
+                tab._refresh_lie_backend()
+            self.assertTrue(tab.lie_backend_label.text().startswith("后端: CPU（无 NVIDIA 显卡"))  # GPU 不可用给 CPU 与首行原因。
+            with patch('src.ui.DashboardTab.og') as og_mock, \
+                    patch('src.liedetector.vision.device.gpu_option_state', side_effect=RuntimeError("探测炸")):
+                og_mock.my_app = None
+                tab._refresh_lie_backend()  # 异常不外溢。
+            self.assertEqual("后端: --", tab.lie_backend_label.text())  # 异常兜底占位。
+        finally:
+            tab.timer.stop()
 
     def test_lie_abort_key_wired_and_validated(self):
         # 测谎栏应有「急停按键」输入框：能从看板配置读写往返，非法按键名被 save() 拦截，留空允许（停用）。

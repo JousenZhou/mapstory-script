@@ -26,18 +26,12 @@ from src.dashboard_store import (DASHBOARD_DEFAULTS, SUPER_CHANNEL, SUPER_CHARAC
                                  coco_fingerprint, config_fingerprint, load_annotations_by_supercategory,
                                  load_dashboard_config, save_dashboard_config, validate_key_name)
 from src.ui.DashboardTaskPanel import TaskControlPanel  # 任务控制栏：挂机/巡逻脚本手风琴卡 + 内嵌运行日志。
-from src.liedetector.gpu_shape_backend import gpu_backend_available  # 探测 torch CUDA+N 卡可用性：决定测谎精度下拉可选档位与运算后端显示。
-from src.liedetector.shape_session import (PRECISION_TIER_DEFAULT, PRECISION_TIER_GPU_ONLY,  # 精度档名单/默认档/显卡专属档：与算法内核同源，
-                                           PRECISION_TIER_KEYS)  # 免得下拉可选项与 _resolve_scoring_backend 的 clamp 名单两边漂移。
 
 CAPTURE_FPS = 30  # 截图采集固定帧率：实时画面刷新与无任务时的截图取帧都按该节拍。
 CAPTURE_INTERVAL_MS = round(1000 / CAPTURE_FPS)  # 帧间隔毫秒数（33ms）。
 VISION_MAX_AGE = 5.0  # 带标注画面的最长可用秒数：任务循环偶尔超过 1 秒时继续沿用上一帧标注画面，而不是立即闪回原始截图，消除两种画面交替闪烁。
 PLACEHOLDER = '(未选择)'  # 下拉框空选项占位文本，保存时映射回空字符串。
 SAVE_DEBOUNCE_MS = 300  # 控件变动后防抖多少毫秒再落盘：合并连续调参/逐字输入为一次保存，避免每敲一键就写盘。
-LIE_TIER_LABELS = {"low": "低", "medium": "中等", "high": "高", "ultra": "极高", "extreme": "最强"}  # 精度档 key -> 中文标签（唯一数据源，测谎检验页签也复用它）。
-LIE_PRECISION_TIERS = tuple((key, LIE_TIER_LABELS[key]) for key in PRECISION_TIER_KEYS)  # 测谎精度档下拉项 (key, 中文 label)，由低到高的顺序直接取算法层的档位顺序。
-LIE_PRECISION_GPU_ONLY = PRECISION_TIER_GPU_ONLY  # 仅 GPU 可选的重载档（高/极高/最强）：无 N 卡时从下拉移除并回落中等。
 
 
 def to_pixmap(frame):  # 把 OpenCV 的 BGR 画面矩阵转换成 Qt 图片，传入的画面应已缩放到目标显示尺寸。
@@ -198,26 +192,16 @@ class DashboardTab(CustomTab):  # 定义看板页签：视图区 + 测谎栏 + �
         self.lie_threshold_spin = DoubleSpinBox()  # 测谎触发匹配阈值。
         self.lie_threshold_spin.setRange(0.01, 1.0)  # 阈值范围 (0, 1]。
         self.lie_threshold_spin.setSingleStep(0.05)  # 步长。
-        self.lie_delay_spin = DoubleSpinBox()  # 匹配到测谎触发后延迟多少秒才开始解测谎。
-        self.lie_delay_spin.setRange(0.0, 60.0)  # 延迟范围 0~60 秒，0 表示不延迟立即解题。
-        self.lie_delay_spin.setSingleStep(0.5)  # 步长。
-        self.lie_delay_spin.setDecimals(1)  # 保留一位小数。
-        self.lie_delay_spin.setSuffix(" s")  # 单位后缀，一眼看出是秒数。
         self.lie_abort_edit = LineEdit()  # 解测谎急停按键输入框：敲击该键即中止本次解测谎并把「自动解测谎」开关同步为关。
         self.lie_abort_edit.setPlaceholderText("留空不启用，如 f8")  # 占位提示：示例按键名，留空表示不装全局键盘监听。
         self.lie_alarm_edit = LineEdit()  # 报警音频路径输入框。
         self.lie_alarm_edit.setPlaceholderText("alarm.mp3")  # 占位提示。
-        self.lie_precision_combo = ComboBox()  # 解测谎精度档下拉（低/中等/高/极高/最强，固定五档不可编辑）。
-        for _tier_key, _tier_label in LIE_PRECISION_TIERS:  # 逐项填充：显示中文 label，userData 存英文 key。
-            self.lie_precision_combo.addItem(_tier_label, None, _tier_key)
-        self.lie_backend_label = BodyLabel("运算后端: --")  # 只读显示当前测谎打分后端（GPU/CPU），load_config 时按显卡可用性刷新。
+        self.lie_backend_label = BodyLabel("后端: --")  # 只读显示测谎 YOLO 后端解析结果（GPU · TensorRT INT8（缓存引擎）/ torch CUDA / CPU），由实战服务的后台装配线程就绪后刷新。
         lie_form.addRow("自动解测谎", self.lie_auto_switch)
         lie_form.addRow("测谎区域标注", self.lie_region_combo)
         lie_form.addRow("测谎触发标注", self.lie_trigger_combo)
         lie_form.addRow("匹配阈值", self.lie_threshold_spin)
-        lie_form.addRow("精度", self.lie_precision_combo)
-        lie_form.addRow("运算后端", self.lie_backend_label)
-        lie_form.addRow("触发延迟", self.lie_delay_spin)
+        lie_form.addRow("后端", self.lie_backend_label)
         lie_form.addRow("急停按键", self.lie_abort_edit)
         lie_form.addRow("报警音频", self.lie_alarm_edit)
         lie_layout.addWidget(self.region_preview, 1)  # 预览占左半。
@@ -261,6 +245,14 @@ class DashboardTab(CustomTab):  # 定义看板页签：视图区 + 测谎栏 + �
         self.del_interval_spin = DoubleSpinBox()  # 自动按 Del 键间隔（秒），0 禁用。
         self.del_interval_spin.setRange(0.0, 86400.0)
         self.del_interval_spin.setDecimals(1)
+        self.attack_wait_spin = DoubleSpinBox()  # 攻击后摇等待（秒）：松攻击键到允许按方向键的保护间隔，全部任务通用，可按手感微调。
+        self.attack_wait_spin.setRange(0.0, 5.0)
+        self.attack_wait_spin.setDecimals(2)
+        self.attack_wait_spin.setSingleStep(0.05)
+        self.target_loss_spin = DoubleSpinBox()  # 目标丢失缓冲（秒）：攻击中怪框连续没匹配到时不松攻击键的容忍时长，消抖帧“打一下停一下”，0 立即松键。
+        self.target_loss_spin.setRange(0.0, 5.0)
+        self.target_loss_spin.setDecimals(2)
+        self.target_loss_spin.setSingleStep(0.05)
         char_grid.addWidget(BodyLabel("角色特征"), 0, 0)
         char_grid.addWidget(self.char_feature_combo, 0, 1)
         char_grid.addWidget(BodyLabel("匹配阈值"), 0, 2)
@@ -293,6 +285,10 @@ class DashboardTab(CustomTab):  # 定义看板页签：视图区 + 测谎栏 + �
         range_y_layout.addWidget(QLabel("~"))
         range_y_layout.addWidget(self.range_y_max_spin)
         char_grid.addWidget(range_y, 4, 3)
+        char_grid.addWidget(BodyLabel("攻击后摇等待(秒)"), 5, 0)
+        char_grid.addWidget(self.attack_wait_spin, 5, 1)
+        char_grid.addWidget(BodyLabel("目标丢失缓冲(秒)"), 5, 2)  # 攻击中怪框短暂丢帧不松攻击键的容忍时长，全部任务经共享键采集。
+        char_grid.addWidget(self.target_loss_spin, 5, 3)
         self.add_card("角色配置", char_widget)
 
         # —— 第 5 栏：怪物栏 ——
@@ -350,9 +346,7 @@ class DashboardTab(CustomTab):  # 定义看板页签：视图区 + 测谎栏 + �
             self._set_combo_value(self.lie_region_combo, str(data.get('Lie Detector Region Feature') or ''))
             self._set_combo_value(self.lie_trigger_combo, str(data.get('Lie Detector Trigger Feature') or ''))
             self.lie_threshold_spin.setValue(float(data.get('Lie Detector Threshold') or 0.75))
-            self._refresh_precision_availability()  # 按显卡可用性刷新精度可选档与运算后端显示。
-            self._set_precision_value(str(data.get('Lie Detector Precision') or PRECISION_TIER_DEFAULT))  # 选中配置精度档（CPU 下重载档不可用时回落中等）。
-            self.lie_delay_spin.setValue(float(data.get('Lie Detector Trigger Delay', DASHBOARD_DEFAULTS['Lie Detector Trigger Delay'])))
+            self._refresh_lie_backend()  # 刷新测谎 YOLO 后端只读标签（服务后台装配结果）。
             self.lie_abort_edit.setText(str(data.get('Lie Detector Abort Key') or ''))
             self.lie_alarm_edit.setText(str(data.get('Lie Alarm Sound') or ''))
             self._set_combo_value(self.char_feature_combo, str(data.get('Character Feature') or ''))
@@ -367,6 +361,10 @@ class DashboardTab(CustomTab):  # 定义看板页签：视图区 + 测谎栏 + �
             self.range_y_min_spin.setValue(int(data.get('Attack Range Y Min', DASHBOARD_DEFAULTS['Attack Range Y Min'])))
             self.range_y_max_spin.setValue(int(data.get('Attack Range Y Max', DASHBOARD_DEFAULTS['Attack Range Y Max'])))
             self.del_interval_spin.setValue(float(data.get('Del Key Interval') or 0))
+            raw_attack_wait = data.get('Attack To Move Wait Seconds')  # 0 是合法值（不等待），不能用 or 短路成默认值。
+            self.attack_wait_spin.setValue(float(raw_attack_wait if raw_attack_wait is not None else DASHBOARD_DEFAULTS['Attack To Move Wait Seconds']))  # 缺失时回退默认保护值。
+            raw_loss_buffer = data.get('Target Loss Buffer Seconds')  # 同上：0 合法（不缓冲），不能用 or 短路。
+            self.target_loss_spin.setValue(float(raw_loss_buffer if raw_loss_buffer is not None else DASHBOARD_DEFAULTS['Target Loss Buffer Seconds']))  # 缺失时回退默认缓冲值。
             self.monster_multi.set_value(parse_feature_list(data.get('Monster Features')))
             self.monster_threshold_spin.setValue(float(data.get('Monster Threshold') or 0.65))
             self.monster_mirror_spin.setValue(float(data.get('Monster Mirror Threshold') or 0.65))
@@ -387,28 +385,20 @@ class DashboardTab(CustomTab):  # 定义看板页签：视图区 + 测谎栏 + �
         text = combo.currentText().strip()  # 取当前文本。
         return '' if text == PLACEHOLDER else text  # 占位项按空处理。
 
-    def _refresh_precision_availability(self):  # 按显卡可用性刷新精度下拉可选档与运算后端显示：GPU 五档齐全，CPU 移除高/极高/最强并回落中等。
-        try:  # 探测异常（驱动问题等）按无显卡处理，不能拖垮看板加载。
-            gpu = bool(gpu_backend_available())
-        except Exception:  # 探测本身报错。
-            gpu = False
-        self.lie_backend_label.setText("运算后端: GPU (torch CUDA)" if gpu else "运算后端: CPU (numpy)")  # 后端显示项，最佳努力（运行期真实降级以 service 端 clamp 为准）。
-        current = self.lie_precision_combo.currentData()  # 记录当前选中档 key，重建后尽量保持。
-        tiers = LIE_PRECISION_TIERS if gpu else tuple(t for t in LIE_PRECISION_TIERS if t[0] not in LIE_PRECISION_GPU_ONLY)  # CPU 只保留低/中等。
-        self.lie_precision_combo.blockSignals(True)  # 重建期间不触发信号。
-        self.lie_precision_combo.clear()  # 清空旧项：qfluentwidgets ComboBox 非 QComboBox 子类，逐项 disable 不可靠，改用重建规避。
-        for key, label in tiers:  # 按可用档重新填充。
-            self.lie_precision_combo.addItem(label, None, key)
-        self.lie_precision_combo.blockSignals(False)  # 恢复信号。
-        self._set_precision_value(current or PRECISION_TIER_DEFAULT)  # 还原原选中档；被移除（CPU 下的重载档）时回落中等。
-
-    def _set_precision_value(self, key):  # 按 key 选中精度档；key 不在可选档（如 CPU 下的高/极高/最强）时回落中等，再不行落首项。
-        index = self.lie_precision_combo.findData(key)  # 按 userData 定位目标档。
-        if index < 0:  # 目标档不可用。
-            index = self.lie_precision_combo.findData('medium')  # 回落中等。
-        if index < 0:  # 连中等也不在（理论上不会）。
-            index = 0  # 落首项兜底。
-        self.lie_precision_combo.setCurrentIndex(index)  # 选中目标档。
+    def _refresh_lie_backend(self):  # 只读展示测谎 YOLO 后端解析结果：优先取实战服务后台线程已装配的后端；未就绪时按 GPU 三探测（nvidia-smi/torch CUDA/tensorrt）给预期。
+        try:
+            lie_service = getattr(og, "my_app", None) and getattr(og.my_app, "lie_service", None)  # 独立测谎监控服务（由 Globals 持有）。
+            if lie_service is not None:  # 服务就绪：显实际生效后端（GPU · TensorRT INT8（缓存引擎）/ torch CUDA / CPU，未装配完显装配中）。
+                desc = str(lie_service._backend_desc())  # 后端展示名。
+                self.lie_backend_label.setText(f"后端: {desc}")
+                if "装配中" in desc:  # 后台装配线程就绪前是瞬态：3 秒后自行补刷新，直到显示生效后端。
+                    QTimer.singleShot(3000, self, self._refresh_lie_backend)  # 绑 self 为接收者：页签销毁后不再触发。
+                return
+            from src.liedetector.vision import device as lie_device  # 服务未启动：按探测链给预期后端。
+            gpu = lie_device.gpu_option_state()
+            self.lie_backend_label.setText("后端: GPU · TensorRT INT8（待装配）" if gpu.enabled else f"后端: CPU（{gpu.reason.splitlines()[0]}）")
+        except Exception:  # 探测/读取异常不影响看板。
+            self.lie_backend_label.setText("后端: --")
 
     def reload_annotations(self):  # 重新读取模板页标注，按类别填充测谎/角色下拉框与怪物多选框（保留当前选择；刷新期置守卫避免触发自动保存）。
         self._loading = True  # 进入刷新：屏蔽 _set_combo_value 还原选择时触发的自动保存。
@@ -446,8 +436,6 @@ class DashboardTab(CustomTab):  # 定义看板页签：视图区 + 测谎栏 + �
             'Lie Detector Region Feature': self._combo_value(self.lie_region_combo),
             'Lie Detector Trigger Feature': self._combo_value(self.lie_trigger_combo),
             'Lie Detector Threshold': round(float(self.lie_threshold_spin.value()), 2),
-            'Lie Detector Precision': self.lie_precision_combo.currentData() or PRECISION_TIER_DEFAULT,
-            'Lie Detector Trigger Delay': round(float(self.lie_delay_spin.value()), 1),
             'Lie Detector Abort Key': self.lie_abort_edit.text().strip(),
             'Lie Alarm Sound': self.lie_alarm_edit.text().strip(),
             'Character Feature': self._combo_value(self.char_feature_combo),
@@ -462,6 +450,8 @@ class DashboardTab(CustomTab):  # 定义看板页签：视图区 + 测谎栏 + �
             'Attack Range Y Min': int(self.range_y_min_spin.value()),
             'Attack Range Y Max': int(self.range_y_max_spin.value()),
             'Del Key Interval': round(float(self.del_interval_spin.value()), 1),
+            'Attack To Move Wait Seconds': round(float(self.attack_wait_spin.value()), 2),  # 攻击后摇等待：全部任务运行时经 apply_shared_config 采集。
+            'Target Loss Buffer Seconds': round(float(self.target_loss_spin.value()), 2),  # 目标丢失缓冲：地台等任务运行时经 apply_shared_config 采集。
             'Monster Features': self.monster_multi.value_text(),
             'Monster Threshold': round(float(self.monster_threshold_spin.value()), 2),
             'Monster Mirror Threshold': round(float(self.monster_mirror_spin.value()), 2),
@@ -502,10 +492,11 @@ class DashboardTab(CustomTab):  # 定义看板页签：视图区 + 测谎栏 + �
                       self.char_facing_left_combo, self.char_facing_right_combo,
                       self.server_combo, self.channel_combo):
             combo.currentTextChanged.connect(self._schedule_save)
-        self.lie_precision_combo.currentIndexChanged.connect(self._schedule_save)  # 精度档下拉。
-        for spin in (self.lie_threshold_spin, self.lie_delay_spin, self.char_threshold_spin,  # 各数字框：值变化即保存（防抖合并连续调参）。
+        for spin in (self.lie_threshold_spin, self.char_threshold_spin,  # 各数字框：值变化即保存（防抖合并连续调参）。
                      self.melee_distance_spin, self.range_x_min_spin, self.range_x_max_spin,
                      self.range_y_min_spin, self.range_y_max_spin, self.del_interval_spin,
+                     self.attack_wait_spin,  # 攻击后摇等待：值变化即保存。
+                     self.target_loss_spin,  # 目标丢失缓冲：值变化即保存。
                      self.monster_threshold_spin, self.monster_mirror_spin):
             spin.valueChanged.connect(self._schedule_save)
         for edit in self._line_edits:  # 文本框：编辑提交（回车/失焦）即保存，避免逐字触发按键校验报错。

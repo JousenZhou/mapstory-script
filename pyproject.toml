@@ -27,18 +27,19 @@ docs = [
 gpu = [
     "cupy-cuda12x[ctk]",
 ]
-# Optional: ONNX Runtime CUDA inference used by LieDetectorTab (测谎检验).
-# onnxruntime-gpu 1.23.x is the CUDA 12 generation (1.29+ requires CUDA 13);
-# NVIDIA pip wheels supply cuBLAS/cuFFT/cuDNN runtimes on machines without a
-# system CUDA Toolkit. The tab disables itself when this extra is missing.
+# Optional: the lie-detector vision pipeline (src/liedetector/vision) -- ultralytics YOLO
+# detection + built-in OC-SORT tracking, default GPU · TensorRT INT8 with a
+# torch CUDA / CPU fallback chain. tensorrt/onnx/onnxslim power the local INT8
+# engine build; engines and calibration images are rebuilt per machine and never
+# shipped. torch must be a CUDA build matching the GPU generation; for Blackwell
+# (RTX 50xx, sm_120) install from the cu128 index:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+# Without this extra the detector falls back to the CPU path.
 inference = [
-    "onnxruntime-gpu==1.23.2",
-    "scipy>=1.14",
-    "nvidia-cudnn-cu12",
-    "nvidia-cublas-cu12",
-    "nvidia-cufft-cu12",
-    "nvidia-cuda-runtime-cu12",
-    "nvidia-nvjitlink-cu12",
+    "ultralytics>=8.4",
+    "tensorrt",
+    "onnx",
+    "onnxslim",
 ]
 # Optional: ultralytics YOLO detection accelerated on NVIDIA GPU, used by
 # Globals.detect (src/globals.py). torch must be a CUDA build matching the GPU
@@ -51,16 +52,14 @@ yolo = [
     "torchvision",
     "ultralytics>=8.4",
 ]
-# Optional: the LieDetector (解测谎) GPU pipeline -- dense optical flow plus the
-# particle filter -- reuses torch CUDA (src/liedetector/torch_flow.py,
-# torch_array.py, tensor_evidence.py). It needs torch only, NOT torchvision:
-# the Farneback-equivalent flow is implemented with plain tensor operators, so
-# no pretrained weights are downloaded. Same CUDA-build caveat as `yolo` above;
-# for Blackwell (RTX 50xx, sm_120) install from the cu128 index:
+# Optional: torch CUDA backend for the lie-detector vision pipeline (src/liedetector/vision/detector.py)
+# -- the fallback used when no cached TensorRT INT8 engine exists. It needs torch
+# only, NOT tensorrt: the torch path runs the plain ultralytics YOLO weights on the
+# GPU. Same CUDA-build caveat as `yolo` above; for Blackwell (RTX 50xx, sm_120)
+# install from the cu128 index:
 #   pip install torch --index-url https://download.pytorch.org/whl/cu128
-# Without it the detector falls back to the CPU path (cv2 DIS flow + numpy
-# scoring), which is also what the packaged exe uses since build_exe.spec
-# excludes torch.
+# Without it the detector falls back to the CPU path, which is also what the
+# packaged exe uses since build_exe.spec excludes torch.
 liegpu = [
     "torch",
 ]

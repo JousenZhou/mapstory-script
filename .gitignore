@@ -26,6 +26,9 @@ click_screenshots/
 test_scripts/
 screenshots/
 lie_records/
+# TensorRT INT8 引擎缓存与校准采样图：本机重建的临时产物，不入库。
+weights/*.engine
+cache/trt_calib/
 _diag_out/
 *.log
 thread_dumps.txt

@@ -1,0 +1,16 @@
+tracker_type: ocsort
+
+# Detections below this still match existing tracks but cannot spawn one.
+track_high_thresh: 0.3
+track_low_thresh: 0.1
+# The stars' YOLO boxes jitter by ~20px as they spin, so a permissive spawn threshold
+# makes OC-SORT create duplicate tracks that then fight over the same star.
+new_track_thresh: 0.6
+# Kept >= OC_SORT_MAX_AGE so an occluded star is revived with its id, not re-created.
+track_buffer: 45
+match_thresh: 0.5
+fuse_score: true
+
+delta_t: 3
+inertia: 0.2
+use_byte: false

@@ -23,7 +23,7 @@ MOVE_RIGHT_KEY = "right"  # 右方向键。
 MOVE_UP_KEY = "up"  # 上方向键：爬梯。
 MOVE_DOWN_KEY = "down"  # 下方向键：下梯。
 JUMP_MIN_INTERVAL = 0.35  # 连续跳跃指令的最小触发间隔秒数，避免每帧重复触发导致乱跳。
-ATTACK_TO_MOVE_WAIT = 0.5  # 攻击结束后恢复移动前的等待秒数，攻击后摇会吞方向键（沿用巡逻时序）。
+ATTACK_TO_MOVE_WAIT = 0.5  # 攻击后摇等待默认秒数（已提升为看板角色配置共享键，改用 MyBaseTask.attack_to_move_wait() 读取，此常量仅作历史参照）。
 
 
 class MapleRouteTask(MaplePatrolTask):  # 地图路线挂机任务，继承巡逻任务复用其全部底层能力。
@@ -220,7 +220,7 @@ class MapleRouteTask(MaplePatrolTask):  # 地图路线挂机任务，继承巡�
                         if self._held_attack_key is not None:  # 转身前松攻击键避免被后摇吞。
                             self.send_key_up(self._held_attack_key)  # 松开攻击键。
                             self._held_attack_key = None  # 清空。
-                            self.sleep(0.5)  # 等攻击后摇。
+                            self.sleep(self.attack_to_move_wait())  # 等攻击后摇（时长看板角色配置全局可调）。
                         self.send_key(MOVE_RIGHT_KEY if want_direction == 1 else MOVE_LEFT_KEY, down_time=0.05)  # 单按方向键转身。
                         facing = want_direction  # 记录朝向。
                         self.sleep(0.08)  # 等转身生效。
@@ -233,7 +233,7 @@ class MapleRouteTask(MaplePatrolTask):  # 地图路线挂机任务，继承巡�
                 if self._held_attack_key is not None:  # 目标消失松开攻击键并短暂等待再移动。
                     self.send_key_up(self._held_attack_key)  # 松开攻击键。
                     self._held_attack_key = None  # 清空。
-                    patrol_resume_at = time.time() + ATTACK_TO_MOVE_WAIT  # 攻击后摇期暂不移动。
+                    patrol_resume_at = time.time() + self.attack_to_move_wait()  # 攻击后摇期暂不移动（时长看板角色配置全局可调）。
                 if time.time() < patrol_resume_at:  # 后摇等待期只识图不动。
                     self.info_set("Status", "恢复跟随中")  # GUI 状态。
                     continue  # 下一帧。

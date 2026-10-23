@@ -98,7 +98,9 @@ class LieSolver:
                     lost_ticks = 0
                 region_box = self._host.get_region(frame, region_name)
                 if region_box is None:
-                    frame = self._next_frame(pump) or frame  # 未采到区域：等新帧重试。
+                    new_frame = self._next_frame(pump)  # 未采到区域：等新帧重试（numpy 帧不能 or 判真）。
+                    if new_frame is not None:
+                        frame = new_frame
                     continue
                 new_region = (region_box.x, region_box.y, region_box.width, region_box.height)
                 if region is None or self._region_reset(region, new_region):
@@ -122,7 +124,9 @@ class LieSolver:
                     logger.info("Lie pipeline reached GAME_OVER. 管线状态机判定测谎结束。")
                     outcome = "solved"
                     break
-                frame = self._next_frame(pump) or frame
+                new_frame = self._next_frame(pump)
+                if new_frame is not None:
+                    frame = new_frame
         finally:
             if pump is not None:
                 pump.stop()

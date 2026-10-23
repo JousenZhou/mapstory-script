@@ -334,7 +334,7 @@ class LieDetectorTab(CustomTab):
         self.history_combo.blockSignals(True)
         self.history_combo.clear()
         self._history_by_video = {}
-        self.history_combo.addItem("历史录像…", None)
+        self.history_combo.addItem("历史录像…", userData=None)
         for record in list_records():
             video = record.get("video")
             if not video:
@@ -342,7 +342,7 @@ class LieDetectorTab(CustomTab):
             outcome = record.get("outcome") or ""
             label = LIE_OUTCOME_LABELS.get(outcome, outcome)
             stamp = str(record.get("timestamp") or "")[:16].replace("T", " ")
-            self.history_combo.addItem(f"{stamp}  {label}", video)
+            self.history_combo.addItem(f"{stamp}  {label}", userData=video)
             self._history_by_video[video] = record
         self.history_combo.blockSignals(False)
 

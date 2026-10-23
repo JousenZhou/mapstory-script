@@ -94,7 +94,7 @@ class TestMaplePatrolSmoke(TaskTestCase):
         self.assertEqual("测谎触发", DASHBOARD_DEFAULTS["Lie Detector Trigger Feature"])  # 触发标注默认名。
         self.assertEqual("测谎坐标框", DASHBOARD_DEFAULTS["Lie Detector Region Feature"])  # 坐标框标注默认名。
         self.assertEqual(0.75, DASHBOARD_DEFAULTS["Lie Detector Threshold"])  # 触发匹配阈值默认 0.75。
-        self.assertEqual(5.0, DASHBOARD_DEFAULTS["Lie Detector Trigger Delay"])  # 触发延迟默认 5 秒。
+        self.assertNotIn("Lie Detector Trigger Delay", DASHBOARD_DEFAULTS)  # 旧光流策略的触发延迟键已废弃，看板默认值与残留配置均不再携带。
 
 
 if __name__ == '__main__':

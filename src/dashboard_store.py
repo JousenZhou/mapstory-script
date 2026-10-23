@@ -24,6 +24,7 @@ SUPER_MONSTER = '怪物'  # 怪物标注的类别名，供看板怪物栏「怪�
 SUPER_SERVER = '服务区'  # 服务区标注的类别名，供自动登录栏「服务区」单选下拉取值（蓝蜗牛等）。
 SUPER_CHANNEL = '频道'  # 频道标注的类别名，供自动登录栏「频道」单选下拉取值（频道1等）。
 SUPER_DISCONNECT = '掉线'  # 掉线相关标注的类别名（掉线/掉线2/掉线确定/连接/开始游戏）。
+SUPER_PLATFORM = '地台'  # 地台标注的类别名，供地台定点挂机任务卡「地台标注」单选下拉取值。
 
 DASHBOARD_DEFAULTS = {  # 看板共享配置默认值：键名与任务原配置键一致，任务运行时无缝读取。
     # —— 测谎栏 ——
@@ -31,8 +32,6 @@ DASHBOARD_DEFAULTS = {  # 看板共享配置默认值：键名与任务原配置
     'Lie Detector Region Feature': '测谎坐标框',  # 测谎区域标注：类别为「测谎」的标注分类名，直接采集坐标作为解测谎输入区域。
     'Lie Detector Trigger Feature': '测谎触发',  # 测谎触发标注：类别为「测谎触发」的标注分类名，画面匹配到即触发解测谎。
     'Lie Detector Threshold': 0.75,  # 测谎触发匹配阈值，越高越严格。
-    'Lie Detector Precision': 'extreme',  # 解测谎精度档（low/medium/high/ultra/extreme）：GPU 默认最强，无 N 卡时高/极高/最强运行时回落 medium。与 shape_session.PRECISION_TIER_DEFAULT 同步（此处故意用字面量，不让配置层反向依赖算法层）。
-    'Lie Detector Trigger Delay': 5.0,  # 匹配到测谎触发后延迟多少秒才开始解测谎（等弹窗完全展开、图形动画起势），0 表示立即解题。
     'Lie Detector Abort Key': '',  # 解测谎急停按键（键盘按键名，如 f8）：敲击即中止本次解测谎并把「自动解测谎」开关同步关掉，留空不启用（不装全局键盘监听）。
     'Lie Alarm Sound': 'alarm.mp3',  # 测谎报警音频（支持 wav/mp3，相对路径相对项目根目录），留空不报警。
     # —— 角色栏 ——
@@ -48,6 +47,8 @@ DASHBOARD_DEFAULTS = {  # 看板共享配置默认值：键名与任务原配置
     'Attack Range Y Min': -60,  # 攻击区域上边界（符号化像素）。
     'Attack Range Y Max': 60,  # 攻击区域下边界（符号化像素）。
     'Del Key Interval': 0.0,  # 自动按 Del 键间隔（秒），0 禁用。
+    'Attack To Move Wait Seconds': 0.5,  # 攻击后摇等待（秒）：松攻击键到允许按方向键的保护间隔，全部任务通用，0 不等待（自担吞键风险）。
+    'Target Loss Buffer Seconds': 0.3,  # 目标丢失缓冲（秒）：攻击中怪物框连续没匹配到时不松攻击键，超时确实没怪才松，消抖帧导致的“打一下停一下”；0 立即松键。
     # —— 怪物栏 ——
     'Monster Features': '',  # 怪物标注分类名，英文逗号分隔支持多个。
     'Monster Threshold': 0.65,  # 怪物匹配阈值。
@@ -91,6 +92,8 @@ def load_dashboard_config():  # 读取看板共享配置；文件不存在时先
         logger.info(f'Dashboard config created with migrated values: {DASHBOARD_CONFIG_FILE}')
     for key, value in DASHBOARD_DEFAULTS.items():  # 版本升级新增键时补齐默认值。
         data.setdefault(key, value)
+    for legacy in ('Lie Detector Precision', 'Lie Detector Trigger Delay'):  # 旧光流粒子滤波策略的精度档/触发延迟键：新栈不再使用，读到残留静默剔除。
+        data.pop(legacy, None)
     return data
 
 

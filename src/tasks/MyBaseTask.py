@@ -22,6 +22,14 @@ _THREE_DECIMAL_KEYS = frozenset({"Move Away Seconds", "Move Back Seconds"})
 # 需要放大上限的浮点配置键：框默认上限 99.99，Del 间隔需要输入三位数（如 100 秒）。
 _LARGE_MAX_KEYS = frozenset({"Del Key Interval"})
 
+# 攻击后摇等待默认秒数：松攻击键到允许按方向键之间的保护间隔（防游戏吞方向键），
+# 看板角色配置共享键 Attack To Move Wait Seconds 缺失/非法时的回退值，全部任务统一生效。
+DEFAULT_ATTACK_TO_MOVE_WAIT = 0.5
+
+# 目标丢失缓冲默认秒数：攻击中怪物框连续没匹配到时不松攻击键的容忍时长，消模板匹配抖帧导致的“打一下停一下”；
+# 看板角色配置共享键 Target Loss Buffer Seconds 缺失/非法时的回退值。
+DEFAULT_TARGET_LOSS_BUFFER = 0.3
+
 _original_double_spinbox_init = _double_spinbox_module.LabelAndDoubleSpinBox.__init__  # 保存框架浮点控件的原构造函数。
 
 
@@ -57,6 +65,20 @@ class MyBaseTask(BaseTask):
             self.log_warning(f"Load dashboard shared config failed: {e}. 看板共享配置读取失败，沿用任务自身配置。")  # 提示后降级。
             return  # 不覆盖任何值。
         self.config.update(shared)  # 看板为单一数据源：任务页已移除这些键，运行时全部以看板为准。
+
+    def attack_to_move_wait(self):  # 攻击后摇等待秒数：统一读看板角色配置共享键（apply_shared_config 已注入任务配置），全部任务通用；0 表示不等待，缺失/非法回退默认保护值。
+        raw = self.config.get("Attack To Move Wait Seconds")  # 取共享键原始值。
+        try:  # 容错解析：配置残留非数字时不致任务崩溃。
+            return max(0.0, float(raw))  # 0 合法（自担吞键风险），负数夹到 0。
+        except (TypeError, ValueError):  # 未配置或非数字。
+            return DEFAULT_ATTACK_TO_MOVE_WAIT  # 回退默认保护值。
+
+    def target_loss_buffer(self):  # 目标丢失缓冲秒数：统一读看板角色配置共享键 Target Loss Buffer Seconds，攻击中怪框短暂没匹配到不松攻击键；0 表示不缓冲立即松键，缺失/非法回退默认 0.3 秒。
+        raw = self.config.get("Target Loss Buffer Seconds")  # 取共享键原始值。
+        try:  # 容错解析：配置残留非数字时不致任务崩溃。
+            return max(0.0, float(raw))  # 0 合法（抖帧风险自担），负数夹到 0。
+        except (TypeError, ValueError):  # 未配置或非数字。
+            return DEFAULT_TARGET_LOSS_BUFFER  # 回退默认缓冲值。
 
 
 

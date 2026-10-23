@@ -167,7 +167,7 @@ class MapleIdleTask(MyBaseTask):  # 定义冒险岛挂机任务，继承项目�
                     facing = -facing  # 转身后朝向与原朝向相反。
                     self.sleep(0.08)  # 等待转身动画生效后再攻击。
                     self.send_key(attack_key, down_time=0.2)  # 短按一下常规攻击键攻击一次，转身后距离未知不用近战键。
-                    self.sleep(0.5)  # 攻击后等 0.5 秒再转身，等攻击后摇结束，避免归位的方向键被吞导致没有转回来。
+                    self.sleep(self.attack_to_move_wait())  # 攻击后等后摇结束再转身，避免归位的方向键被吞导致没有转回来（时长看板角色配置全局可调）。
                     back_key = MOVE_RIGHT_KEY if turn_key == MOVE_LEFT_KEY else MOVE_LEFT_KEY  # 归位键：转身键的反方向，转身后朝向已翻转，再按同一方向键会变成前行而不是转身。
                     self.send_key(back_key, down_time=0.05)  # 短按反方向键转回身归位。
                     facing = -facing  # 第二次转身后朝向恢复为转身前的原朝向。

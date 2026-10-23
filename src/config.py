@@ -138,6 +138,7 @@ config = {
         ["src.tasks.MapleIdleTask", "MapleIdleTask"],
         ["src.tasks.MaplePatrolTask", "MaplePatrolTask"],
         ["src.tasks.MapleSingleSpotTask", "MapleSingleSpotTask"],
+        ["src.tasks.MaplePlatformTask", "MaplePlatformTask"],  # 地台定点挂机：选类别为「地台」的标注，按地台百分比定点巡逻打怪
         ["src.tasks.MapleRouteTask", "MapleRouteTask"],  # 地图路线挂机：消费地图页签的全局小地图底图与彩色指令路线图
     ],
 }

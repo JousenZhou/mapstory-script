@@ -26,8 +26,10 @@ from ok import Logger, og  # 全局对象与日志器。
 from src.ui.spin_wheel_guard import DoubleSpinBox, SpinBox  # 数字框改用滚轮守卫子类：需点击聚焦后滚轮才生效，避免滚动页面误改数值。
 from ok.core.events import communicate  # 应用事件总线：订阅任务状态与配置校验事件。
 
+from src.dashboard_store import SUPER_PLATFORM, coco_fingerprint, load_annotations_by_supercategory  # 标注存取：按类别读取模板页标注与文件指纹，供地台标注下拉框动态刷新。
 from src.tasks.MapleIdleTask import MapleIdleTask  # 挂机任务类，用于按类取实例。
 from src.tasks.MaplePatrolTask import MaplePatrolTask  # 巡逻任务类，用于按类取实例。
+from src.tasks.MaplePlatformTask import MaplePlatformTask  # 地台定点挂机任务类，用于按类取实例。
 from src.tasks.MapleSingleSpotTask import MapleSingleSpotTask  # 单点挂机任务类，用于按类取实例。
 
 logger = Logger.get_logger(__name__)  # 本模块日志器。
@@ -38,6 +40,7 @@ LOG_POLL_MS = 150  # 日志轮询间隔毫秒数，兼顾实时性与开销。
 LOG_TAIL_CHUNK = 256 * 1024  # 首次加载日志尾部时最多回读的字节数。
 LOG_INITIAL_LINES = 200  # 面板打开时预加载的历史日志行数，提供上下文。
 STATUS_POLL_MS = 600  # 任务实时状态文本的轮询间隔毫秒数（info_set 不发信号，只能轮询读取）。
+ANNOTATION_POLL_MS = 3000  # 标注文件指纹轮询间隔毫秒数：标注增删改后自动刷新按类别过滤的下拉选项，无需手动点「刷新标注」。
 
 # 日志行首级别解析：与框架 LogWindow 用同一条正则，识别 DEBUG/INFO/WARNING/ERROR/CRITICAL。
 LOG_LINE_PATTERN = re.compile(
@@ -60,6 +63,9 @@ _FLOAT_SPEC = {
     "Return Offset Max Percent": (1, 0.0, 100.0, 0.5),
     "Stuck Seconds": (1, 0.0, 999.0, 0.5),
     "Resume Wait Seconds": (1, 0.0, 999.0, 0.5),
+    # —— 地台定点挂机任务（MaplePlatformTask）——
+    "Spot Percent": (1, 0.0, 100.0, 1.0),
+    "Platform Threshold": (2, 0.01, 1.0, 0.05),
 }
 
 # 整数配置项的取值范围：键 -> (下限, 上限, 步进)。范围与任务 validate_config 的校验一致，非法值根本无法输入。
@@ -67,6 +73,11 @@ _INT_SPEC = {
     "Dot Hue Min": (0, 179, 1),  # OpenCV HSV 色相范围 0-179。
     "Dot Hue Max": (0, 179, 1),
     "Dot Min Pixels": (1, 100000, 1),  # 面积至少 1 像素。
+    # —— 地台定点挂机任务（MaplePlatformTask）：巡逻区间像素偏移，非负整数，上限给足屏宽余量。——
+    "Patrol Left Pixels": (0, 4000, 5),
+    "Patrol Right Pixels": (0, 4000, 5),
+    "Band Exit Margin Pixels": (0, 4000, 5),  # 脱区触发余量：越过边界再多该像素才归位，0 合法（越界即归位）。
+    "Home Tolerance Pixels": (0, 1000, 1),  # 归位容差像素，上限给足屏宽余量。
 }
 
 # 字符串配置项的占位提示，引导用户填对格式。
@@ -99,6 +110,14 @@ _CONFIG_LABEL_ZH = {
     "Resume Wait Seconds": "恢复等待(秒)",
     # —— 单点挂机任务（MapleSingleSpotTask）——
     "Return Offset Max Percent": "碰撞偏移归位max(%)",
+    # —— 地台定点挂机任务（MaplePlatformTask）——
+    "Platform Feature": "地台标注",
+    "Spot Percent": "定点(%)",
+    "Patrol Left Pixels": "巡逻左偏移(px)",
+    "Patrol Right Pixels": "巡逻右偏移(px)",
+    "Band Exit Margin Pixels": "脱区触发余量(px)",
+    "Platform Threshold": "地台阈值",
+    "Home Tolerance Pixels": "归位容差(px)",
 }
 
 # 任务控制栏统一隐藏的底层配置键：这些变量对日常挂机没有调整价值，一律不在配置网格中渲染，
@@ -149,6 +168,9 @@ def _build_control(task, key):  # 按配置值类型为单个键创建紧凑控�
         control.setValue(float(value))  # 设初值。
         control.valueChanged.connect(lambda v, k=key: _write_config(task, k, float(v)))  # 变更即写回。
         return control
+    type_spec = (getattr(task, "config_type", None) or {}).get(key)  # 该键的 GUI 控件元数据。
+    if isinstance(type_spec, dict) and type_spec.get("category"):  # 声明了标注类别的字符串键（如地台标注）：渲染成按类别过滤的下拉框，选项随标注文件自动刷新。
+        return AnnotationComboBox(task, key, str(type_spec["category"]))  # 类别取 config_type["category"]（如「地台」）。
     control = LineEdit()  # 其余按字符串处理，用单行输入框。
     control.setText(str(value or ''))  # 设初值。
     if key in _STR_PLACEHOLDER:  # 有格式引导的键显示占位提示。
@@ -165,11 +187,59 @@ def _write_str_config(task, key, edit):  # 字符串控件写回：校验被拒�
         edit.setText(str(actual if actual is not None else ''))  # 回退输入框到真实生效值，MainWindow 已弹出校验失败提示。
 
 
+class AnnotationComboBox(ComboBox):  # 按类别过滤的标注单选下拉框（如「地台标注」）：选项来自模板页对应类别的全部标注名，标注文件变化后自动重填，占位项表示未选择（存空串）。
+
+    PLACEHOLDER = '(未选择)'  # 占位项文本，选中时写回空字符串，与看板的空选项约定一致。
+
+    def __init__(self, task, key, category, parent=None):  # 构造下拉框并绑定任务配置键与标注类别。
+        super().__init__(parent)  # 初始化下拉框。
+        self.task = task  # 绑定的任务实例。
+        self.key = key  # 配置键名。
+        self.category = category  # 标注类别（supercategory），如「地台」。
+        self._loading = False  # 刷新选项期间置位，程序化 setCurrentIndex 不触发写回。
+        self.refresh()  # 首次填充选项并回显当前配置值。
+        self.currentIndexChanged.connect(self._on_changed)  # 用户切换选项即写回配置。
+
+    def _names(self):  # 读取该类别下的全部标注分类名（排序），标注文件异常时返回空列表。
+        try:  # 读盘解析可能因文件缺失/损坏异常，不能拖垮 UI。
+            return sorted((load_annotations_by_supercategory().get(self.category) or {}).keys())  # {类别: {分类名: 信息}} 取键。
+        except Exception as e:  # 读取异常。
+            logger.warning(f"load annotations for category {self.category} failed: {e}")  # 记录供排查。
+            return []  # 空选项，只剩占位项。
+
+    def refresh(self):  # 重新填充选项：保留当前选择；历史值不在最新标注里也继续显示，避免重标注后静默丢配置。
+        current = str(self.task.config.get(self.key) or '')  # 当前配置值（标注分类名或空）。
+        names = self._names()  # 最新可选标注名。
+        if current and current not in names:  # 历史值已不在标注中：仍列为选项，用户不换选就不丢配置。
+            names = [current] + names  # 历史值排最前。
+        self._loading = True  # 进入刷新：屏蔽选中回调的写回。
+        self.blockSignals(True)  # 双保险：重建选项不触发 currentIndexChanged。
+        try:  # 保证异常时也恢复信号与状态。
+            self.clear()  # 清空重建。
+            self.addItem(self.PLACEHOLDER)  # 占位项固定第 0 位。
+            if names:  # 有可选标注时全部加入。
+                self.addItems(names)  # 分类名直接用原文。
+            index = max(0, self.findText(current)) if current else 0  # 回显当前选择，找不到时回占位项。
+            self.setCurrentIndex(index)  # 定位选中项。
+        finally:  # 退出刷新。
+            self.blockSignals(False)  # 恢复信号。
+            self._loading = False  # 复位状态。
+
+    def _on_changed(self, _index):  # 用户切换选项：写回选中的分类名，占位项写空串。
+        if self._loading:  # 程序化刷新不写回。
+            return  # 跳过。
+        text = self.currentText()  # 当前选项文本。
+        value = '' if text == self.PLACEHOLDER else text  # 占位项映射回空字符串。
+        _write_config(self.task, self.key, value)  # 写回任务配置（框架自动校验落盘）。
+        self.setToolTip(f'当前: {value or self.PLACEHOLDER}')  # 悬浮提示当前值。
+
+
 class TaskAccordionCard(ExpandSettingCard):  # 单个任务的手风琴卡片：头部含状态与启停按钮，展开体是紧凑配置网格。
 
     def __init__(self, task, parent=None):  # 构造卡片。
         super().__init__(task.icon or FluentIcon.INFO, _tr(task.name), None, parent)  # 头部：图标 + 任务名，content 留空使头部保持 50px 紧凑高度。
         self.task = task  # 绑定的任务实例。
+        self.annotation_combos = []  # 本卡内按类别过滤的标注下拉框，面板级指纹轮询统一刷新选项。
         self._last_status = None  # 上次显示的状态文本，变化时才刷新标签，避免无谓重排。
         self.viewLayout.setContentsMargins(16, 10, 16, 14)  # 展开体内边距。
         self.viewLayout.setSpacing(6)  # 展开体内控件间距。
@@ -211,6 +281,8 @@ class TaskAccordionCard(ExpandSettingCard):  # 单个任务的手风琴卡片：
                 continue
             label = BodyLabel(_CONFIG_LABEL_ZH.get(key) or _tr(key))  # 标签优先用简短中文，未收录的键回退翻译/原文。
             control = _build_control(self.task, key)  # 按类型创建绑定控件。
+            if isinstance(control, AnnotationComboBox):  # 类别标注下拉框登记，供面板级指纹轮询刷新。
+                self.annotation_combos.append(control)  # 记录实例。
             desc = (self.task.config_description or {}).get(key)  # 该键的双语帮助文本。
             if desc:  # 有帮助文本时作为悬浮提示。
                 label.setToolTip(desc)  # 标签悬浮显示完整说明。
@@ -542,14 +614,24 @@ class TaskControlPanel(QWidget):  # 看板任务控制栏容器：两张任务�
         self._status_timer.setInterval(STATUS_POLL_MS)  # 轮询间隔。
         self._status_timer.timeout.connect(self._poll_status)  # 绑定轮询。
         self._status_timer.start()  # 启动轮询。
+        self._annotation_combos = [combo for card in self.cards for combo in card.annotation_combos]  # 汇总各卡的类别标注下拉框。
+        if self._annotation_combos:  # 有下拉框才轮询标注文件，避免无谓读盘。
+            try:  # 首次取指纹可能因标注文件缺失异常，取不到则不启动轮询。
+                self._annotation_fp = coco_fingerprint()  # 记录标注文件指纹基线，变化时刷新下拉选项。
+            except Exception:  # 读取异常。
+                self._annotation_fp = None  # 无基线，轮询首次成功时补记。
+            self._annotation_timer = QTimer(self)  # 标注文件指纹轮询定时器。
+            self._annotation_timer.setInterval(ANNOTATION_POLL_MS)  # 轮询间隔。
+            self._annotation_timer.timeout.connect(self._poll_annotations)  # 绑定轮询。
+            self._annotation_timer.start()  # 启动轮询。
 
     @staticmethod
-    def _collect_tasks():  # 从执行器按类精确取出要迁移的两个任务实例，取不到的跳过。
+    def _collect_tasks():  # 从执行器按类精确取出要迁移的四个任务实例，取不到的跳过。
         executor = getattr(og, "executor", None)  # 全局执行器，构造期已由 do_init 赋值。
         if executor is None:  # 执行器不可用（异常场景）。
             return []  # 返回空，面板只剩日志。
         tasks = []  # 收集结果。
-        for cls in (MapleIdleTask, MaplePatrolTask, MapleSingleSpotTask):  # 目标三个任务类，按挂机、巡逻、单点挂机顺序。
+        for cls in (MapleIdleTask, MaplePatrolTask, MapleSingleSpotTask, MaplePlatformTask):  # 目标四个任务类，按挂机、巡逻、单点挂机、地台定点顺序。
             for candidate in executor.onetime_tasks:  # 遍历已注册的一次性任务。
                 if type(candidate) is cls:  # 精确匹配类，避免 MaplePatrolTask 因继承被 MapleIdleTask 命中。
                     tasks.append(candidate)  # 命中。
@@ -559,3 +641,14 @@ class TaskControlPanel(QWidget):  # 看板任务控制栏容器：两张任务�
     def _poll_status(self):  # 轮询刷新运行中任务的实时状态文本（info_set 不发信号，只能定时读取）。
         for card in self.cards:  # 遍历任务卡。
             card._refresh_status()  # 只刷新状态文本，变化才更新标签。
+
+    def _poll_annotations(self):  # 轮询标注文件指纹：模板页增删改「地台」等类别标注后自动刷新下拉选项，与 DashboardTab 同机制。
+        try:  # 读盘取指纹可能因文件缺失/损坏异常，下轮再试。
+            fp = coco_fingerprint()  # 当前标注文件指纹。
+        except Exception:  # 读取异常。
+            return  # 本轮跳过。
+        if fp == self._annotation_fp:  # 指纹未变，标注没有增删改。
+            return  # 不刷新，避免无谓重填下拉。
+        self._annotation_fp = fp  # 更新基线。
+        for combo in self._annotation_combos:  # 逐个刷新建了类别下拉的控件。
+            combo.refresh()  # 重建选项，保留当前选择。

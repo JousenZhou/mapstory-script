@@ -17,7 +17,7 @@ DOT_VAL_MIN = 80  # HSV 取黄色的亮度下限，过滤暗色干扰。
 DOT_MISSING_HOLD_SECONDS = 2.0  # 黄点丢失期间允许继续按住方向键的最大秒数，超时松键等黄点恢复，避免盲走越界。
 STUCK_MOVE_SECONDS = 0.5  # 卡住恢复时反向移动按住的秒数。
 STUCK_MIN_MOVE_PERCENT = 0.8  # 位置变化达到该百分比（地图区域宽度）才算“移动了”，否则累计卡住时长。
-ATTACK_TO_MOVE_WAIT = 0.5  # 攻击结束后恢复巡逻按方向键前的等待秒数，过早按键会被攻击后摇动画吞掉（沿用挂机任务验证过的时序）。
+ATTACK_TO_MOVE_WAIT = 0.5  # 攻击后摇等待默认秒数（已提升为看板角色配置共享键 Attack To Move Wait Seconds，各任务改用 MyBaseTask.attack_to_move_wait() 读取，此常量仅作历史参照）。
 FACING_CHECK_INTERVAL = 0.2  # 用朝向模板校准角色实际朝向的间隔秒数，兼顾及时修正与 CPU 开销。
 
 
@@ -291,7 +291,7 @@ class MaplePatrolTask(MapleIdleTask):  # 定义冒险岛小地图巡逻打怪任
                         if self._held_attack_key is not None:  # 先松开攻击键：攻击后摇期间方向键输入会被游戏吞掉，导致转身失败后长时间空打。
                             self.send_key_up(self._held_attack_key)  # 松开攻击键。
                             self._held_attack_key = None  # 清空按住状态，转身完成后重新按住。
-                            self.sleep(0.5)  # 等攻击后摇结束再发方向键，与转身策略验证过的防吞值一致。
+                            self.sleep(self.attack_to_move_wait())  # 等攻击后摇结束再发方向键，时长看板角色配置全局可调。
                         self.send_key(MOVE_RIGHT_KEY if want_direction == 1 else MOVE_LEFT_KEY, down_time=0.05)  # 单次短按方向键只触发转身动画，按住时间越短越不容易产生位移。
                         facing = want_direction  # 记录当前朝向，同一方向不再重复按键，避免持续位移。
                         self.sleep(0.08)  # 等待转身动作生效后再攻击。
@@ -304,7 +304,7 @@ class MaplePatrolTask(MapleIdleTask):  # 定义冒险岛小地图巡逻打怪任
                 if self._held_attack_key is not None:  # 目标消失时松开持续按住的攻击键并准备恢复巡逻。
                     self.send_key_up(self._held_attack_key)  # 松开攻击键。
                     self._held_attack_key = None  # 清空按住状态。
-                    patrol_resume_at = time.time() + ATTACK_TO_MOVE_WAIT  # 攻击后摇会吞方向键输入，短暂等待后再恢复移动。
+                    patrol_resume_at = time.time() + self.attack_to_move_wait()  # 攻击后摇会吞方向键输入，短暂等待后再恢复移动（时长看板角色配置全局可调）。
                 if time.time() < patrol_resume_at:  # 攻击刚结束的等待期内只识图不移动。
                     self.info_set("Status", "恢复巡逻中")  # 在 GUI 显示恢复巡逻等待状态。
                     self.sleep(loop_interval)  # 按固定 30FPS 节拍等待。

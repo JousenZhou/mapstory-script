@@ -233,6 +233,162 @@
       "file_name": "38.png",
       "width": 1366,
       "height": 768
+    },
+    {
+      "id": 45,
+      "file_name": "39.png",
+      "width": 1366,
+      "height": 768
+    },
+    {
+      "id": 46,
+      "file_name": "40.png",
+      "width": 1366,
+      "height": 768
+    },
+    {
+      "id": 47,
+      "file_name": "41.png",
+      "width": 1366,
+      "height": 768
+    },
+    {
+      "id": 48,
+      "file_name": "42.png",
+      "width": 1366,
+      "height": 768
+    },
+    {
+      "id": 49,
+      "file_name": "43.png",
+      "width": 1366,
+      "height": 768
+    },
+    {
+      "id": 50,
+      "file_name": "44.png",
+      "width": 1920,
+      "height": 1080
+    },
+    {
+      "id": 51,
+      "file_name": "45.png",
+      "width": 1920,
+      "height": 1080
+    },
+    {
+      "id": 52,
+      "file_name": "46.png",
+      "width": 1920,
+      "height": 1080
+    },
+    {
+      "id": 54,
+      "file_name": "48.png",
+      "width": 1366,
+      "height": 768
+    },
+    {
+      "id": 55,
+      "file_name": "47.png",
+      "width": 1366,
+      "height": 768
+    },
+    {
+      "id": 56,
+      "file_name": "49.png",
+      "width": 1366,
+      "height": 768
+    },
+    {
+      "id": 57,
+      "file_name": "50.png",
+      "width": 1366,
+      "height": 768
+    },
+    {
+      "id": 60,
+      "file_name": "53.png",
+      "width": 1366,
+      "height": 768
+    },
+    {
+      "id": 63,
+      "file_name": "56.png",
+      "width": 1366,
+      "height": 768
+    },
+    {
+      "id": 64,
+      "file_name": "57.png",
+      "width": 1366,
+      "height": 768
+    },
+    {
+      "id": 65,
+      "file_name": "58.png",
+      "width": 1366,
+      "height": 768
+    },
+    {
+      "id": 66,
+      "file_name": "59.png",
+      "width": 1366,
+      "height": 768
+    },
+    {
+      "id": 67,
+      "file_name": "60.png",
+      "width": 1366,
+      "height": 768
+    },
+    {
+      "id": 68,
+      "file_name": "61.png",
+      "width": 1366,
+      "height": 768
+    },
+    {
+      "id": 69,
+      "file_name": "62.png",
+      "width": 1920,
+      "height": 1080
+    },
+    {
+      "id": 70,
+      "file_name": "63.png",
+      "width": 1920,
+      "height": 1080
+    },
+    {
+      "id": 71,
+      "file_name": "51.png",
+      "width": 1366,
+      "height": 768
+    },
+    {
+      "id": 72,
+      "file_name": "52.png",
+      "width": 1366,
+      "height": 768
+    },
+    {
+      "id": 73,
+      "file_name": "54.png",
+      "width": 1366,
+      "height": 768
+    },
+    {
+      "id": 74,
+      "file_name": "55.png",
+      "width": 1366,
+      "height": 768
+    },
+    {
+      "id": 75,
+      "file_name": "64.png",
+      "width": 1366,
+      "height": 768
     }
   ],
   "annotations": [
@@ -1002,6 +1158,370 @@
       ],
       "area": 16587,
       "iscrowd": 0
+    },
+    {
+      "id": 60,
+      "image_id": 45,
+      "category_id": 60,
+      "bbox": [
+        926,
+        428,
+        26,
+        30
+      ],
+      "area": 780,
+      "iscrowd": 0
+    },
+    {
+      "id": 61,
+      "image_id": 47,
+      "category_id": 61,
+      "bbox": [
+        650,
+        397,
+        36,
+        32
+      ],
+      "area": 1152,
+      "iscrowd": 0
+    },
+    {
+      "id": 62,
+      "image_id": 47,
+      "category_id": 62,
+      "bbox": [
+        4,
+        52,
+        161,
+        69
+      ],
+      "area": 11109,
+      "iscrowd": 0
+    },
+    {
+      "id": 63,
+      "image_id": 48,
+      "category_id": 63,
+      "bbox": [
+        643,
+        393,
+        37,
+        35
+      ],
+      "area": 1295,
+      "iscrowd": 0
+    },
+    {
+      "id": 64,
+      "image_id": 50,
+      "category_id": 64,
+      "bbox": [
+        14,
+        74,
+        97,
+        111
+      ],
+      "area": 10767,
+      "iscrowd": 0
+    },
+    {
+      "id": 65,
+      "image_id": 51,
+      "category_id": 65,
+      "bbox": [
+        550,
+        424,
+        35,
+        53
+      ],
+      "area": 1855,
+      "iscrowd": 0
+    },
+    {
+      "id": 66,
+      "image_id": 51,
+      "category_id": 66,
+      "bbox": [
+        817,
+        287,
+        65,
+        119
+      ],
+      "area": 7735,
+      "iscrowd": 0
+    },
+    {
+      "id": 67,
+      "image_id": 52,
+      "category_id": 67,
+      "bbox": [
+        15,
+        73,
+        94,
+        113
+      ],
+      "area": 10622,
+      "iscrowd": 0
+    },
+    {
+      "id": 68,
+      "image_id": 54,
+      "category_id": 68,
+      "bbox": [
+        99,
+        251,
+        759,
+        100
+      ],
+      "area": 75900,
+      "iscrowd": 0
+    },
+    {
+      "id": 69,
+      "image_id": 55,
+      "category_id": 69,
+      "bbox": [
+        784,
+        302,
+        18,
+        34
+      ],
+      "area": 612,
+      "iscrowd": 0
+    },
+    {
+      "id": 70,
+      "image_id": 55,
+      "category_id": 70,
+      "bbox": [
+        557,
+        295,
+        34,
+        37
+      ],
+      "area": 1258,
+      "iscrowd": 0
+    },
+    {
+      "id": 71,
+      "image_id": 55,
+      "category_id": 71,
+      "bbox": [
+        637,
+        291,
+        48,
+        43
+      ],
+      "area": 2064,
+      "iscrowd": 0
+    },
+    {
+      "id": 72,
+      "image_id": 55,
+      "category_id": 73,
+      "bbox": [
+        191,
+        360,
+        34,
+        25
+      ],
+      "area": 850,
+      "iscrowd": 0
+    },
+    {
+      "id": 73,
+      "image_id": 57,
+      "category_id": 72,
+      "bbox": [
+        317,
+        409,
+        44,
+        30
+      ],
+      "area": 1320,
+      "iscrowd": 0
+    },
+    {
+      "id": 74,
+      "image_id": 72,
+      "category_id": 74,
+      "bbox": [
+        386,
+        596,
+        492,
+        112
+      ],
+      "area": 55104,
+      "iscrowd": 0
+    },
+    {
+      "id": 75,
+      "image_id": 74,
+      "category_id": 75,
+      "bbox": [
+        425,
+        318,
+        55,
+        54
+      ],
+      "area": 2970,
+      "iscrowd": 0
+    },
+    {
+      "id": 76,
+      "image_id": 60,
+      "category_id": 76,
+      "bbox": [
+        93,
+        174,
+        756,
+        93
+      ],
+      "area": 70308,
+      "iscrowd": 0
+    },
+    {
+      "id": 79,
+      "image_id": 64,
+      "category_id": 79,
+      "bbox": [
+        884,
+        383,
+        61,
+        35
+      ],
+      "area": 2135,
+      "iscrowd": 0
+    },
+    {
+      "id": 80,
+      "image_id": 63,
+      "category_id": 80,
+      "bbox": [
+        925,
+        385,
+        59,
+        33
+      ],
+      "area": 1947,
+      "iscrowd": 0
+    },
+    {
+      "id": 81,
+      "image_id": 67,
+      "category_id": 81,
+      "bbox": [
+        229,
+        320,
+        49,
+        48
+      ],
+      "area": 2352,
+      "iscrowd": 0
+    },
+    {
+      "id": 82,
+      "image_id": 67,
+      "category_id": 82,
+      "bbox": [
+        336,
+        317,
+        42,
+        54
+      ],
+      "area": 2268,
+      "iscrowd": 0
+    },
+    {
+      "id": 83,
+      "image_id": 66,
+      "category_id": 83,
+      "bbox": [
+        778,
+        416,
+        16,
+        23
+      ],
+      "area": 368,
+      "iscrowd": 0
+    },
+    {
+      "id": 84,
+      "image_id": 65,
+      "category_id": 84,
+      "bbox": [
+        690,
+        408,
+        51,
+        29
+      ],
+      "area": 1479,
+      "iscrowd": 0
+    },
+    {
+      "id": 85,
+      "image_id": 69,
+      "category_id": 85,
+      "bbox": [
+        632,
+        559,
+        752,
+        106
+      ],
+      "area": 79712,
+      "iscrowd": 0
+    },
+    {
+      "id": 86,
+      "image_id": 69,
+      "category_id": 86,
+      "bbox": [
+        1259,
+        516,
+        39,
+        45
+      ],
+      "area": 1755,
+      "iscrowd": 0
+    },
+    {
+      "id": 87,
+      "image_id": 69,
+      "category_id": 87,
+      "bbox": [
+        1305,
+        525,
+        54,
+        33
+      ],
+      "area": 1782,
+      "iscrowd": 0
+    },
+    {
+      "id": 88,
+      "image_id": 70,
+      "category_id": 88,
+      "bbox": [
+        578,
+        240,
+        767,
+        601
+      ],
+      "area": 460967,
+      "iscrowd": 0
+    },
+    {
+      "id": 89,
+      "image_id": 70,
+      "category_id": 89,
+      "bbox": [
+        861,
+        792,
+        202,
+        22
+      ],
+      "area": 4444,
+      "iscrowd": 0
     }
   ],
   "categories": [
@@ -1299,6 +1819,146 @@
       "id": 59,
       "name": "射手村东",
       "supercategory": ""
+    },
+    {
+      "id": 60,
+      "name": "黑鳄鱼",
+      "supercategory": "怪物"
+    },
+    {
+      "id": 61,
+      "name": "左",
+      "supercategory": "角色"
+    },
+    {
+      "id": 62,
+      "name": "鳄鱼潭2",
+      "supercategory": "地图"
+    },
+    {
+      "id": 63,
+      "name": "右",
+      "supercategory": "角色"
+    },
+    {
+      "id": 64,
+      "name": "森林迷宫",
+      "supercategory": ""
+    },
+    {
+      "id": 65,
+      "name": "风独眼兽",
+      "supercategory": "怪物"
+    },
+    {
+      "id": 66,
+      "name": "黑巨人",
+      "supercategory": "怪物"
+    },
+    {
+      "id": 67,
+      "name": "巨人之森1",
+      "supercategory": "地图"
+    },
+    {
+      "id": 68,
+      "name": "地台",
+      "supercategory": "地台"
+    },
+    {
+      "id": 69,
+      "name": "风独眼兽1",
+      "supercategory": "怪物"
+    },
+    {
+      "id": 70,
+      "name": "风独眼兽2",
+      "supercategory": "怪物"
+    },
+    {
+      "id": 71,
+      "name": "风独眼兽3",
+      "supercategory": "怪物"
+    },
+    {
+      "id": 72,
+      "name": "xx",
+      "supercategory": "怪物"
+    },
+    {
+      "id": 73,
+      "name": "角色测试1",
+      "supercategory": "角色"
+    },
+    {
+      "id": 74,
+      "name": "巨人",
+      "supercategory": "地台"
+    },
+    {
+      "id": 75,
+      "name": "白色石头人",
+      "supercategory": "怪物"
+    },
+    {
+      "id": 76,
+      "name": "迷宫森林2台子",
+      "supercategory": "地台"
+    },
+    {
+      "id": 79,
+      "name": "拿破仑左",
+      "supercategory": "角色"
+    },
+    {
+      "id": 80,
+      "name": "拿破仑右",
+      "supercategory": "角色"
+    },
+    {
+      "id": 81,
+      "name": "黑色石头人",
+      "supercategory": "怪物"
+    },
+    {
+      "id": 82,
+      "name": "黑色石头人2",
+      "supercategory": "怪物"
+    },
+    {
+      "id": 83,
+      "name": "魔灵",
+      "supercategory": "怪物"
+    },
+    {
+      "id": 84,
+      "name": "魔灵2",
+      "supercategory": "怪物"
+    },
+    {
+      "id": 85,
+      "name": "鳄鱼台子",
+      "supercategory": "地台"
+    },
+    {
+      "id": 86,
+      "name": "黑鳄鱼1",
+      "supercategory": "怪物"
+    },
+    {
+      "id": 87,
+      "name": "黑鳄鱼2",
+      "supercategory": "怪物"
+    },
+    {
+      "id": 88,
+      "name": "moonlight测谎窗口",
+      "supercategory": "测谎"
+    },
+    {
+      "id": 89,
+      "name": "moonlight测谎触发",
+      "supercategory": "测谎触发"
     }
   ]
 }

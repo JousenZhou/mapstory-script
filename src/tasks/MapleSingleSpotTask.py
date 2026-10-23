@@ -7,7 +7,7 @@ from qfluentwidgets import FluentIcon  # 导入 Fluent 图标，用于任务在 
 
 # 导入巡逻任务复用小地图定位、黄点检测、朝向校准、卡住脱困与攻击辅助能力；
 # 测谎监控与自动解题由独立服务 src/liedetector/service.py 值守，任务只需通过 pop_held_keys 上报持有键供服务暂停时释放。
-from src.tasks.MaplePatrolTask import MaplePatrolTask, MatchBatch, CAPTURE_MIN_INTERVAL, ATTACK_TO_MOVE_WAIT
+from src.tasks.MaplePatrolTask import MaplePatrolTask, MatchBatch, CAPTURE_MIN_INTERVAL
 
 HOME_WAIT_SECONDS = 10.0  # 启动时记录初始坐标比例的最长等待秒数，超时仍找不到黄点则任务退出。
 RETURN_DONE_RATIO = 0.5  # 归位滞回系数：偏移回落到最大值的一半以内才算归位完成，避免在阈值边界上反复走停抖动。
@@ -226,7 +226,7 @@ class MapleSingleSpotTask(MaplePatrolTask):  # 定义冒险岛单点挂机任务
                         if self._held_attack_key is not None:  # 先松开攻击键：攻击后摇期间方向键输入会被游戏吞掉，导致转身失败后长时间空打。
                             self.send_key_up(self._held_attack_key)  # 松开攻击键。
                             self._held_attack_key = None  # 清空按住状态，转身完成后重新按住。
-                            self.sleep(0.5)  # 等攻击后摇结束再发方向键，与巡逻任务验证过的防吞值一致。
+                            self.sleep(self.attack_to_move_wait())  # 等攻击后摇结束再发方向键，时长看板角色配置全局可调。
                         self.send_key("right" if want_direction == 1 else "left", down_time=0.05)  # 单次短按方向键只触发转身动画，按住时间越短越不容易产生位移。
                         facing = want_direction  # 记录当前朝向，同一方向不再重复按键，避免持续位移。
                         self.sleep(0.08)  # 等待转身动作生效后再攻击。
@@ -261,7 +261,7 @@ class MapleSingleSpotTask(MaplePatrolTask):  # 定义冒险岛单点挂机任务
                             self.recover_stuck(self._held_move_key, walk_direction, resume_wait)  # 反向短移脱困，脱困后本帧松键，下一帧按最新偏移继续归位。
                             self._held_move_key = None  # 恢复过程已松键。
                             anchor_x, anchor_time = None, time.time()  # 脱困后重置卡住锚点。
-                        if time.time() < self._attack_released_at + ATTACK_TO_MOVE_WAIT:  # 攻击刚结束的等待期内只识图不移动，方向键会被攻击后摇吞掉。
+                        if time.time() < self._attack_released_at + self.attack_to_move_wait():  # 攻击刚结束的等待期内只识图不移动，方向键会被攻击后摇吞掉（时长看板角色配置全局可调）。
                             self.info_set("Status", "归位等待")  # 在 GUI 显示归位等待状态。
                             self.sleep(loop_interval)  # 按固定 30FPS 节拍等待。
                             continue  # 等待期结束后自动恢复走动。

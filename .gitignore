@@ -73,3 +73,4 @@ pip-delete-this-directory.txt
 build_exe.log
 autohelper
 working_images/
+cache/diag_*/

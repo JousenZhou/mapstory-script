@@ -389,6 +389,12 @@
       "file_name": "67.png",
       "width": 1366,
       "height": 768
+    },
+    {
+      "id": 79,
+      "file_name": "29.png",
+      "width": 1366,
+      "height": 768
     }
   ],
   "annotations": [
@@ -975,6 +981,19 @@
         51
       ],
       "area": 2499,
+      "iscrowd": 0
+    },
+    {
+      "id": 46,
+      "image_id": 79,
+      "category_id": 46,
+      "bbox": [
+        142,
+        569,
+        1086,
+        86
+      ],
+      "area": 93396,
       "iscrowd": 0
     },
     {
@@ -1736,6 +1755,11 @@
       "id": 45,
       "name": "猴子1",
       "supercategory": "怪物"
+    },
+    {
+      "id": 46,
+      "name": "地台最下面",
+      "supercategory": "地台"
     },
     {
       "id": 48,

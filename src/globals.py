@@ -6,7 +6,8 @@ from PySide6.QtCore import QObject
 
 from ok import Logger
 
-from src.liedetector.service import LieDetectorService  # 导入独立测谎监控服务，由 Globals 持有并随 app 启动。
+from src.autologin.monitor import DisconnectMonitor  # 掉线重登独立监控，与测谎服务分离。
+from src.liedetector.service import LieDetectorService  # 独立测谎监控服务，由 Globals 持有并随 app 启动。
 
 logger = Logger.get_logger(__name__)
 
@@ -25,6 +26,9 @@ class Globals(QObject):
         # Globals(og.my_app) 在 og.executor/og.device_manager 之后创建，此处启动后台守护线程可安全引用二者。
         self.lie_service = LieDetectorService(exit_event)  # 创建服务，与 app 共用退出事件。
         self.lie_service.start()  # 启动后台守护线程，随进程退出。
+        # 掉线重登独立监控：与测谎服务职责分离，各自按看板开关值守。
+        self.disconnect_monitor = DisconnectMonitor(exit_event)
+        self.disconnect_monitor.start()
 
     def update_vision(self, frame):  # 任务线程写入最新一帧带标注画面，供 UI 实时展示。
         with self._vision_lock:  # 加锁避免 UI 线程读到写一半的数据。

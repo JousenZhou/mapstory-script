@@ -1381,6 +1381,19 @@
       "iscrowd": 0
     },
     {
+      "id": 77,
+      "image_id": 75,
+      "category_id": 77,
+      "bbox": [
+        304,
+        222,
+        801,
+        137
+      ],
+      "area": 109737,
+      "iscrowd": 0
+    },
+    {
       "id": 79,
       "image_id": 64,
       "category_id": 79,
@@ -1903,6 +1916,11 @@
     {
       "id": 76,
       "name": "迷宫森林2台子",
+      "supercategory": "地台"
+    },
+    {
+      "id": 77,
+      "name": "迷宫测试",
       "supercategory": "地台"
     },
     {

@@ -175,12 +175,6 @@
       "height": 768
     },
     {
-      "id": 35,
-      "file_name": "29.png",
-      "width": 1366,
-      "height": 768
-    },
-    {
       "id": 36,
       "file_name": "30.png",
       "width": 1368,
@@ -189,12 +183,6 @@
     {
       "id": 37,
       "file_name": "31.png",
-      "width": 1366,
-      "height": 768
-    },
-    {
-      "id": 38,
-      "file_name": "32.png",
       "width": 1366,
       "height": 768
     },
@@ -387,6 +375,18 @@
     {
       "id": 75,
       "file_name": "64.png",
+      "width": 1366,
+      "height": 768
+    },
+    {
+      "id": 76,
+      "file_name": "65.png",
+      "width": 1366,
+      "height": 768
+    },
+    {
+      "id": 78,
+      "file_name": "67.png",
       "width": 1366,
       "height": 768
     }
@@ -758,15 +758,15 @@
     },
     {
       "id": 29,
-      "image_id": 35,
+      "image_id": 76,
       "category_id": 29,
       "bbox": [
-        705,
-        569,
-        43,
-        51
+        548,
+        413,
+        41,
+        52
       ],
-      "area": 2193,
+      "area": 2132,
       "iscrowd": 0
     },
     {
@@ -966,41 +966,15 @@
     },
     {
       "id": 45,
-      "image_id": 38,
+      "image_id": 78,
       "category_id": 45,
       "bbox": [
-        18,
-        74,
-        88,
-        129
+        520,
+        409,
+        49,
+        51
       ],
-      "area": 11352,
-      "iscrowd": 0
-    },
-    {
-      "id": 46,
-      "image_id": 38,
-      "category_id": 46,
-      "bbox": [
-        644,
-        534,
-        46,
-        26
-      ],
-      "area": 1196,
-      "iscrowd": 0
-    },
-    {
-      "id": 47,
-      "image_id": 38,
-      "category_id": 47,
-      "bbox": [
-        563,
-        194,
-        53,
-        22
-      ],
-      "area": 1166,
+      "area": 2499,
       "iscrowd": 0
     },
     {
@@ -1760,17 +1734,7 @@
     },
     {
       "id": 45,
-      "name": "树林底",
-      "supercategory": ""
-    },
-    {
-      "id": 46,
       "name": "猴子1",
-      "supercategory": "怪物"
-    },
-    {
-      "id": 47,
-      "name": "蘑菇",
       "supercategory": "怪物"
     },
     {

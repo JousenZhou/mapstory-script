@@ -51,6 +51,7 @@ class LieSolver:
         self._host = host  # 框架胶水（由 LieDetectorService 实现）。
         self._exit_event = exit_event  # 进程退出事件。
         self._abort_event = abort_event  # 用户急停事件。
+        self._follow_moves = 0  # 本局已发出的鼠标移动次数（诊断用）。
 
     # ------------------------------------------------------------------ 主入口
 
@@ -76,6 +77,8 @@ class LieSolver:
         outcome = "timeout"  # 兜底退出原因。
         solve_start = time.perf_counter()
         last_vision_time = 0.0
+        last_diag_time = 0.0  # 上次每秒诊断日志时刻。
+        self._follow_moves = 0  # 本局已发出的鼠标移动次数（诊断用）。
         pump, pump_release = self._start_pump()
         try:
             while not self._exit_event.is_set():
@@ -116,7 +119,13 @@ class LieSolver:
                 if result.follow_bbox is not None:  # 鼠标直跟呈现框中心（3 帧中值平滑已在管线内做）。
                     x1, y1, x2, y2 = result.follow_bbox
                     self._host.move_mouse(region[0] + (x1 + x2) / 2.0, region[1] + (y1 + y2) / 2.0)
+                    self._follow_moves += 1  # 实测鼠标链路观测：本局已发 move 次数（为 0=视觉没锁定，>0 但光标不动=交互后端问题）。
                 now = time.perf_counter()
+                if now - last_diag_time >= 1.0:  # 每秒一条解题诊断：无此日志实战局是黑盒，无法区分视觉/鼠标问题。
+                    last_diag_time = now
+                    logger.info(f"Lie solve diag: frame={frame_idx} state={result.state} target={result.target_id} "
+                                f"dets={result.detect_count} follow_moves={self._follow_moves} "
+                                f"elapsed={now - solve_start:.1f}s. 解题诊断：帧号/状态机/目标/检测数/已发鼠标移动次数。")
                 if now - last_vision_time >= VISION_PUSH_INTERVAL:
                     last_vision_time = now
                     self._host.push_vision(self._draw(frame, region, result, found))
@@ -135,6 +144,8 @@ class LieSolver:
                     pump_release()
                 except Exception:
                     pass
+        logger.info(f"Lie solve exit: outcome={outcome} frames={frame_idx} follow_moves={self._follow_moves} "
+                    f"elapsed={time.perf_counter() - solve_start:.1f}s. 解题结束：结果/处理帧数/鼠标移动次数/耗时。")
         return outcome
 
     # ------------------------------------------------------------------ 结算

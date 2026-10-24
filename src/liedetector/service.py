@@ -185,9 +185,10 @@ class LieDetectorService:
         _auto, _trig, _reg, _thr, alarm_sound = self._read_config()
         self._play_alarm(alarm_sound)  # 报警先于一切，让用户第一时间知道触发。
         paused_task = pause_current_task(owner="lie detector")
+        cursor_restore = self._save_cursor_position()  # 前台档：解题会接管真实光标，先存位置结束后还原。
         detector = self._detector_for_solve()
         if detector is None:
-            self._finish_round(paused_task, "abandoned")
+            self._finish_round(paused_task, "abandoned", cursor_restore)
             return
         region_box = self.get_region(frame, region_name)
         crop = (region_box.x, region_box.y, region_box.width, region_box.height) if region_box is not None else None
@@ -200,16 +201,38 @@ class LieDetectorService:
             outcome = "timeout"
         finally:
             self._stop_recorder(outcome)
-        self._finish_round(paused_task, outcome)
+        self._finish_round(paused_task, outcome, cursor_restore)
 
-    def _finish_round(self, paused_task, outcome):
-        """一局收尾：恢复任务、开冷却、回空闲态。"""
+    def _finish_round(self, paused_task, outcome, cursor_restore=None):
+        """一局收尾：恢复任务、还原光标、开冷却、回空闲态。"""
         resume_task(paused_task, owner="lie detector")
+        self._restore_cursor_position(cursor_restore)
         self.state = STATE_IDLE
         self._set_status("watching")
         self._cooldown_until = time.time() + SOLVE_COOLDOWN
         self._idle_sleep(POST_SOLVE_SLEEP)
         logger.info(f"Lie round finished, outcome={outcome}, cooldown {SOLVE_COOLDOWN}s. 一局测谎结束，冷却后继续值守。")
+
+    def _save_cursor_position(self):
+        """前台鼠标档：记录真实光标位置（解题期间跟随目标会挪动它，结束后还原）。"""
+        if self.is_background_mouse() or self._interaction() is None:
+            return None
+        try:
+            import win32gui
+            return win32gui.GetCursorPos()
+        except Exception:
+            return None
+
+    @staticmethod
+    def _restore_cursor_position(pos):
+        """还原真实光标到解题前位置；用户解题中途主动动过鼠标则还原仍是合理默认。"""
+        if not pos:
+            return
+        try:
+            import win32api
+            win32api.SetCursorPos((int(pos[0]), int(pos[1])))
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------ 录像协调
 

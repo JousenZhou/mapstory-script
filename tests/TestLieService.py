@@ -57,6 +57,7 @@ def test_handle_trigger_orchestration_order(monkeypatch, tmp_path):
     monkeypatch.setattr(service_mod, "LieSolver", FakeSolver)
     monkeypatch.setattr(service_mod, "POST_SOLVE_SLEEP", 0)
     monkeypatch.setattr(service_mod, "SOLVE_COOLDOWN", 0)
+    monkeypatch.setattr(svc, "_save_cursor_position", lambda: None)  # 测试不动真实光标。
     frame = SimpleNamespace(shape=(480, 640))
     svc._handle_trigger(frame, SimpleNamespace(), "测谎触发", "测谎坐标框", 0.75)
     order = [c[0] for c in calls]
@@ -76,6 +77,7 @@ def test_handle_trigger_abandoned_when_no_detector(monkeypatch):
     monkeypatch.setattr(service_mod, "resume_task", lambda task, owner=None: calls.append("resume"))
     monkeypatch.setattr(svc, "_detector_for_solve", lambda: None)  # 后端不可用。
     monkeypatch.setattr(service_mod, "POST_SOLVE_SLEEP", 0)
+    monkeypatch.setattr(svc, "_save_cursor_position", lambda: None)
     svc._handle_trigger(SimpleNamespace(shape=(480, 640)), None, "t", "r", 0.75)
     assert calls == ["resume"]  # 不解题但仍恢复任务。
     assert svc._recorder is None  # 未起录。
@@ -123,6 +125,7 @@ def test_new_round_clears_stale_abort_flag(monkeypatch):
             return "success"
 
     monkeypatch.setattr(service_mod, "LieSolver", ProbeSolver)
+    monkeypatch.setattr(svc, "_save_cursor_position", lambda: None)
     svc._handle_trigger(SimpleNamespace(shape=(480, 640)), None, "t", "r", 0.75)
     assert seen["armed_at_ctor"] is False  # 新局开始时急停标志已被清除。
     assert seen["armed_at_run"] is False  # 解题全程标志保持清除。

@@ -94,6 +94,40 @@ def test_abort_writes_config_off_and_notice(monkeypatch, tmp_path):
     svc._trigger_abort()  # 幂等：重复急停不再触发。
 
 
+def test_new_round_clears_stale_abort_flag(monkeypatch):
+    """回归：一次急停后用户重开自动解测谎，新局必须清掉残留的急停标志。
+
+    症状：09:06 实战每局 30ms 内 aborted、报警每 2.5s 重响、录像只有 1~3 帧。
+    """
+    svc = _service()
+    monkeypatch.setattr(svc, "_read_config", lambda: (True, "t", "r", 0.75, ""))
+    monkeypatch.setattr(svc, "_play_alarm", lambda p: False)
+    monkeypatch.setattr(service_mod, "pause_current_task", lambda owner=None: None)
+    monkeypatch.setattr(service_mod, "resume_task", lambda task, owner=None: None)
+    monkeypatch.setattr(svc, "_detector_for_solve",
+                        lambda: SimpleNamespace(backend_label="CPU", conf=0.3))
+    monkeypatch.setattr(svc, "get_region", lambda frame, name: None)
+    monkeypatch.setattr(svc, "_start_recorder", lambda shape, crop, det: None)
+    monkeypatch.setattr(svc, "_stop_recorder", lambda outcome: None)
+    monkeypatch.setattr(service_mod, "POST_SOLVE_SLEEP", 0)
+    svc._abort_event.set()  # 上一局急停残留。
+
+    seen = {}
+
+    class ProbeSolver:
+        def __init__(self, host, exit_event, abort_event):
+            seen["armed_at_ctor"] = abort_event.is_set()
+
+        def run(self, detector, frame, trig, region, threshold):
+            seen["armed_at_run"] = self is not None and svc._abort_event.is_set()
+            return "success"
+
+    monkeypatch.setattr(service_mod, "LieSolver", ProbeSolver)
+    svc._handle_trigger(SimpleNamespace(shape=(480, 640)), None, "t", "r", 0.75)
+    assert seen["armed_at_ctor"] is False  # 新局开始时急停标志已被清除。
+    assert seen["armed_at_run"] is False  # 解题全程标志保持清除。
+
+
 def test_backend_desc_states(monkeypatch):
     svc = _service()
     assert "装配中" in svc.backend_desc()  # 未装配。

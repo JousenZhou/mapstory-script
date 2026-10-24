@@ -177,6 +177,9 @@ class LieDetectorService:
 
     def _handle_trigger(self, frame, trigger_box, trigger_name, region_name, threshold):
         """处理一局：报警 → 暂停任务 → 起录 → 解题+结算 → 停录 → 恢复任务 → 冷却。"""
+        # 每局开始复位急停标志：急停只作用于"当局"（用户重新打开自动解测谎后的新局必须干净启动），
+        # 否则一次急停后所有后续局都会秒退成 aborted，表现为报警循环重响 + 一堆空录像。
+        self._abort_event.clear()
         self.state = STATE_SOLVING
         self._set_status("solving")
         _auto, _trig, _reg, _thr, alarm_sound = self._read_config()

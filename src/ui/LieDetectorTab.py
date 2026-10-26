@@ -26,7 +26,7 @@ from src.liedetector.recorder import LIE_OUTCOME_LABELS, LIE_RECORD_DIR, delete_
 from src.liedetector.vision import config as vision_config
 from src.liedetector.vision.frame_rate_controller import FrameRateController, SourceClock
 from src.liedetector.vision.overlay_renderer import render
-from src.liedetector.vision.pipeline import Pipeline
+from src.liedetector.vision.flow_session import create_session
 from src.liedetector.vision.video_source import VideoFileSource, analyze_video
 
 
@@ -78,11 +78,11 @@ class DetectThread(QThread):
                 self.status.emit("首次使用 GPU：正在构建 TensorRT INT8 引擎（约 1-5 分钟，之后直接加载缓存）…")
             detector = Detector(device=self.device, conf=self.conf, calib_video=self.path)
             self.detector = detector
-            pipeline = Pipeline(detector, fps)
+            session = create_session(detector, fps)  # FLOW_PRIMARY 时走光流主会话。
             # 分析总是从倒计时开始：seek 进入等于新会话，状态机时钟锚定到该帧。
             if self.start_frame:
                 source.seek(self.start_frame)
-            pipeline.sm.start(source.frame_idx)
+            session.start(source.frame_idx)
             controller = FrameRateController(fps)
             clock = None
 
@@ -128,7 +128,7 @@ class DetectThread(QThread):
                 if not ret:
                     break
 
-                res = pipeline.process(frame, source.frame_idx)
+                res = session.process(frame, source.frame_idx)
                 out = render(frame, res.tracks, res.target_id, res.state,
                              show_boxes=self.show_boxes, show_trails=self.show_trails)
                 target = next((t for t in res.tracks if t.track_id == res.target_id), None)

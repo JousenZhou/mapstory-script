@@ -166,25 +166,6 @@ COUNTDOWN_FRAGMENT_MIN_AREA_RATIO = 2.0
 RECOVERY_LATE_FRAMES = 30
 RECOVERY_LATE_MIN_RATIO = 0.70
 
-# === Flow-primary session (host addition, not in D:\lie) ===
-# 身份由倒计时白目标锁定后交给 LK 光流像素携带；YOLO 降级为校验（杀漂移/查滑移）与
-# 丢失重获（try_recover 四路证据 + 光流末位锚）。FLOW_PRIMARY=False 时 solver 走原
-# Pipeline 路径，行为与 d:\lie 完全一致。
-FLOW_PRIMARY = True
-FLOW_MAX_POINTS = 40        # 锁定框内 goodFeaturesToTrack 特征点上限
-FLOW_MIN_POINTS = 8         # 一帧追踪后存活点低于此数判死亡
-FLOW_FB_THRESHOLD = 1.5     # 前向-后向往返误差(px)超过即剔除该点
-FLOW_MOTION_GATE_SIGMA = 2.0  # 点位移偏离中位数超过 sigma*MAD 剔除（抗穿越拉扯）
-FLOW_MIN_NCC = 0.5          # 帧间 NCC（上一帧 patch vs 当前 patch）低于此判死亡
-FLOW_SEED_NCC_FLOOR = 0.25  # 种子 NCC 粗筛下限：半透明轮廓换地形天然衰减，只拦 gross 变化
-FLOW_VERIFY_INTERVAL = 5    # 每 N 帧 YOLO 全帧校验一次（吸附杀漂移）
-FLOW_VERIFY_IOU = 0.5       # 校验检测框与光流框 IoU>=此值即吸附
-FLOW_VERIFY_MISS = 2        # 连续 N 次校验无匹配判滑移，进入重获
-FLOW_SMOOTH_FRAMES = 3      # follow bbox 中值平滑窗（与 FOLLOW_SMOOTH_FRAMES 同口径）
-FLOW_HANDOFF_STABLE = 3     # phase-1 交接：TRACKING 且 follow_bbox 连续 N 帧
-FLOW_CARRIER_MAX_FRAMES = 90  # 光流载波寿命上限（校验吸附会重置），防漂移发散
-FLOW_COAST_ON_LOST = 10     # 重获期沿光流惯性外推 follow 的最大帧数
-
 # === Visualization ===
 TARGET_COLOR = (0, 255, 0)
 DISTRACTOR_COLOR = (100, 100, 100)

@@ -20,7 +20,7 @@ from ok import Logger
 
 from src.liedetector.capture import FramePump
 from src.liedetector.vision.overlay_renderer import render
-from src.liedetector.vision.flow_session import create_session
+from src.liedetector.vision.pipeline import Pipeline
 from src.liedetector.vision.state_machine import GameState
 
 logger = Logger.get_logger(__name__)
@@ -68,7 +68,8 @@ class LieSolver:
         """跟踪阶段：鼠标直跟 follow_bbox 直到触发标注消失/状态机结束/急停/兜底超时。"""
         if not self._host.is_background_mouse():
             self._host.ensure_in_front()  # 前台档：鼠标跟随依赖前台窗口接收真实鼠标事件。
-        session = create_session(detector, SOLVE_FPS)  # 新会话：FLOW_PRIMARY=True 走光流主会话，否则原 Pipeline（工厂内部已 start）。
+        pipeline = Pipeline(detector, SOLVE_FPS)  # 新会话：构造时自动复位 OC-SORT 轨迹簿。
+        pipeline.sm.start(0)  # 进入 COUNTDOWN，状态机内部锚定倒计时。
         frame_idx = 0  # 已喂入管线的帧计数。
         region = None  # 当前有效区域 (x, y, w, h)。
         frame = first_frame
@@ -107,12 +108,13 @@ class LieSolver:
                 new_region = (region_box.x, region_box.y, region_box.width, region_box.height)
                 if region is None or self._region_reset(region, new_region):
                     if region is not None:  # 区域位移/缩放：重建会话（防上一局轨迹串扰）。
-                        session = create_session(detector, SOLVE_FPS)
+                        pipeline = Pipeline(detector, SOLVE_FPS)
+                        pipeline.sm.start(0)
                         frame_idx = 0
                         logger.info("Lie region shifted, rebuild pipeline session. 区域位移，重建解题会话。")
                     region = new_region
                 crop = frame[region[1]:region[1] + region[3], region[0]:region[0] + region[2]]
-                result = session.process(crop, frame_idx)
+                result = pipeline.process(crop, frame_idx)
                 frame_idx += 1
                 if result.follow_bbox is not None:  # 鼠标直跟呈现框中心（3 帧中值平滑已在管线内做）。
                     x1, y1, x2, y2 = result.follow_bbox

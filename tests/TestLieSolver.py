@@ -17,8 +17,8 @@ REGION = (10, 20, 300, 200)
 FRAME = np.zeros((480, 860, 3), np.uint8)
 
 
-class FakeSession:
-    """脚本化会话：按帧序返回 follow_bbox / state；记录构造次数验证区域重置。"""
+class FakePipeline:
+    """脚本化管线：按帧序返回 follow_bbox / state；记录构造次数验证区域重置。"""
 
     built = 0
     script = []  # [(follow_bbox, state), ...] 全局脚本，每个用例重置。
@@ -27,6 +27,7 @@ class FakeSession:
         self.idx = 0
         self.calls = 0
         type(self).built += 1
+        self.sm = SimpleNamespace(start=lambda idx: None)
 
     def process(self, crop, frame_idx):
         i = min(self.idx, len(type(self).script) - 1)
@@ -90,9 +91,9 @@ def _solver(host):
 
 
 def _run_solve(monkeypatch, script, host=None):
-    FakeSession.built = 0
-    FakeSession.script = script
-    monkeypatch.setattr(solver_mod, "create_session", lambda detector, fps: FakeSession(detector, fps))
+    FakePipeline.built = 0
+    FakePipeline.script = script
+    monkeypatch.setattr(solver_mod, "Pipeline", FakePipeline)
     monkeypatch.setattr(solver_mod, "VISION_PUSH_INTERVAL", 0)  # 每帧都推送，便于断言。
     host = host or FakeHost()
     solver = _solver(host)
@@ -121,24 +122,24 @@ def test_trigger_lost_returns_gone(monkeypatch):
     assert outcome == "gone"
 
 
-def test_region_shift_rebuilds_session(monkeypatch):
+def test_region_shift_rebuilds_pipeline(monkeypatch):
     # 区域中途位移超阈值 → 重建管线会话。
-    FakeSession.built = 0
-    FakeSession.script = [((10, 10, 50, 50), "TRACKING")] * 6 + [(None, "GAME_OVER")]
-    monkeypatch.setattr(solver_mod, "create_session", lambda detector, fps: FakeSession(detector, fps))
+    FakePipeline.built = 0
+    FakePipeline.script = [((10, 10, 50, 50), "TRACKING")] * 6 + [(None, "GAME_OVER")]
+    monkeypatch.setattr(solver_mod, "Pipeline", FakePipeline)
     host = FakeHost(region=REGION)
     solver = _solver(host)
     solver.solve(SimpleNamespace(), FRAME, "测谎触发", "测谎坐标框", 0.75)
-    assert FakeSession.built == 1
+    assert FakePipeline.built == 1
     host.region = (REGION[0] + 100, REGION[1], REGION[2], REGION[3])  # 位移超 4px。
     solver.solve(SimpleNamespace(), FRAME, "测谎触发", "测谎坐标框", 0.75)
-    assert FakeSession.built == 2  # 新会话重建了管线。
+    assert FakePipeline.built == 2  # 新会话重建了管线。
 
 
 def test_abort_event_stops_solve(monkeypatch):
-    FakeSession.built = 0
-    FakeSession.script = [((10, 10, 50, 50), "TRACKING")] * 100
-    monkeypatch.setattr(solver_mod, "create_session", lambda detector, fps: FakeSession(detector, fps))
+    FakePipeline.built = 0
+    FakePipeline.script = [((10, 10, 50, 50), "TRACKING")] * 100
+    monkeypatch.setattr(solver_mod, "Pipeline", FakePipeline)
     abort = threading.Event()
     abort.set()
     solver = LieSolver(FakeHost(), threading.Event(), abort)
@@ -174,9 +175,9 @@ def test_settle_aborted(monkeypatch):
 
 def test_run_routes_normal_outcomes_to_settle(monkeypatch):
     # run() 对 gone/solved 先结算再返回最终结果。
-    FakeSession.built = 0
-    FakeSession.script = [(None, "GAME_OVER")]
-    monkeypatch.setattr(solver_mod, "create_session", lambda detector, fps: FakeSession(detector, fps))
+    FakePipeline.built = 0
+    FakePipeline.script = [(None, "GAME_OVER")]
+    monkeypatch.setattr(solver_mod, "Pipeline", FakePipeline)
     host = FakeHost(success_script=[SimpleNamespace(x=1, y=1, width=4, height=4)],
                     ok_script=[SimpleNamespace(x=1, y=1, width=4, height=4), None])
     solver = _solver(host)

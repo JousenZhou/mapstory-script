@@ -120,10 +120,11 @@ _CONFIG_LABEL_ZH = {
     "Home Tolerance Pixels": "归位容差(px)",
 }
 
-# 任务控制栏统一隐藏的底层配置键：这些变量对日常挂机没有调整价值，一律不在配置网格中渲染，
-# 运行时沿用任务 default_config 的默认值（灰度匹配、帧间隔、地图区域与黄点取色/面积阈值）。
+# 任务控制栏统一隐藏的底层配置键：这些变量对日常挂机没有调整价值，一律不在配置网格中渲染。
+# 其中灰度匹配已上移到看板【怪物配置】卡片（src/dashboard_store.py 的 Use Gray Scale），
+# 运行时经 apply_shared_config 覆盖进任务配置；其余沿用任务 default_config 默认值。
 _HIDDEN_KEYS = frozenset({
-    "Use Gray Scale",  # 灰度匹配。
+    "Use Gray Scale",  # 灰度匹配：编辑入口在看板怪物配置卡片，任务页不再展示。
     "Frame Interval",  # 帧间隔(秒)。
     "Map Rect",  # 地图区域(%)。
     "Dot Hue Min",  # 黄点色相下限。

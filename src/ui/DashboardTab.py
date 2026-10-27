@@ -5,7 +5,7 @@
 #   2. 任务控制栏：原【任务】页的挂机/巡逻两个脚本迁移至此，手风琴卡片 + 紧凑配置网格 + 内嵌运行日志；
 #   3. 测谎栏：区域/触发两个按类别过滤的标注选择、裁剪预览、匹配阈值、报警音频与总开关；
 #   4. 角色栏：角色特征/阈值、朝向模板、攻击键、近战键与距离、攻击范围、Del 间隔；
-#   5. 怪物栏：怪物特征、阈值与镜像阈值。
+#   5. 怪物栏：怪物特征、阈值、镜像阈值与灰度匹配开关。
 # 保存写入 configs/Dashboard.json，任务启动时由 MyBaseTask.apply_shared_config() 采集（单一数据源）。
 # 无需手动点「保存」：任一配置控件变动即防抖自动落盘并通知测谎服务热更新；也无需点「刷新标注」：
 # 定时轮询按文件指纹侦测标注增删改（自动刷新下拉）与服务端写回配置（自动回填 UI），做到 UI 与服务端实时一致。
@@ -32,6 +32,9 @@ CAPTURE_INTERVAL_MS = round(1000 / CAPTURE_FPS)  # 帧间隔毫秒数（33ms）�
 VISION_MAX_AGE = 5.0  # 带标注画面的最长可用秒数：任务循环偶尔超过 1 秒时继续沿用上一帧标注画面，而不是立即闪回原始截图，消除两种画面交替闪烁。
 PLACEHOLDER = '(未选择)'  # 下拉框空选项占位文本，保存时映射回空字符串。
 SAVE_DEBOUNCE_MS = 300  # 控件变动后防抖多少毫秒再落盘：合并连续调参/逐字输入为一次保存，避免每敲一键就写盘。
+
+ATTACK_MODE_LABELS = {'normal': '站立攻击', 'move_attack': '边攻击边位移', 'move_jump': '位移跳跃攻击'}  # 攻击模式配置存取值→界面显示名：站立攻击=松开方向键停下打、归位途中不攻击（本次改动前最原始的攻击策略，初始默认）；边攻击边位移=攻击时按住朝目标方向键走打不跳；位移跳跃攻击=走打并周期跳跃。
+ATTACK_MODE_VALUES = {label: value for value, label in ATTACK_MODE_LABELS.items()}  # 显示名→存取值反查，保存时映射回稳定 id。
 
 
 def to_pixmap(frame):  # 把 OpenCV 的 BGR 画面矩阵转换成 Qt 图片，传入的画面应已缩放到目标显示尺寸。
@@ -253,6 +256,15 @@ class DashboardTab(CustomTab):  # 定义看板页签：视图区 + 测谎栏 + �
         self.target_loss_spin.setRange(0.0, 5.0)
         self.target_loss_spin.setDecimals(2)
         self.target_loss_spin.setSingleStep(0.05)
+        self.attack_mode_combo = ComboBox()  # 攻击模式：站立攻击=停下站着打（原始默认）；边攻击边位移=走打不跳；位移跳跃攻击=走打+周期跳跃，缓解被怪碰撞顶出台子。
+        for mode_label in ATTACK_MODE_LABELS.values():  # 按映射顺序填入两个模式选项。
+            self.attack_mode_combo.addItem(mode_label)
+        self.jump_key_edit = LineEdit()  # 跳跃按键：位移跳跃攻击模式按它周期跳跃。
+        self.jump_key_edit.setPlaceholderText("如 space")
+        self.jump_interval_spin = DoubleSpinBox()  # 攻击中跳跃间隔（秒），0 不跳。
+        self.jump_interval_spin.setRange(0.0, 10.0)
+        self.jump_interval_spin.setDecimals(2)
+        self.jump_interval_spin.setSingleStep(0.05)
         char_grid.addWidget(BodyLabel("角色特征"), 0, 0)
         char_grid.addWidget(self.char_feature_combo, 0, 1)
         char_grid.addWidget(BodyLabel("匹配阈值"), 0, 2)
@@ -289,6 +301,12 @@ class DashboardTab(CustomTab):  # 定义看板页签：视图区 + 测谎栏 + �
         char_grid.addWidget(self.attack_wait_spin, 5, 1)
         char_grid.addWidget(BodyLabel("目标丢失缓冲(秒)"), 5, 2)  # 攻击中怪框短暂丢帧不松攻击键的容忍时长，全部任务经共享键采集。
         char_grid.addWidget(self.target_loss_spin, 5, 3)
+        char_grid.addWidget(BodyLabel("攻击模式"), 6, 0)
+        char_grid.addWidget(self.attack_mode_combo, 6, 1)
+        char_grid.addWidget(BodyLabel("跳跃键"), 6, 2)
+        char_grid.addWidget(self.jump_key_edit, 6, 3)
+        char_grid.addWidget(BodyLabel("跳跃间隔(秒)"), 7, 0)
+        char_grid.addWidget(self.jump_interval_spin, 7, 1)
         self.add_card("角色配置", char_widget)
 
         # —— 第 5 栏：怪物栏 ——
@@ -302,9 +320,11 @@ class DashboardTab(CustomTab):  # 定义看板页签：视图区 + 测谎栏 + �
         self.monster_mirror_spin = DoubleSpinBox()  # 怪物镜像匹配阈值。
         self.monster_mirror_spin.setRange(0.01, 1.0)
         self.monster_mirror_spin.setSingleStep(0.05)
+        self.monster_gray_switch = SwitchButton()  # 灰度匹配开关：仅对怪物匹配生效（角色等固定灰度），误匹配偏多时可关掉改彩色。
         monster_form.addRow("怪物特征(多选)", self.monster_multi)
         monster_form.addRow("匹配阈值", self.monster_threshold_spin)
         monster_form.addRow("镜像阈值", self.monster_mirror_spin)
+        monster_form.addRow("灰度匹配", self.monster_gray_switch)
         self.add_card("怪物配置", monster_widget)
 
         # —— 底部状态行：仅保留状态提示（刷新标注/保存已改为自动，无需按钮）——
@@ -317,7 +337,7 @@ class DashboardTab(CustomTab):  # 定义看板页签：视图区 + 测谎栏 + �
         self.add_card("状态", status_widget)
 
         self._loading = False  # 加载守卫：程序回填控件值（load_config/reload_annotations）期间置 True，避免自动保存被回填信号触发回写。
-        self._line_edits = (self.attack_key_edit, self.melee_key_edit, self.lie_abort_edit, self.lie_alarm_edit)  # 文本框集合：接「编辑提交即保存」信号。
+        self._line_edits = (self.attack_key_edit, self.melee_key_edit, self.jump_key_edit, self.lie_abort_edit, self.lie_alarm_edit)  # 文本框集合：接「编辑提交即保存」信号。
         self._last_coco_fp = None  # 标注文件指纹基线，reload_annotations 末尾更新。
         self._last_config_fp = None  # 配置文件指纹基线，load_config/save 末尾更新。
         self._save_timer = QTimer(self)  # 自动保存防抖定时器（单次触发）。
@@ -365,9 +385,17 @@ class DashboardTab(CustomTab):  # 定义看板页签：视图区 + 测谎栏 + �
             self.attack_wait_spin.setValue(float(raw_attack_wait if raw_attack_wait is not None else DASHBOARD_DEFAULTS['Attack To Move Wait Seconds']))  # 缺失时回退默认保护值。
             raw_loss_buffer = data.get('Target Loss Buffer Seconds')  # 同上：0 合法（不缓冲），不能用 or 短路。
             self.target_loss_spin.setValue(float(raw_loss_buffer if raw_loss_buffer is not None else DASHBOARD_DEFAULTS['Target Loss Buffer Seconds']))  # 缺失时回退默认缓冲值。
+            mode_value = str(data.get('Attack Mode') or 'normal')  # 读取攻击模式存取值（稳定 id）。
+            if mode_value not in ATTACK_MODE_LABELS:  # 残留非法值回退普通模式。
+                mode_value = 'normal'
+            self.attack_mode_combo.setCurrentText(ATTACK_MODE_LABELS[mode_value])  # 按映射显示中文标签。
+            self.jump_key_edit.setText(str(data.get('Attack Jump Key') or ''))
+            raw_jump_interval = data.get('Jump Interval Seconds')  # 同上：0 合法（不跳），不能用 or 短路。
+            self.jump_interval_spin.setValue(float(raw_jump_interval if raw_jump_interval is not None else DASHBOARD_DEFAULTS['Jump Interval Seconds']))  # 缺失时回退默认间隔。
             self.monster_multi.set_value(parse_feature_list(data.get('Monster Features')))
             self.monster_threshold_spin.setValue(float(data.get('Monster Threshold') or 0.65))
             self.monster_mirror_spin.setValue(float(data.get('Monster Mirror Threshold') or 0.65))
+            self.monster_gray_switch.setChecked(bool(data.get('Use Gray Scale', DASHBOARD_DEFAULTS['Use Gray Scale'])))
             self.auto_login_switch.setChecked(bool(data.get('Auto Login Enabled')))
             self._set_combo_value(self.server_combo, str(data.get('Auto Login Server Feature') or ''))
             self._set_combo_value(self.channel_combo, str(data.get('Auto Login Channel Feature') or ''))
@@ -426,6 +454,7 @@ class DashboardTab(CustomTab):  # 定义看板页签：视图区 + 测谎栏 + �
     def save(self):  # 校验并保存看板共享配置到 configs/Dashboard.json。
         for label, key_edit in (("攻击键", self.attack_key_edit),  # 按键类字段必须与框架按键校验规则一致。
                                 ("近战键", self.melee_key_edit),
+                                ("跳跃键", self.jump_key_edit),
                                 ("急停按键", self.lie_abort_edit)):
             value = key_edit.text().strip()  # 取按键文本。
             if value and not validate_key_name(value):  # 非空且不在键盘按键名单内。
@@ -442,6 +471,9 @@ class DashboardTab(CustomTab):  # 定义看板页签：视图区 + 测谎栏 + �
             'Character Threshold': round(float(self.char_threshold_spin.value()), 2),
             'Character Facing Left Feature': self._combo_value(self.char_facing_left_combo),
             'Character Facing Right Feature': self._combo_value(self.char_facing_right_combo),
+            'Attack Mode': ATTACK_MODE_VALUES.get(self.attack_mode_combo.currentText().strip(), 'normal'),  # 攻击模式存稳定 id，未知显示名回退普通。
+            'Attack Jump Key': self.jump_key_edit.text().strip(),
+            'Jump Interval Seconds': round(float(self.jump_interval_spin.value()), 2),
             'Attack Key': self.attack_key_edit.text().strip(),
             'Melee Attack Key': self.melee_key_edit.text().strip(),
             'Melee Distance': int(self.melee_distance_spin.value()),
@@ -455,6 +487,7 @@ class DashboardTab(CustomTab):  # 定义看板页签：视图区 + 测谎栏 + �
             'Monster Features': self.monster_multi.value_text(),
             'Monster Threshold': round(float(self.monster_threshold_spin.value()), 2),
             'Monster Mirror Threshold': round(float(self.monster_mirror_spin.value()), 2),
+            'Use Gray Scale': bool(self.monster_gray_switch.isChecked()),  # 灰度匹配：怪物栏共享开关，任务运行时经 apply_shared_config 采集。
             'Auto Login Enabled': bool(self.auto_login_switch.isChecked()),
             'Auto Login Server Feature': self._combo_value(self.server_combo),
             'Auto Login Channel Feature': self._combo_value(self.channel_combo),
@@ -497,11 +530,14 @@ class DashboardTab(CustomTab):  # 定义看板页签：视图区 + 测谎栏 + �
                      self.range_y_min_spin, self.range_y_max_spin, self.del_interval_spin,
                      self.attack_wait_spin,  # 攻击后摇等待：值变化即保存。
                      self.target_loss_spin,  # 目标丢失缓冲：值变化即保存。
+                     self.jump_interval_spin,  # 攻击中跳跃间隔：值变化即保存。
                      self.monster_threshold_spin, self.monster_mirror_spin):
             spin.valueChanged.connect(self._schedule_save)
+        self.attack_mode_combo.currentIndexChanged.connect(self._schedule_save)  # 攻击模式：切换选项即保存。
         for edit in self._line_edits:  # 文本框：编辑提交（回车/失焦）即保存，避免逐字触发按键校验报错。
             edit.editingFinished.connect(self._schedule_save)
         self.monster_multi.on_changed = self._schedule_save  # 怪物多选：勾选变化即保存。
+        self.monster_gray_switch.checkedChanged.connect(self._schedule_save)  # 灰度匹配开关。
 
     def _editing_text(self):  # 焦点是否落在本页签的文本输入框（含可编辑下拉的输入框）：外部配置回填时避开，防止冲掉用户正在输入的内容。
         focused = QApplication.focusWidget()  # 当前聚焦控件。

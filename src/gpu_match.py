@@ -67,16 +67,22 @@ class _GpuFrameMatch:  # 单帧匹配句柄：持有本帧的显存数据，对�
         self.fft_shape = (self.H + max_h - 1, self.W + max_w - 1)  # 全部模板共用的补零尺寸。
         self.ig_fft = cp.fft.rfft2(self.ig, s=self.fft_shape, axes=(0, 1))  # 帧 FFT 只做一次，全部模板复用。
 
-    def _window_stats(self, h, w):  # 用积分图求 (h, w) 滑动窗口内的像素和与平方和，同尺寸只算一次。
+    def _window_stats(self, h, w):  # 用积分图求 (h, w) 滑动窗口内的像素和与平方和，同尺寸只算一次（彩色帧沿通道维求和后统计，与彩色模板像素总数含通道的口径一致）。
         cached = self.window_cache.get((h, w))  # 先查缓存。
         if cached is not None:  # 已有该尺寸的统计。
             return cached  # 直接复用。
         ig64 = self.ig.astype(cp.float64)  # 双精度积分图避免累积误差。
+        if ig64.ndim == 3:  # 彩色帧：积分图只接受单通道，先沿通道求和。
+            g = ig64.sum(axis=2)  # 窗口像素和按全部通道累计。
+            g2 = (ig64 * ig64).sum(axis=2)  # 平方和同样沿通道累计。
+        else:  # 灰度帧。
+            g = ig64  # 原样。
+            g2 = ig64 * ig64  # 逐像素平方。
         pad = cp.zeros((self.H + 1, self.W + 1), dtype=cp.float64)  # 积分图补零边。
-        pad[1:, 1:] = cp.cumsum(cp.cumsum(ig64, axis=0), axis=1)  # 二维前缀和。
+        pad[1:, 1:] = cp.cumsum(cp.cumsum(g, axis=0), axis=1)  # 二维前缀和。
         s = pad[h:, w:] - pad[:-h, w:] - pad[h:, :-w] + pad[:-h, :-w]  # 窗口像素和。
         pad2 = cp.zeros((self.H + 1, self.W + 1), dtype=cp.float64)  # 平方积分图。
-        pad2[1:, 1:] = cp.cumsum(cp.cumsum(ig64 * ig64, axis=0), axis=1)  # 平方二维前缀和。
+        pad2[1:, 1:] = cp.cumsum(cp.cumsum(g2, axis=0), axis=1)  # 平方二维前缀和。
         sq = pad2[h:, w:] - pad2[:-h, w:] - pad2[h:, :-w] + pad2[:-h, :-w]  # 窗口像素平方和。
         self.window_cache[(h, w)] = (s, sq)  # 写入缓存。
         return s, sq  # 返回统计量。
@@ -125,3 +131,34 @@ class _GpuFrameMatch:  # 单帧匹配句柄：持有本帧的显存数据，对�
         ys, xs = cp.nonzero(mask)  # 达标位置的坐标。
         vals = score[mask]  # 达标位置的分数。
         return cp.stack([xs, ys, vals], axis=-1).get()  # 打包传回 CPU，一次传输。
+
+
+class GpuSplitMatcher:  # 角色/怪物色彩模式不同时的组合匹配器：角色与怪物模板分属两个 GpuTemplateMatcher（各自灰度/彩色），
+    # 对外接口（match_frame/match_frame 句柄的 best/above/matcher.templates）与单匹配器完全一致，调用方无感。
+    def __init__(self, char_matcher, mob_matcher):  # 传入角色匹配器与怪物匹配器，两者色彩模式必须不同。
+        self.char_matcher = char_matcher  # 角色匹配器（灰度）。
+        self.mob_matcher = mob_matcher  # 怪物匹配器（灰度或彩色）。
+        self.mob_keys = set(mob_matcher.templates)  # 归属怪物匹配器的模板键，路由依据。
+        self.templates = {}  # 合并两个匹配器的模板尺寸视图：调用方按 key 取 w/h，与单匹配器用法一致。
+        self.templates.update(char_matcher.templates)  # 先角色。
+        self.templates.update(mob_matcher.templates)  # 后怪物（角色名与怪物名分属不同标注分类，正常不重名）。
+
+    def match_frame(self, frame_bgr):  # 上传一帧画面并返回组合帧句柄。
+        return GpuSplitFrame(self, frame_bgr)  # 句柄内对两个匹配器各做一次上传与帧 FFT。
+
+
+class GpuSplitFrame:  # 组合匹配器的帧句柄：按模板 key 路由到归属匹配器的帧句柄。
+    def __init__(self, split, frame_bgr):  # 持有同一帧在两个匹配器里的句柄。
+        self.split = split  # 记录所属组合匹配器，路由查 mob_keys 用。
+        self.char = split.char_matcher.match_frame(frame_bgr)  # 角色侧帧句柄（灰度）。
+        self.mob = split.mob_matcher.match_frame(frame_bgr)  # 怪物侧帧句柄（按怪物色彩模式）。
+        self.matcher = split  # 与 _GpuFrameMatch.matcher 属性对齐：调用方取 .templates 尺寸视图。
+
+    def _handle(self, key):  # 取模板 key 归属的帧句柄。
+        return self.mob if key in self.split.mob_keys else self.char  # 怪物键走怪物侧，其余走角色侧。
+
+    def best(self, key):  # 语义与 _GpuFrameMatch.best 一致，直接转发。
+        return self._handle(key).best(key)  # 转发到归属句柄。
+
+    def above(self, key, threshold):  # 语义与 _GpuFrameMatch.above 一致，直接转发。
+        return self._handle(key).above(key, threshold)  # 转发到归属句柄。

@@ -39,6 +39,9 @@ DASHBOARD_DEFAULTS = {  # 看板共享配置默认值：键名与任务原配置
     'Character Threshold': 0.8,  # 角色匹配阈值。
     'Character Facing Left Feature': '',  # 角色左朝向模板分类名，留空禁用朝向校准。
     'Character Facing Right Feature': '',  # 角色右朝向模板分类名，两个朝向模板都配置才启用校准。
+    'Attack Mode': 'normal',  # 攻击模式：normal=站立攻击（本次改动前最原始的攻击策略，停下站着打，初始默认）；move_attack=边攻击边位移（按住朝目标方向键走打不跳）；move_jump=位移跳跃攻击（走打并周期跳跃）。
+    'Attack Jump Key': 'space',  # 攻击跳跃按键：位移跳跃攻击模式按它周期跳跃，与按住的方向键形成方向跳（区别于路线任务私有的 Jump Key 配置，避免共享配置覆盖任务页设置）。
+    'Jump Interval Seconds': 0.6,  # 攻击中跳跃间隔（秒）：位移跳跃攻击模式每隔该秒数跳一次，0 不跳；实际生效值钳制最小 0.35 秒防乱跳。
     'Attack Key': 'a',  # 常规攻击按键。
     'Melee Attack Key': 'b',  # 近战攻击按键。
     'Melee Distance': 40,  # 近战距离（像素）。
@@ -53,6 +56,7 @@ DASHBOARD_DEFAULTS = {  # 看板共享配置默认值：键名与任务原配置
     'Monster Features': '',  # 怪物标注分类名，英文逗号分隔支持多个。
     'Monster Threshold': 0.65,  # 怪物匹配阈值。
     'Monster Mirror Threshold': 0.65,  # 怪物镜像匹配阈值。
+    'Use Gray Scale': True,  # 灰度匹配：仅对怪物匹配生效（角色/朝向/地台等固定灰度），关闭后怪物改彩色匹配，误匹配多时可试；任务运行时经 apply_shared_config 覆盖进任务配置。
     # —— 自动登录栏 ——
     'Auto Login Enabled': True,  # 自动登录开关：开启后检测到掉线模板自动执行重登流程。
     'Auto Login Server Feature': '',  # 服务区模板名（类别=服务区），对应启动器服务器选择按钮。

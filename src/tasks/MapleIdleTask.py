@@ -65,7 +65,8 @@ class MapleIdleTask(MyBaseTask):  # 定义冒险岛挂机任务，继承项目�
         self._held_key = None  # 当前持续按住的攻击键（近战或常规）；改为实例属性，独立测谎服务暂停任务时可读取并通过 pop_held_keys 释放它。
         for key in ("Character Feature", "Character Threshold", "Attack Key", "Melee Attack Key", "Melee Distance",  # 角色/怪物参数已搬到看板统一配置（见 src/dashboard_store.py），任务页不再展示。
                     "Attack Range X Min", "Attack Range X Max", "Attack Range Y Min", "Attack Range Y Max",
-                    "Del Key Interval", "Monster Features", "Monster Threshold", "Monster Mirror Threshold"):
+                    "Del Key Interval", "Monster Features", "Monster Threshold", "Monster Mirror Threshold",
+                    "Use Gray Scale"):  # 灰度匹配已上移看板怪物配置（仅对怪物生效），清理旧任务配置残留。
             self.default_config.pop(key, None)  # 移除默认值，框架加载旧配置时会自动清理已保存的旧键。
             self.config_description.pop(key, None)  # 同步移除帮助文本。
         self.default_config.update({  # 用户可在 GUI 编辑的配置项（仅保留动作节奏类，角色/怪物/测谎参数在看板页签配置）。
@@ -73,7 +74,6 @@ class MapleIdleTask(MyBaseTask):  # 定义冒险岛挂机任务，继承项目�
             "Move Away Seconds": 1.0,  # 位移第一段：朝角色朝向的反向按住方向键移动的秒数，支持 3 位小数（毫秒级）。
             "Move Back Seconds": 1.0,  # 位移第二段：攻击后停顿 1 秒再反方向（即朝向方向）按住方向键移动的秒数，支持 3 位小数（毫秒级）。
             "Turn Interval": 0.0,  # 每隔 x 秒做一次转身攻击：停止攻击等 1 秒→单击方向键转身→攻击一下→等 0.5 秒→再单击反方向键转身归位，设为 0 表示禁用。
-            "Use Gray Scale": True,  # 是否转灰度匹配，对颜色差异更稳定。
             "Frame Interval": 0.05,  # 每帧处理之间的最小间隔秒数，控制检测节奏。
         })
         self.config_description.update({  # 各配置项的帮助文本。
@@ -81,7 +81,6 @@ class MapleIdleTask(MyBaseTask):  # 定义冒险岛挂机任务，继承项目�
             "Move Away Seconds": "Hold seconds for the first leg, moving opposite to character facing, supports 3 decimals. 位移第一段：朝角色朝向反向移动的秒数，支持 3 位小数。",
             "Move Back Seconds": "Hold seconds for the second leg after attacking once and waiting 1s, moving in the opposite direction of the first leg, supports 3 decimals. 位移第二段：攻击一下停顿 1 秒后再反方向移动的秒数，支持 3 位小数。",
             "Turn Interval": "Every x seconds do a turn-around attack: stop attacking and wait 1s, tap direction key to turn, attack once, wait 0.5s, tap the opposite direction key to turn back; 0 disables it. 每隔 x 秒做一次转身攻击：停止攻击等 1 秒→单击方向键转身→攻击一下→等 0.5 秒→再单击反方向键转身归位，0 禁用。",
-            "Use Gray Scale": "Match in grayscale, more robust to color differences. 是否转灰度匹配，对颜色差异更稳定。",
             "Frame Interval": "Minimum seconds between processed frames. 每帧处理之间的最小间隔秒数。",
         })
 
@@ -331,14 +330,16 @@ class MapleIdleTask(MyBaseTask):  # 定义冒险岛挂机任务，继承项目�
             return None  # 返回未知。
         return -1 if getattr(box, "flipped", False) else 1  # 镜像命中=朝左，原始命中=朝右。
 
-    def build_gpu_matcher(self, char_name, monster_names):  # 构建 GPU 匹配器并为角色与全部怪物注册原始/镜像模板，不可用时返回 None。
+    def build_gpu_matcher(self, char_name, monster_names):  # 构建 GPU 匹配器并为角色与全部怪物注册原始/镜像模板，不可用时返回 None；角色固定灰度，怪物色彩模式跟随看板灰度开关（组合匹配器对外接口与单匹配器一致，调用方无感）。
         # 显卡加速隐藏式启用（不设配置开关）：统一优先 GPU，无显卡/异常时自动降级 CPU。
         try:  # 延迟导入，未安装 cupy 时不影响任务加载。
-            from src.gpu_match import GpuTemplateMatcher, gpu_available  # 导入项目 GPU 匹配模块。
+            from src.gpu_match import GpuSplitMatcher, GpuTemplateMatcher, gpu_available  # 导入项目 GPU 匹配模块。
             if not gpu_available():  # 无可用 NVIDIA 显卡或 CuPy 未装好。
                 self.log_info("GPU match unavailable, use CPU. 显卡加速不可用，使用 CPU 匹配。")  # 提示回退原因。
                 return None  # 回退 CPU。
-            matcher = GpuTemplateMatcher(gray=bool(self.config.get("Use Gray Scale")))  # 按灰度配置创建匹配器。
+            mob_gray = self.mob_gray()  # 怪物灰度开关只影响怪物模板的色彩模式，角色/朝向等固定灰度。
+            matcher = GpuTemplateMatcher(gray=True)  # 角色匹配器固定灰度，保持历史行为。
+            matcher_mob = matcher if mob_gray else GpuTemplateMatcher(gray=False)  # 怪物灰度时与角色共用一个匹配器，彩色时单独建（帧 FFT 各做一次，仅彩色调试模式有额外开销）。
             feature_set = self.executor.feature_set  # 取执行器的特征集。
             for name in [char_name] + monster_names:  # 逐个分类注册原始与镜像两份模板。
                 feature_set.ensure_feature(name)  # 确保标注已加载。
@@ -346,10 +347,14 @@ class MapleIdleTask(MyBaseTask):  # 定义冒险岛挂机任务，继承项目�
                 if feature is None or getattr(feature, "mask", None) is not None:  # 标注缺失或带掩码时 GPU 路径无法等价复现。
                     self.log_info(f"Feature {name} not GPU-matchable, use CPU. 标注 {name} 无法 GPU 匹配，整体回退 CPU。")  # 说明回退原因。
                     return None  # 回退 CPU 保证行为一致。
-                matcher.add_template(name, feature.mat)  # 注册原始朝向模板。
-                matcher.add_template(name + "__flip", cv2.flip(feature.mat, 1))  # 注册水平镜像模板。
-            self.log_info("GPU template match enabled. 已启用显卡模板匹配加速。")  # 提示加速已生效。
-            return matcher  # 返回可用的匹配器。
+                target = matcher_mob if name in monster_names else matcher  # 怪物注册进怪物匹配器（灰度模式下就是同一个），其余注册进角色匹配器。
+                target.add_template(name, feature.mat)  # 注册原始朝向模板。
+                target.add_template(name + "__flip", cv2.flip(feature.mat, 1))  # 注册水平镜像模板。
+            if matcher_mob is matcher:  # 怪物灰度模式：单匹配器原样返回。
+                self.log_info("GPU template match enabled. 已启用显卡模板匹配加速。")  # 提示加速已生效。
+                return matcher  # 返回可用的匹配器。
+            self.log_info("GPU template match enabled (monster color mode). 已启用显卡模板匹配加速（怪物彩色匹配）。")  # 提示怪物彩色模式生效。
+            return GpuSplitMatcher(matcher, matcher_mob)  # 组合匹配器按模板名路由角色/怪物帧句柄，对 gpu_lookup_* 透明。
         except Exception as e:  # 初始化任何环节异常都不影响任务运行。
             self.log_warning(f"GPU match init failed, use CPU: {e}. GPU 匹配初始化失败，使用 CPU。")  # 记录异常原因。
             return None  # 回退 CPU。
@@ -385,36 +390,41 @@ class MapleIdleTask(MyBaseTask):  # 定义冒险岛挂机任务，继承项目�
             self.log_warning(f"GPU lookup-all failed for {name}: {e}. GPU 匹配异常。")  # 记录异常。
         return self.merge_boxes(boxes)  # 两种朝向的框合并后统一去重。
 
-    def find_one_raw(self, feature_name, frame, threshold):  # 仅用原始朝向匹配单个模板（不做镜像回退），返回置信度最高的框或 None。
+    def mob_gray(self):  # 怪物匹配是否用灰度：看板怪物配置的灰度开关只对怪物匹配生效，角色/朝向/地台等其他匹配固定灰度不受影响。
+        return bool(self.config.get("Use Gray Scale", True))  # 键由看板共享配置经 apply_shared_config 注入，缺失时沿用历史默认（灰度）。
+
+    def find_one_raw(self, feature_name, frame, threshold, use_gray=True):  # 仅用原始朝向匹配单个模板（不做镜像回退），返回置信度最高的框或 None；use_gray 默认灰度，保持角色/朝向/地台等历史行为。
         try:  # 标注不存在时框架会抛 ValueError，不能中断主流程。
-            return self.find_one(feature_name, frame=frame, threshold=threshold, use_gray_scale=self.config.get("Use Gray Scale"), horizontal_variance=1, vertical_variance=1)  # variance=1 表示全屏搜索，目标会移动不能只在标注位置附近找。
+            return self.find_one(feature_name, frame=frame, threshold=threshold, use_gray_scale=use_gray, horizontal_variance=1, vertical_variance=1)  # variance=1 表示全屏搜索，目标会移动不能只在标注位置附近找。
         except ValueError:  # 该分类名未在模板页标注。
             return None  # 按未匹配处理。
 
-    def find_all_raw(self, feature_name, frame, threshold):  # 仅用原始朝向匹配单个模板的全部出现位置（不做镜像回退），返回匹配框列表。
-        return self.find_feature(feature_name, frame=frame, threshold=threshold, use_gray_scale=self.config.get("Use Gray Scale"), horizontal_variance=1, vertical_variance=1)  # variance=1 表示全屏搜索，返回全部匹配框。
+    def find_all_raw(self, feature_name, frame, threshold, use_gray=True):  # 仅用原始朝向匹配单个模板的全部出现位置（不做镜像回退），返回匹配框列表；怪物调用方传 mob_gray()。
+        return self.find_feature(feature_name, frame=frame, threshold=threshold, use_gray_scale=use_gray, horizontal_variance=1, vertical_variance=1)  # variance=1 表示全屏搜索，返回全部匹配框。
 
-    def find_one_feature(self, feature_name, frame, threshold, mirror_threshold=None):  # 在一帧画面中匹配一个标注模板，返回置信度最高的框或 None，镜像未单独给阈值时沿用主阈值。
-        box = self.find_one_raw(feature_name, frame, threshold)  # 先按原始朝向匹配。
+    def find_one_feature(self, feature_name, frame, threshold, mirror_threshold=None, use_gray=True):  # 在一帧画面中匹配一个标注模板，返回置信度最高的框或 None，镜像未单独给阈值时沿用主阈值。
+        box = self.find_one_raw(feature_name, frame, threshold, use_gray=use_gray)  # 先按原始朝向匹配。
         if box is not None:  # 原始朝向匹配成功。
             return box  # 直接返回结果。
-        return self.find_flipped(feature_name, frame, threshold=mirror_threshold or threshold)  # 目标转向时精灵图会水平镜像，用翻转模板再匹配一次。
+        return self.find_flipped(feature_name, frame, threshold=mirror_threshold or threshold, use_gray=use_gray)  # 目标转向时精灵图会水平镜像，用翻转模板再匹配一次。
 
-    def find_all_features(self, feature_name, frame, threshold, mirror_threshold=None):  # 在一帧画面中匹配标注模板的全部出现位置，镜像未单独给阈值时沿用主阈值。
-        boxes = list(self.find_all_raw(feature_name, frame, threshold))  # 原始朝向的全部匹配框。
-        boxes.extend(self.find_flipped(feature_name, frame, find_all=True, threshold=mirror_threshold or threshold))  # 补充镜像朝向的匹配结果，目标转向后也能识别。
+    def find_all_features(self, feature_name, frame, threshold, mirror_threshold=None, use_gray=True):  # 在一帧画面中匹配标注模板的全部出现位置，镜像未单独给阈值时沿用主阈值。
+        boxes = list(self.find_all_raw(feature_name, frame, threshold, use_gray=use_gray))  # 原始朝向的全部匹配框。
+        boxes.extend(self.find_flipped(feature_name, frame, find_all=True, threshold=mirror_threshold or threshold, use_gray=use_gray))  # 补充镜像朝向的匹配结果，目标转向后也能识别。
         return self.merge_boxes(boxes)  # 两种朝向的框合并后统一去重，避免同一目标出重复框。
 
     def submit_char_monster_matches(self, batch, frame, char_name, monster_names):  # 把本帧角色与全部怪物的原始/镜像匹配一次性提交线程池，各匹配彼此独立且只读同一帧画面，结果与串行执行完全一致。
         char_threshold = self.config.get("Character Threshold")  # 角色独立阈值，角色镜像沿用同一阈值。
         mob_threshold = self.config.get("Monster Threshold")  # 怪物阈值。
         mob_mirror_threshold = self.config.get("Monster Mirror Threshold") or mob_threshold  # 怪物镜像阈值，未配置时沿用怪物阈值，与串行实现一致。
-        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if self.config.get("Use Gray Scale") else None  # 整帧灰度图只转一次给全部镜像匹配共用，避免每个线程重复转换整帧。
+        mob_gray = self.mob_gray()  # 怪物灰度开关只影响怪物两条匹配，角色保持固定灰度。
+        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)  # 角色镜像固定灰度匹配：整帧灰度图只转一次，与怪物灰度开启时共用同一份。
+        mob_gray_frame = gray_frame if mob_gray else None  # 怪物彩色匹配时不传灰度图，find_flipped 内部按 use_gray 直接用原帧。
         batch.submit("char", lambda: self.find_one_raw(char_name, frame, char_threshold))  # 角色原始朝向匹配。
         batch.submit("char_flip", lambda: self.find_flipped(char_name, frame, threshold=char_threshold, gray_frame=gray_frame))  # 角色镜像朝向匹配，只在原始未命中时才会被采用。
         for i, name in enumerate(monster_names):  # 逐个怪物分类提交，键带序号避免怪物名与角色名重名冲突。
-            batch.submit(f"m{i}", lambda name=name: self.find_all_raw(name, frame, mob_threshold))  # 怪物原始朝向的全部匹配框。
-            batch.submit(f"m{i}_flip", lambda name=name: self.find_flipped(name, frame, find_all=True, threshold=mob_mirror_threshold, gray_frame=gray_frame))  # 怪物镜像朝向的全部匹配框。
+            batch.submit(f"m{i}", lambda name=name: self.find_all_raw(name, frame, mob_threshold, use_gray=mob_gray))  # 怪物原始朝向的全部匹配框，色彩模式跟随看板灰度开关。
+            batch.submit(f"m{i}_flip", lambda name=name: self.find_flipped(name, frame, find_all=True, threshold=mob_mirror_threshold, gray_frame=mob_gray_frame, use_gray=mob_gray))  # 怪物镜像朝向的全部匹配框。
 
     def collect_char_monster_matches(self, batch, monster_names):  # 按串行执行时的原顺序取回并发匹配结果，返回（角色框或 None, 全部怪物框）。
         character = batch.get("char")  # 先取角色原始朝向结果。
@@ -438,7 +448,7 @@ class MapleIdleTask(MyBaseTask):  # 定义冒险岛挂机任务，继承项目�
     def overlapping(self, a, b):  # 判断两个框中心是否足够近，近则视为同一目标。
         return abs(a.x - b.x) < min(a.width, b.width) / 2 and abs(a.y - b.y) < min(a.height, b.height) / 2  # 左上角差距小于较小框一半尺寸即重叠。
 
-    def find_flipped(self, feature_name, frame, find_all=False, threshold=0.8, gray_frame=None):  # 用水平镜像的模板在整帧匹配，返回 Box 或 Box 列表，阈值由调用方按目标类型传入；gray_frame 为调用方已转好的整帧灰度图，并发匹配时多个线程共用一份。
+    def find_flipped(self, feature_name, frame, find_all=False, threshold=0.8, gray_frame=None, use_gray=True):  # 用水平镜像的模板在整帧匹配，返回 Box 或 Box 列表，阈值由调用方按目标类型传入；gray_frame 为调用方已转好的整帧灰度图，并发匹配时多个线程共用一份；use_gray 默认灰度保持角色镜像行为不变。
         try:  # 获取标注模板失败时不能影响主流程。
             feature_set = self.executor.feature_set  # 取执行器的特征集。
             feature_set.ensure_feature(feature_name)  # 确保该标注已加载进缓存。
@@ -450,7 +460,7 @@ class MapleIdleTask(MyBaseTask):  # 定义冒险岛挂机任务，继承项目�
             return [] if find_all else None  # 返回空结果。
         template = cv2.flip(feature.mat, 1)  # 水平镜像模板，对应目标反朝向的精灵图。
         search = frame  # 待匹配画面。
-        if self.config.get("Use Gray Scale"):  # 配置为灰度匹配时统一转灰度。
+        if use_gray:  # 灰度匹配时统一转灰度（use_gray=False 走彩色，只影响怪物）。
             search = gray_frame if gray_frame is not None else cv2.cvtColor(search, cv2.COLOR_BGR2GRAY)  # 画面转灰度，调用方已转好则直接复用同一份。
             template = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)  # 模板转灰度。
         result = cv2.matchTemplate(search, template, cv2.TM_CCOEFF_NORMED)  # 整帧模板匹配。

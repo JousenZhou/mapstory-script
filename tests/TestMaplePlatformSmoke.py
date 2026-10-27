@@ -220,6 +220,25 @@ class TestMaplePlatformSmoke(TaskTestCase):
         self.assertIsNone(self.task._held_move_key)  # 移动键状态清空。
         self.assertGreater(self.task._attack_released_at, 0.0)  # 松键时间戳已记录，走动前会等待后摇结束。
 
+    def test_attack_mode_dashboard_defaults(self):
+        # 攻击模式/攻击跳跃键/跳跃间隔为看板角色配置共享键：默认值正确且不落任务页（test_config_trimmed_and_added 的循环已自动覆盖不落地断言）。
+        self.assertEqual('normal', DASHBOARD_DEFAULTS['Attack Mode'])  # 默认站立攻击（本次改动前最原始的攻击策略）。
+        self.assertEqual('space', DASHBOARD_DEFAULTS['Attack Jump Key'])  # 默认攻击跳跃键为空格。
+        self.assertAlmostEqual(0.6, DASHBOARD_DEFAULTS['Jump Interval Seconds'])  # 默认跳跃间隔 0.6 秒。
+        for key in ('Attack Mode', 'Attack Jump Key', 'Jump Interval Seconds'):  # 任务页不携带共享键（看板单一数据源）。
+            self.assertNotIn(key, self.task.default_config)
+            self.assertNotIn(key, self.task.config_description)
+
+    def test_attack_mode_labels(self):
+        # 攻击模式三个选项：站立攻击（最原始版本）为初始默认排首位，两种位移模式依次排列，存取映射一一对应。
+        from src.ui.DashboardTab import ATTACK_MODE_LABELS, ATTACK_MODE_VALUES  # 只读模块级映射，不实例化控件。
+        self.assertEqual(['normal', 'move_attack', 'move_jump'], list(ATTACK_MODE_LABELS))  # 站立攻击排首位即初始选项。
+        self.assertEqual('站立攻击', ATTACK_MODE_LABELS['normal'])
+        self.assertEqual('边攻击边位移', ATTACK_MODE_LABELS['move_attack'])
+        self.assertEqual('位移跳跃攻击', ATTACK_MODE_LABELS['move_jump'])
+        for label, value in ATTACK_MODE_VALUES.items():  # 显示名反查存取值与正映射一一对应。
+            self.assertEqual(ATTACK_MODE_LABELS[value], label)
+
     def test_draw_overlay(self):
         frame = np.full((300, 400, 3), 20, dtype=np.uint8)  # 构造纯色合成画面。
         canvas = self.task.draw_overlay(frame, None, None, 50.0, 100, 100, 100, False, None, [], None, None)  # 全部未检测到时不报错。

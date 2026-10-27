@@ -19,6 +19,7 @@ BOUND_TURN_PAUSE = 0.2  # 巡逻到达区间边界折返时松键停顿的秒数
 TARGET_LOSS_BUFFER = 0.3  # 目标丢失缓冲默认秒数（已提升为看板角色配置共享键 Target Loss Buffer Seconds，任务经 MyBaseTask.target_loss_buffer() 读取，此常量仅作历史参照）。
 SPOT_BOX_FALLBACK_WIDTH = 40  # 未匹配到角色时定点色框的兜底宽度（像素）。
 SPOT_BOX_FALLBACK_HEIGHT = 60  # 未匹配到角色时定点色框的兜底高度（像素）。
+JUMP_MIN_INTERVAL = 0.35  # 攻击中跳跃最小间隔（秒）：配置低于它按它执行防每帧连跳（与路线任务 JUMP_MIN_INTERVAL 一致）。
 
 
 class MaplePlatformTask(MaplePatrolTask):  # 定义冒险岛地台定点挂机任务，继承巡逻任务复用匹配与攻击能力。
@@ -164,6 +165,15 @@ class MaplePlatformTask(MaplePatrolTask):  # 定义冒险岛地台定点挂机�
         melee_distance = float(self.config.get("Melee Distance") or 0)  # 读取近战距离（像素），横向距离绝对值不超过该值用近战键。
         attack_x_min, attack_x_max = sorted((int(self.config.get("Attack Range X Min")), int(self.config.get("Attack Range X Max"))))  # 读取攻击区域左右边界（符号化像素），填反时自动交换。
         attack_y_min, attack_y_max = sorted((int(self.config.get("Attack Range Y Min")), int(self.config.get("Attack Range Y Max"))))  # 读取攻击区域上下边界（符号化像素），填反时自动交换。
+        attack_mode = str(self.config.get("Attack Mode") or 'normal').strip()  # 读取攻击模式（看板角色配置共享键）：normal=站立攻击（本次改动前最原始的攻击策略，停下站着打，初始默认）；move_attack=边攻击边位移；move_jump=位移跳跃攻击。
+        move_attack = attack_mode in ('move_attack', 'move_jump')  # 位移攻击开关（两种位移模式共用）：攻击时同时按住朝目标方向键走打，缓解被怪碰撞顶走。
+        jump_key = str(self.config.get("Attack Jump Key") or '').strip()  # 读取攻击跳跃键（看板角色配置共享键，区别于路线任务私有的 Jump Key 配置）：位移跳跃模式按它周期跳跃，留空则只位移不跳。
+        try:  # 攻击中跳跃间隔容错解析：配置残留非数字时不致任务崩溃。
+            jump_interval_cfg = max(0.0, float(self.config.get("Jump Interval Seconds") or 0))  # 配置间隔（秒），0 表示不跳。
+        except (TypeError, ValueError):  # 未配置或非数字。
+            jump_interval_cfg = 0.6  # 回退看板默认间隔（与 DASHBOARD_DEFAULTS 的 Jump Interval Seconds 一致）。
+        jump_interval = max(JUMP_MIN_INTERVAL, jump_interval_cfg) if jump_interval_cfg > 0 else 0.0  # 生效间隔：配置低于最小间隔按最小间隔执行，防每帧连跳。
+        jump_active = move_attack and attack_mode == 'move_jump' and bool(jump_key) and jump_interval > 0  # 仅位移跳跃攻击模式周期跳跃：边攻击边位移模式不跳，跳跃键留空或间隔为 0 也不跳。
         del_interval = float(self.config.get("Del Key Interval") or 0)  # 读取自动按 Del 键的间隔秒数，0 表示禁用。
         last_del_time = time.time()  # 上次按 Del 键的时间，从任务启动开始计时。
         platform_threshold = float(self.config.get("Platform Threshold"))  # 读取地台匹配阈值。
@@ -199,6 +209,7 @@ class MaplePlatformTask(MaplePatrolTask):  # 定义冒险岛地台定点挂机�
         anchor_time = time.time()  # 位置锚点上次更新时间。
         last_diag_time = 0.0  # 上次诊断日志的时间戳，限频避免刷日志。
         last_facing_check = 0.0  # 上次朝向校准的时间戳，0 表示启动后立即校准一次。
+        last_jump_time = 0.0  # 上次攻击中/归位中跳跃的时间戳，控制位移跳跃攻击的跳跃节奏。
         loop_start = time.time()  # 本轮循环起点，用于把截图采集节拍钉在固定 30FPS。
         try:  # 包裹主循环，退出时兜底松开移动键与攻击键。
             while True:  # 实时识图循环，直到用户手动停止任务。
@@ -306,6 +317,11 @@ class MaplePlatformTask(MaplePatrolTask):  # 定义冒险岛地台定点挂机�
                     if self._held_move_key is not None:  # 有按住的移动键。
                         self.send_key_up(self._held_move_key)  # 松开方向键，位置未知时走动有越界坠落风险。
                         self._held_move_key = None  # 清空按住状态。
+                    if self._held_attack_key is not None and time.time() - last_target_seen > target_loss_buffer:  # 定位丢失且超目标丢失缓冲仍按着攻击键：被怪顶着遮挡定位时会带着攻击键原地盲打且归位永不触发，必须松键（短暂抖帧在缓冲期内不松，保持攻击节奏）。
+                        self.send_key_up(self._held_attack_key)  # 松开攻击键停止盲打。
+                        self._held_attack_key = None  # 清空按住状态。
+                        self._attack_released_at = time.time()  # 记录松键时间，恢复走动前等攻击后摇。
+                        self.log_warning("Tracking lost while attack key held, release after target loss buffer. 定位丢失超过目标丢失缓冲，已松开攻击键，防止被怪顶着时原地盲打不归位。")  # 记录事件供确认根因。
                     anchor_x = None  # 定位丢失时卡住锚点失效。
                     self.info_set("Status", "地台定位丢失" if plat_rect is None else "未找到角色")  # 在 GUI 显示定位丢失状态。
                     self.sleep(loop_interval)  # 按固定 30FPS 节拍等待。
@@ -319,17 +335,24 @@ class MaplePlatformTask(MaplePatrolTask):  # 定义冒险岛地台定点挂机�
                         returning = False  # 退出归位状态，恢复巡逻（保留原巡逻方向）。
                         self.log_info(f"Back to spot at x={cx:.0f}, resume patrol. 已归位到 x={cx:.0f}，恢复区间巡逻。")  # 记录归位完成供排查。
                     else:  # 尚未归位，本帧继续朝定点走动，不进入攻击与巡逻分支。
-                        if self._held_attack_key is not None:  # 归位优先：松开按住的攻击键，归位途中不攻击。
+                        if not move_attack and self._held_attack_key is not None:  # 站立攻击模式归位优先：松开按住的攻击键，归位途中不攻击（最原始版本行为）；两种位移模式保持输出边走边打。
                             self.send_key_up(self._held_attack_key)  # 松开攻击键。
                             self._held_attack_key = None  # 清空按住状态。
                             self._attack_released_at = time.time()  # 记录松键时间，走动前需等攻击后摇结束。
+                        if move_attack and self._held_attack_key is not None and target is None and time.time() - last_target_seen > target_loss_buffer:  # 位移模式归位途中目标消失超缓冲：松攻击键，无怪可打不空挥。
+                            self.send_key_up(self._held_attack_key)  # 松开攻击键。
+                            self._held_attack_key = None  # 清空按住状态。
+                            self._attack_released_at = time.time()  # 记录松键时间。
+                        if move_attack and attack_key and self._held_attack_key is None and target is not None:  # 位移模式归位途中有目标：按住常规攻击键朝移动方向继续输出。
+                            self.send_key_down(attack_key)  # 持续按住攻击键。
+                            self._held_attack_key = attack_key  # 记录当前按住的键。
                         walk_direction = 1 if cx < spot_x else -1  # 归位走动方向：定点在右侧向右走，在左侧向左走。
                         anchor_x, anchor_time = self.update_stuck_anchor(int(cx), anchor_x, anchor_time, plat_rect[2])  # 用角色画面 x 更新卡住锚点。
                         if stuck_seconds > 0 and self._held_move_key is not None and time.time() - anchor_time >= stuck_seconds:  # 按住方向键但位置长期不动视为卡住。
                             self.recover_stuck(self._held_move_key, walk_direction, resume_wait)  # 反向短移脱困，脱困后本帧松键，下一帧按最新偏移继续归位。
                             self._held_move_key = None  # 恢复过程已松键。
                             anchor_x, anchor_time = None, time.time()  # 脱困后重置卡住锚点。
-                        if time.time() < self._attack_released_at + attack_to_move_wait:  # 攻击刚结束的等待期内只识图不移动，方向键会被攻击后摇吞掉（时长看板可调）。
+                        if not move_attack and time.time() < self._attack_released_at + attack_to_move_wait:  # 站立攻击模式攻击刚结束的等待期内只识图不移动，方向键会被攻击后摇吞掉（时长看板可调）；位移模式攻击键未松开无吞键问题。
                             self.info_set("Status", "归位等待")  # 在 GUI 显示归位等待状态。
                             self.sleep(loop_interval)  # 按固定 30FPS 节拍等待。
                             continue  # 等待期结束后自动恢复走动。
@@ -340,21 +363,32 @@ class MaplePlatformTask(MaplePatrolTask):  # 定义冒险岛地台定点挂机�
                             self.send_key_down(want_key)  # 持续按住新方向键走回定点。
                             self._held_move_key = want_key  # 记录当前按住的键。
                             facing = walk_direction  # 走动时朝向与移动方向一致，供攻击换向判定直接使用。
-                        self.info_set("Status", f"{'向右' if walk_direction == 1 else '向左'}归位 (偏移 {abs(cx - spot_x):.0f}px)")  # 在 GUI 显示归位方向与当前像素偏移。
+                        if jump_active and time.time() - last_jump_time >= jump_interval:  # 位移跳跃模式归位途中同样按间隔跳跃：空中不受地面碰撞推移，防止走回途中再被顶开；边攻击边位移模式不跳。
+                            self.send_key(jump_key, down_time=0.05)  # 短按跳跃键，配合按住的方向键形成方向跳。
+                            last_jump_time = time.time()  # 记录跳跃时间。
+                        self.info_set("Status", f"{'向右' if walk_direction == 1 else '向左'}归位 (偏移 {abs(cx - spot_x):.0f}px)" + (" 边打" if move_attack else ""))  # 在 GUI 显示归位方向与当前像素偏移。
                         self.sleep(loop_interval)  # 按固定 30FPS 节拍等待后处理下一帧。
                         continue  # 归位中不进入攻击与巡逻分支。
-                if target is not None:  # 区间内且攻击范围内有怪：停下巡逻原地转向攻击。
-                    if self._held_move_key is not None:  # 进入攻击前先松开移动键，站着打不边走边打。
-                        self.send_key_up(self._held_move_key)  # 松开方向键。
-                        self._held_move_key = None  # 清空按住状态。
-                        anchor_x = None  # 停止走动后卡住锚点失效。
+                if target is not None:  # 区间内且攻击范围内有怪：普通模式停下巡逻原地转向攻击；位移跳跃模式按住朝怪方向键边走边跳边打。
                     dx, dy = self.center_offset(character, target)  # 计算目标怪物相对角色的方向。
                     want_direction = 1 if dx > 0 else -1  # 1=怪在右侧，-1=怪在左侧。
                     want_key = melee_key if abs(dx) <= melee_distance else attack_key  # 横向距离在近战距离内用近战键，否则用常规攻击键，怪物走近走远时自动切换。
+                    if move_attack:  # 位移攻击模式（边攻击边位移/位移跳跃攻击共用）：按住朝目标方向键边走边打，朝向与移动方向一致攻击不落空，空中也不受地面碰撞推移。
+                        want_move_key = MOVE_RIGHT_KEY if want_direction == 1 else MOVE_LEFT_KEY  # 朝目标方向的移动键。
+                        if self._held_move_key != want_move_key:  # 换向先松旧键再按新键（首次按下也走此分支）。
+                            if self._held_move_key is not None:  # 有旧键按住。
+                                self.send_key_up(self._held_move_key)  # 松开旧方向键。
+                            self.send_key_down(want_move_key)  # 持续按住新方向键朝目标移动。
+                            self._held_move_key = want_move_key  # 记录当前按住的键。
+                            facing = want_direction  # 移动时朝向与移动方向一致，转身序列不再触发。
+                    elif self._held_move_key is not None:  # 普通模式进入攻击前先松开移动键，站着打不边走边打。
+                        self.send_key_up(self._held_move_key)  # 松开方向键。
+                        self._held_move_key = None  # 清空按住状态。
+                        anchor_x = None  # 停止走动后卡住锚点失效。
                     if self._held_attack_key is not None and self._held_attack_key != want_key:  # 换攻击键（近战↔常规）：同一帧内松旧按新不中断输出，不计入后摇也不影响朝向；只有真正要转身才走下方松键→等待→点方向键序列。
                         self.send_key_up(self._held_attack_key)  # 松开当前按住的攻击键。
                         self._held_attack_key = None  # 清空按住状态，紧下方会立即按新键，帧内无缝衔接。
-                    if facing != want_direction:  # 朝向与怪物方向不一致时执行转身序列。
+                    if facing != want_direction:  # 朝向与怪物方向不一致时执行转身序列（位移跳跃模式移动键已同步朝向，通常不触发）。
                         if self._held_attack_key is not None:  # 先松开攻击键：攻击后摇期间方向键输入会被游戏吞掉，导致转身失败后长时间空打。
                             self.send_key_up(self._held_attack_key)  # 松开攻击键。
                             self._held_attack_key = None  # 清空按住状态，转身完成后重新按住。
@@ -364,8 +398,11 @@ class MaplePlatformTask(MaplePatrolTask):  # 定义冒险岛地台定点挂机�
                         self.sleep(0.08)  # 等待转身动作生效后再攻击。
                     if self._held_attack_key is None:  # 当前没有按住攻击键时才按下，已按住则保持不重复发送。
                         self.send_key_down(want_key)  # 持续按住近战或常规攻击键不放。
-                        self._held_attack_key = want_key  # 记录当前按住的键。
-                    self.info_set("Status", "攻击中")  # 在 GUI 显示攻击状态。
+                        self._held_attack_key = want_key  # 记录当前按住的攻击键。
+                    if jump_active and time.time() - last_jump_time >= jump_interval:  # 位移跳跃模式到达跳跃间隔：短按跳跃键，配合按住的方向键形成方向跳；边攻击边位移模式不跳。
+                        self.send_key(jump_key, down_time=0.05)  # 短按跳跃键。
+                        last_jump_time = time.time()  # 记录跳跃时间。
+                    self.info_set("Status", "位移攻击中" if move_attack else "攻击中")  # 在 GUI 显示攻击状态。
                     self.sleep(0.1)  # 按住期间每 0.1 秒重新识别一次校准目标。
                     continue  # 目标消失时自动停止攻击重新扫描。
                 if self._held_attack_key is not None and time.time() - last_target_seen <= target_loss_buffer:  # 目标丢失缓冲（看板角色配置可调）：怪物框连续一两帧没匹配到时不松攻击键，消掉抖帧导致的打一下停一下；超时确实没怪才落入下方松键流程。

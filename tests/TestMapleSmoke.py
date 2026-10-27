@@ -23,8 +23,8 @@ class TestMapleIdleSmoke(TaskTestCase):
         from src.dashboard_store import DASHBOARD_DEFAULTS  # 看板共享配置默认值。
         for shared_key in DASHBOARD_DEFAULTS:  # 看板共享键不再出现在任务页。
             self.assertNotIn(shared_key, self.task.default_config)
-        for kept in ("Move Interval", "Move Away Seconds", "Move Back Seconds", "Turn Interval", "Use Gray Scale", "Frame Interval"):
-            self.assertIn(kept, self.task.default_config)  # 动作节奏类配置保留。
+        for kept in ("Move Interval", "Move Away Seconds", "Move Back Seconds", "Turn Interval", "Frame Interval"):
+            self.assertIn(kept, self.task.default_config)  # 动作节奏类配置保留；灰度匹配已上移看板怪物配置，归上方共享键循环校验。
 
     def test_validate_key_name(self):
         # 按键合法性校验随配置搬到看板，看板存取层提供与框架规则一致的校验函数。
@@ -110,7 +110,7 @@ class TestMapleIdleSmoke(TaskTestCase):
         feature_set = self.task.executor.feature_set
         self.task.config['Character Feature'] = '帽子'  # 角色分类名已搬到看板，测试直接注入模板页实际标注名。
         names = [self.task.config['Character Feature'], "绿水灵"]  # 角色与怪物各验一个。
-        matcher = GpuTemplateMatcher(gray=bool(self.task.config.get("Use Gray Scale")))  # 按任务灰度配置建匹配器。
+        matcher = GpuTemplateMatcher(gray=True)  # 灰度匹配器：与 find_one_feature 默认灰度路径对齐（怪物彩色路径由下方独立用例覆盖）。
         for name in names:  # 注册原始与镜像模板，与任务运行时的注册方式一致。
             feature_set.ensure_feature(name)
             feature = feature_set.feature_dict.get(name)
@@ -119,6 +119,36 @@ class TestMapleIdleSmoke(TaskTestCase):
         gm = matcher.match_frame(frame)
         for name in names:  # 逐个分类对比 GPU 与 CPU 的最佳匹配。
             cpu_box = self.task.find_one_feature(name, frame, 0.6)
+            gx, gy, gscore = gm.best(name)
+            if cpu_box is None:  # CPU 找不到时 GPU 分数也必须不达标。
+                self.assertLess(gscore, 0.6)
+                continue
+            self.assertLessEqual(abs(gx - cpu_box.x), 3)
+            self.assertLessEqual(abs(gy - cpu_box.y), 3)
+            self.assertLess(abs(gscore - cpu_box.confidence), 0.02)
+
+    def test_gpu_match_monster_color_consistent_with_cpu(self):
+        # 看板灰度开关关闭时怪物走彩色匹配：GpuSplitMatcher 按模板路由角色（灰度）/怪物（彩色），
+        # 两条侧路与 CPU（find_one_feature 传对应 use_gray）的最佳匹配位置与分数应一致。
+        try:  # CuPy 未安装时跳过，不阻断无显卡环境的测试。
+            from src.gpu_match import GpuSplitMatcher, GpuTemplateMatcher, gpu_available
+        except Exception as e:
+            self.skipTest(f"cupy not installed: {e}")
+        if not gpu_available():  # 无可用 NVIDIA 显卡。
+            self.skipTest("no available NVIDIA GPU")
+        self.set_image('ok_templates/0.png')
+        frame = self.task.frame
+        feature_set = self.task.executor.feature_set
+        char_matcher = GpuTemplateMatcher(gray=True)  # 角色固定灰度，与任务运行时一致。
+        mob_matcher = GpuTemplateMatcher(gray=False)  # 怪物彩色：看板灰度开关关闭时的模式。
+        for name, matcher in (('帽子', char_matcher), ('绿水灵', mob_matcher)):  # 角色与怪物各验一个，注册方式与运行时一致。
+            feature_set.ensure_feature(name)
+            feature = feature_set.feature_dict.get(name)
+            matcher.add_template(name, feature.mat)
+            matcher.add_template(name + '__flip', cv2.flip(feature.mat, 1))
+        gm = GpuSplitMatcher(char_matcher, mob_matcher).match_frame(frame)
+        for name, use_gray in (('帽子', True), ('绿水灵', False)):  # 组合句柄按 key 路由到对应色彩模式的侧路。
+            cpu_box = self.task.find_one_feature(name, frame, 0.6, use_gray=use_gray)
             gx, gy, gscore = gm.best(name)
             if cpu_box is None:  # CPU 找不到时 GPU 分数也必须不达标。
                 self.assertLess(gscore, 0.6)

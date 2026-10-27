@@ -205,8 +205,6 @@ def test_factory_returns_pipeline_when_disabled(monkeypatch, fast_cfg):
     assert session.sm.state == GameState.COUNTDOWN
 
 
-def test_factory_default_is_pipeline(monkeypatch):
-    """默认（FLOW_PRIMARY=False）走原 d/lie Pipeline；显式开启才走光流会话。"""
-    monkeypatch.setattr(config, "FLOW_PRIMARY", True)
+def test_factory_returns_flow_session_by_default():
     session = create_session(ScriptedDetector(), 30.0)
     assert isinstance(session, FlowSession)

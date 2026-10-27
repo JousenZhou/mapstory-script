@@ -170,13 +170,7 @@ RECOVERY_LATE_MIN_RATIO = 0.70
 # 身份由倒计时白目标锁定后交给 LK 光流像素携带；YOLO 降级为校验（杀漂移/查滑移）与
 # 丢失重获（try_recover 四路证据 + 光流末位锚）。FLOW_PRIMARY=False 时 solver 走原
 # Pipeline 路径，行为与 d:\lie 完全一致。
-#
-# ⚠ 当前默认关闭：d/lie 验证集 35 场景真值 A/B（failed_videos + trajectory.json）
-# 平均在靶率 d/lie 60.9% vs 光流 9.8%（3/35 不劣化）。失败链：组合体（duo/trio/quad）
-# 检测框内多个子形状+大片地形，环带采样点落在地形上→双峰位移跟错→框漂离→NCC 死亡
-# →重获上下文弱（near_positions 空）→误采纳错误候选→光流长期锁定错误对象。
-# 待解决：形状上点选择（区别地形/子形状间隙）、身份感知校验、强恢复上下文。
-FLOW_PRIMARY = False
+FLOW_PRIMARY = True
 FLOW_MAX_POINTS = 40        # 锁定框内 goodFeaturesToTrack 特征点上限
 FLOW_MIN_POINTS = 8         # 一帧追踪后存活点低于此数判死亡
 FLOW_FB_THRESHOLD = 1.5     # 前向-后向往返误差(px)超过即剔除该点

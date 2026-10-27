@@ -395,6 +395,60 @@
       "file_name": "29.png",
       "width": 1366,
       "height": 768
+    },
+    {
+      "id": 80,
+      "file_name": "32.png",
+      "width": 1920,
+      "height": 1080
+    },
+    {
+      "id": 81,
+      "file_name": "66.png",
+      "width": 1366,
+      "height": 768
+    },
+    {
+      "id": 82,
+      "file_name": "68.png",
+      "width": 1366,
+      "height": 768
+    },
+    {
+      "id": 83,
+      "file_name": "69.png",
+      "width": 1366,
+      "height": 768
+    },
+    {
+      "id": 84,
+      "file_name": "70.png",
+      "width": 1366,
+      "height": 768
+    },
+    {
+      "id": 85,
+      "file_name": "71.png",
+      "width": 1366,
+      "height": 768
+    },
+    {
+      "id": 86,
+      "file_name": "72.png",
+      "width": 1366,
+      "height": 768
+    },
+    {
+      "id": 87,
+      "file_name": "73.png",
+      "width": 1366,
+      "height": 768
+    },
+    {
+      "id": 88,
+      "file_name": "74.png",
+      "width": 1366,
+      "height": 768
     }
   ],
   "annotations": [
@@ -997,6 +1051,19 @@
       "iscrowd": 0
     },
     {
+      "id": 47,
+      "image_id": 70,
+      "category_id": 88,
+      "bbox": [
+        578,
+        240,
+        767,
+        601
+      ],
+      "area": 460967,
+      "iscrowd": 0
+    },
+    {
       "id": 48,
       "image_id": 39,
       "category_id": 48,
@@ -1387,6 +1454,19 @@
       "iscrowd": 0
     },
     {
+      "id": 78,
+      "image_id": 70,
+      "category_id": 89,
+      "bbox": [
+        861,
+        792,
+        202,
+        22
+      ],
+      "area": 4444,
+      "iscrowd": 0
+    },
+    {
       "id": 79,
       "image_id": 64,
       "category_id": 79,
@@ -1505,28 +1585,145 @@
     },
     {
       "id": 88,
-      "image_id": 70,
-      "category_id": 88,
+      "image_id": 81,
+      "category_id": 47,
       "bbox": [
-        578,
-        240,
-        767,
-        601
+        903,
+        346,
+        38,
+        35
       ],
-      "area": 460967,
+      "area": 1330,
       "iscrowd": 0
     },
     {
       "id": 89,
-      "image_id": 70,
-      "category_id": 89,
+      "image_id": 82,
+      "category_id": 78,
       "bbox": [
-        861,
-        792,
-        202,
-        22
+        878,
+        346,
+        38,
+        35
       ],
-      "area": 4444,
+      "area": 1330,
+      "iscrowd": 0
+    },
+    {
+      "id": 90,
+      "image_id": 83,
+      "category_id": 90,
+      "bbox": [
+        343,
+        173,
+        458,
+        166
+      ],
+      "area": 76028,
+      "iscrowd": 0
+    },
+    {
+      "id": 91,
+      "image_id": 83,
+      "category_id": 92,
+      "bbox": [
+        406,
+        134,
+        32,
+        31
+      ],
+      "area": 992,
+      "iscrowd": 0
+    },
+    {
+      "id": 92,
+      "image_id": 83,
+      "category_id": 93,
+      "bbox": [
+        687,
+        131,
+        40,
+        31
+      ],
+      "area": 1240,
+      "iscrowd": 0
+    },
+    {
+      "id": 93,
+      "image_id": 83,
+      "category_id": 91,
+      "bbox": [
+        756,
+        108,
+        49,
+        52
+      ],
+      "area": 2548,
+      "iscrowd": 0
+    },
+    {
+      "id": 94,
+      "image_id": 84,
+      "category_id": 94,
+      "bbox": [
+        963,
+        418,
+        42,
+        31
+      ],
+      "area": 1302,
+      "iscrowd": 0
+    },
+    {
+      "id": 95,
+      "image_id": 85,
+      "category_id": 95,
+      "bbox": [
+        964,
+        419,
+        43,
+        33
+      ],
+      "area": 1419,
+      "iscrowd": 0
+    },
+    {
+      "id": 96,
+      "image_id": 86,
+      "category_id": 96,
+      "bbox": [
+        293,
+        533,
+        649,
+        155
+      ],
+      "area": 100595,
+      "iscrowd": 0
+    },
+    {
+      "id": 97,
+      "image_id": 87,
+      "category_id": 97,
+      "bbox": [
+        872,
+        465,
+        92,
+        17
+      ],
+      "area": 1564,
+      "iscrowd": 0
+    },
+    {
+      "id": 98,
+      "image_id": 88,
+      "category_id": 98,
+      "bbox": [
+        397,
+        358,
+        36,
+        40
+      ],
+      "area": 1440,
       "iscrowd": 0
     }
   ],
@@ -1762,6 +1959,11 @@
       "supercategory": "地台"
     },
     {
+      "id": 47,
+      "name": "潜水右",
+      "supercategory": "角色"
+    },
+    {
       "id": 48,
       "name": "测谎成功",
       "supercategory": ""
@@ -1912,6 +2114,11 @@
       "supercategory": "地台"
     },
     {
+      "id": 78,
+      "name": "潜水左",
+      "supercategory": "角色"
+    },
+    {
       "id": 79,
       "name": "拿破仑左",
       "supercategory": "角色"
@@ -1965,6 +2172,51 @@
       "id": 89,
       "name": "moonlight测谎触发",
       "supercategory": "测谎触发"
+    },
+    {
+      "id": 90,
+      "name": "散步路",
+      "supercategory": "地台"
+    },
+    {
+      "id": 91,
+      "name": "星光精灵1",
+      "supercategory": "怪物"
+    },
+    {
+      "id": 92,
+      "name": "黑色喇叭花",
+      "supercategory": "怪物"
+    },
+    {
+      "id": 93,
+      "name": "黑色喇叭花2",
+      "supercategory": "怪物"
+    },
+    {
+      "id": 94,
+      "name": "黑色喇叭花11",
+      "supercategory": "怪物"
+    },
+    {
+      "id": 95,
+      "name": "黑色喇叭花22",
+      "supercategory": "怪物"
+    },
+    {
+      "id": 96,
+      "name": "散步路1",
+      "supercategory": "地台"
+    },
+    {
+      "id": 97,
+      "name": "黑色食人花名字",
+      "supercategory": "怪物"
+    },
+    {
+      "id": 98,
+      "name": "黑色花",
+      "supercategory": "怪物"
     }
   ]
 }
